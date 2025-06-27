@@ -181,7 +181,7 @@ async function processNextInQueue() {
     });
     
     // Truncate text if too long (Gemini has input limits)
-    const maxTextLength = 30000; // Adjust based on your needs
+    const maxTextLength = 500000; // Adjust based on your needs
     const truncatedText = pdfData.text.length > maxTextLength 
       ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
       : pdfData.text;
