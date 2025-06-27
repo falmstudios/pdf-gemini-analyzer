@@ -44,8 +44,8 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
-// Store processing queue in memory
-let processingQueue = [];
+// Store processing queue in memory - use Map for better state management
+let processingQueue = new Map();
 let currentlyProcessing = null;
 let llmSettings = {
   temperature: 0.7,
@@ -67,17 +67,23 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
       return res.status(400).json({ error: 'No files uploaded' });
     }
     
+    const uploadedFiles = [];
+    
     for (let file of files) {
-      const id = Date.now() + '_' + Math.random().toString(36).substr(2, 9) + '_' + file.originalname;
-      processingQueue.push({
+      const id = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+      const fileData = {
         id: id,
         filename: file.originalname,
         buffer: file.buffer,
         status: 'queued',
         progress: 0,
         result: null,
-        error: null
-      });
+        error: null,
+        processedAt: null
+      };
+      
+      processingQueue.set(id, fileData);
+      uploadedFiles.push({ id, filename: file.originalname });
     }
     
     // Start processing if not already running
@@ -88,7 +94,8 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
     res.json({ 
       success: true, 
       message: `${files.length} files uploaded and queued`,
-      queueLength: processingQueue.length 
+      files: uploadedFiles,
+      queueLength: processingQueue.size 
     });
   } catch (error) {
     console.error('Upload error:', error);
@@ -98,14 +105,17 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
 
 // Get queue status
 app.get('/status', (req, res) => {
+  const queueArray = Array.from(processingQueue.values()).map(item => ({
+    id: item.id,
+    filename: item.filename,
+    status: item.status,
+    progress: item.progress,
+    error: item.error,
+    hasResult: !!item.result
+  }));
+  
   res.json({
-    queue: processingQueue.map(item => ({
-      id: item.id,
-      filename: item.filename,
-      status: item.status,
-      progress: item.progress,
-      error: item.error
-    })),
+    queue: queueArray,
     currentlyProcessing: currentlyProcessing ? {
       id: currentlyProcessing.id,
       filename: currentlyProcessing.filename,
@@ -132,7 +142,7 @@ app.get('/settings', (req, res) => {
 
 // Download result
 app.get('/download/:id', (req, res) => {
-  const item = processingQueue.find(i => i.id === req.params.id);
+  const item = processingQueue.get(req.params.id);
   if (item && item.result) {
     res.json({ 
       filename: item.filename,
@@ -144,34 +154,56 @@ app.get('/download/:id', (req, res) => {
   }
 });
 
+// Clear completed items (optional endpoint)
+app.post('/clear-completed', (req, res) => {
+  let cleared = 0;
+  for (let [id, item] of processingQueue) {
+    if (item.status === 'completed' || item.status === 'error') {
+      processingQueue.delete(id);
+      cleared++;
+    }
+  }
+  res.json({ success: true, cleared });
+});
+
 // Process PDFs
 async function processNextInQueue() {
-  if (processingQueue.length === 0 || currentlyProcessing) return;
+  if (currentlyProcessing) return;
   
-  const item = processingQueue.find(i => i.status === 'queued');
-  if (!item) return;
+  // Find next queued item
+  let nextItem = null;
+  for (let [id, item] of processingQueue) {
+    if (item.status === 'queued') {
+      nextItem = item;
+      break;
+    }
+  }
   
-  currentlyProcessing = item;
-  item.status = 'processing';
+  if (!nextItem) return;
+  
+  currentlyProcessing = nextItem;
+  nextItem.status = 'processing';
+  nextItem.progress = 0;
   
   try {
-    console.log(`Processing PDF: ${item.filename}`);
+    console.log(`Processing PDF: ${nextItem.filename}`);
     
     // Extract text from PDF
-    item.progress = 20;
-    const pdfData = await pdfParse(item.buffer);
+    updateProgress(nextItem, 20);
+    const pdfData = await pdfParse(nextItem.buffer);
     
     if (!pdfData.text || pdfData.text.trim().length === 0) {
       throw new Error('No text content found in PDF');
     }
     
     // Process with Gemini
-    item.progress = 50;
+    updateProgress(nextItem, 50);
     
     if (!process.env.GEMINI_API_KEY) {
       throw new Error('Gemini API key not configured');
     }
     
+    // Use gemini-2.5-pro - UPDATED MODEL NAME
     const model = genAI.getGenerativeModel({ 
       model: "gemini-2.5-pro",
       generationConfig: {
@@ -180,42 +212,50 @@ async function processNextInQueue() {
       }
     });
     
-    // Truncate text if too long (Gemini has input limits)
-    const maxTextLength = 500000; // Adjust based on your needs
+    // Increased text length limit to 500,000 characters
+    const maxTextLength = 500000;
     const truncatedText = pdfData.text.length > maxTextLength 
       ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
       : pdfData.text;
     
     const prompt = `${llmSettings.prompt}\n\nDocument content:\n${truncatedText}`;
     
-    item.progress = 70;
+    updateProgress(nextItem, 70);
     const result = await model.generateContent(prompt);
     const response = await result.response;
     
-    item.progress = 90;
-    item.result = response.text();
-    item.status = 'completed';
-    item.processedAt = new Date();
-    item.progress = 100;
+    updateProgress(nextItem, 90);
+    nextItem.result = response.text();
+    nextItem.status = 'completed';
+    nextItem.processedAt = new Date();
+    updateProgress(nextItem, 100);
     
-    console.log(`Completed processing: ${item.filename}`);
+    console.log(`Completed processing: ${nextItem.filename}`);
     
     // Save to Supabase if configured
     if (supabase) {
-      await saveToSupabase(item);
+      await saveToSupabase(nextItem);
     }
     
   } catch (error) {
-    console.error(`Error processing ${item.filename}:`, error);
-    item.status = 'error';
-    item.error = error.message;
-    item.progress = 0;
+    console.error(`Error processing ${nextItem.filename}:`, error);
+    nextItem.status = 'error';
+    nextItem.error = error.message;
+    nextItem.progress = 0;
   }
   
+  // Clear current processing reference
   currentlyProcessing = null;
   
   // Process next item after a short delay
   setTimeout(() => processNextInQueue(), 1000);
+}
+
+// Helper function to update progress
+function updateProgress(item, progress) {
+  item.progress = progress;
+  // Ensure the update is reflected in the Map
+  processingQueue.set(item.id, item);
 }
 
 // Save results to Supabase
@@ -242,9 +282,14 @@ async function saveToSupabase(item) {
 
 // Calculate total progress
 function calculateTotalProgress() {
-  if (processingQueue.length === 0) return 100;
-  const totalProgress = processingQueue.reduce((sum, item) => sum + item.progress, 0);
-  return Math.round(totalProgress / processingQueue.length);
+  if (processingQueue.size === 0) return 100;
+  
+  let totalProgress = 0;
+  for (let [id, item] of processingQueue) {
+    totalProgress += item.progress;
+  }
+  
+  return Math.round(totalProgress / processingQueue.size);
 }
 
 // Error handling middleware
@@ -254,7 +299,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Gemini API Key: ${process.env.GEMINI_API_KEY ? 'Configured' : 'Not configured'}`);
