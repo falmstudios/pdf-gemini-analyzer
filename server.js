@@ -173,7 +173,7 @@ async function processNextInQueue() {
     }
     
     const model = genAI.getGenerativeModel({ 
-      model: "gemini-pro",
+      model: "gemini-2.5-pro",
       generationConfig: {
         temperature: llmSettings.temperature,
         maxOutputTokens: llmSettings.maxOutputTokens,
