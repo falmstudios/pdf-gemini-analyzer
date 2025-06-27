@@ -8,21 +8,34 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Initialize Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+// Initialize Supabase (only if credentials are provided)
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+  supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
+  );
+}
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
+
+// Health check route
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    message: 'Server is running',
+    port: PORT,
+    timestamp: new Date().toISOString()
+  });
+});
 
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
@@ -50,15 +63,20 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
   try {
     const files = req.files;
     
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+    
     for (let file of files) {
-      const id = Date.now() + '_' + file.originalname;
+      const id = Date.now() + '_' + Math.random().toString(36).substr(2, 9) + '_' + file.originalname;
       processingQueue.push({
         id: id,
         filename: file.originalname,
         buffer: file.buffer,
         status: 'queued',
         progress: 0,
-        result: null
+        result: null,
+        error: null
       });
     }
     
@@ -73,6 +91,7 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
       queueLength: processingQueue.length 
     });
   } catch (error) {
+    console.error('Upload error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -84,7 +103,8 @@ app.get('/status', (req, res) => {
       id: item.id,
       filename: item.filename,
       status: item.status,
-      progress: item.progress
+      progress: item.progress,
+      error: item.error
     })),
     currentlyProcessing: currentlyProcessing ? {
       id: currentlyProcessing.id,
@@ -97,8 +117,12 @@ app.get('/status', (req, res) => {
 
 // Update LLM settings
 app.post('/settings', (req, res) => {
-  llmSettings = { ...llmSettings, ...req.body };
-  res.json({ success: true, settings: llmSettings });
+  try {
+    llmSettings = { ...llmSettings, ...req.body };
+    res.json({ success: true, settings: llmSettings });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Get current settings
@@ -131,12 +155,23 @@ async function processNextInQueue() {
   item.status = 'processing';
   
   try {
+    console.log(`Processing PDF: ${item.filename}`);
+    
     // Extract text from PDF
     item.progress = 20;
     const pdfData = await pdfParse(item.buffer);
     
+    if (!pdfData.text || pdfData.text.trim().length === 0) {
+      throw new Error('No text content found in PDF');
+    }
+    
     // Process with Gemini
     item.progress = 50;
+    
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('Gemini API key not configured');
+    }
+    
     const model = genAI.getGenerativeModel({ 
       model: "gemini-pro",
       generationConfig: {
@@ -145,7 +180,15 @@ async function processNextInQueue() {
       }
     });
     
-    const prompt = `${llmSettings.prompt}\n\nDocument content:\n${pdfData.text}`;
+    // Truncate text if too long (Gemini has input limits)
+    const maxTextLength = 30000; // Adjust based on your needs
+    const truncatedText = pdfData.text.length > maxTextLength 
+      ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
+      : pdfData.text;
+    
+    const prompt = `${llmSettings.prompt}\n\nDocument content:\n${truncatedText}`;
+    
+    item.progress = 70;
     const result = await model.generateContent(prompt);
     const response = await result.response;
     
@@ -155,25 +198,30 @@ async function processNextInQueue() {
     item.processedAt = new Date();
     item.progress = 100;
     
+    console.log(`Completed processing: ${item.filename}`);
+    
     // Save to Supabase if configured
-    if (process.env.SUPABASE_URL) {
+    if (supabase) {
       await saveToSupabase(item);
     }
     
   } catch (error) {
+    console.error(`Error processing ${item.filename}:`, error);
     item.status = 'error';
     item.error = error.message;
-    console.error('Processing error:', error);
+    item.progress = 0;
   }
   
   currentlyProcessing = null;
   
-  // Process next item
+  // Process next item after a short delay
   setTimeout(() => processNextInQueue(), 1000);
 }
 
 // Save results to Supabase
 async function saveToSupabase(item) {
+  if (!supabase) return;
+  
   try {
     const { data, error } = await supabase
       .from('pdf_analyses')
@@ -185,8 +233,10 @@ async function saveToSupabase(item) {
       }]);
     
     if (error) throw error;
+    console.log(`Saved to Supabase: ${item.filename}`);
   } catch (error) {
     console.error('Supabase save error:', error);
+    // Don't throw - we don't want Supabase errors to break PDF processing
   }
 }
 
@@ -197,6 +247,16 @@ function calculateTotalProgress() {
   return Math.round(totalProgress / processingQueue.length);
 }
 
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Gemini API Key: ${process.env.GEMINI_API_KEY ? 'Configured' : 'Not configured'}`);
+  console.log(`Supabase: ${supabase ? 'Configured' : 'Not configured'}`);
 });
