@@ -19,11 +19,11 @@
             </div>
             <div class="form-group">
                 <label for="maxTokens">Max Output Tokens:</label>
-                <input type="number" id="maxTokens" min="100" max="8192" value="2048">
+                <input type="number" id="maxTokens" min="100" max="8192" value="8192">
             </div>
             <div class="form-group">
                 <label for="prompt">Prompt:</label>
-                <textarea id="prompt" rows="4">Analyze this PDF document and provide a comprehensive summary.</textarea>
+                <textarea id="prompt" rows="6">Analysiere nun den folgenden Wörterbuchtext penibel genau und extrahiere ALLE Einträge gemäß den oben definierten, detaillierten Regeln und Heuristiken. Achte besonders auf die sense-zentrische Zerlegung, die korrekte Interpretation impliziter Zuordnungen und beachte auch Folgezeilen in den Quellenzitaten.</textarea>
             </div>
             <button onclick="updateSettings()">Update Settings</button>
         </div>
@@ -52,6 +52,7 @@
                     <div id="currentProgress" class="progress-fill"></div>
                 </div>
                 <span id="currentProgressText">0%</span>
+                <div id="currentStatus" class="status-text"></div>
             </div>
         </div>
         
@@ -59,6 +60,7 @@
         <div class="queue-section">
             <h2>Processing Queue</h2>
             <div id="queueList"></div>
+            <button onclick="clearCompleted()" style="margin-top: 10px;">Clear Completed</button>
         </div>
     </div>
     
