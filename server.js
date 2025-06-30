@@ -27,17 +27,6 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
-// Disable caching for API endpoints
-app.use('/status', (req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  next();
-});
-
-app.use('/logs', (req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  next();
-});
-
 // Health check route
 app.get('/health', (req, res) => {
   res.json({ 
@@ -55,10 +44,12 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
-// Store processing queue in memory - use Map for better state management
+// Store processing queue in memory
 let processingQueue = new Map();
-let globalLogs = []; // Single global log array
+let globalLogs = [];
 let currentlyProcessing = null;
+let sseClients = new Set(); // Store SSE connections
+
 let llmSettings = {
   temperature: 0.7,
   maxOutputTokens: 50000,
@@ -170,8 +161,33 @@ AUFGABE:
 Analysiere nun den folgenden Wörterbuchtext penibel genau und extrahiere ALLE Einträge gemäß den oben definierten, detaillierten Regeln und Heuristiken. Achte besonders auf die sense-zentrische Zerlegung, die korrekte Interpretation impliziter Informationen und die vollständige Normalisierung aller Begriffe. Gib deine Ausgabe als eine einzelne JSON-Liste von Objekten aus, ohne irgendwelche zusätzlichen Sätze und Einleitungen wie "Hier ist die JSON", etc.`
 };
 
-// Version counter to track changes
-let dataVersion = 0;
+// SSE endpoint for real-time logs
+app.get('/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+  
+  // Send initial logs
+  res.write(`data: ${JSON.stringify({ type: 'initial', logs: globalLogs })}\n\n`);
+  
+  // Add client to set
+  sseClients.add(res);
+  
+  // Remove client on disconnect
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+// Broadcast to all SSE clients
+function broadcast(data) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  sseClients.forEach(client => {
+    client.write(message);
+  });
+}
 
 // Routes
 app.get('/', (req, res) => {
@@ -205,7 +221,7 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
       uploadedFiles.push({ id, filename: file.originalname });
     }
     
-    dataVersion++;
+    broadcast({ type: 'queue_update' });
     
     // Start processing if not already running
     if (!currentlyProcessing) {
@@ -240,16 +256,7 @@ app.get('/status', (req, res) => {
       id: currentlyProcessing.id,
       filename: currentlyProcessing.filename,
       status: currentlyProcessing.status
-    } : null,
-    version: dataVersion
-  });
-});
-
-// Get all logs
-app.get('/logs', (req, res) => {
-  res.json({ 
-    logs: globalLogs,
-    version: dataVersion
+    } : null
   });
 });
 
@@ -271,29 +278,34 @@ app.get('/settings', (req, res) => {
 // Download result
 app.get('/download/:id', (req, res) => {
   const item = processingQueue.get(req.params.id);
-  if (item && item.result) {
-    // Clean up the result if it's a JSON string
-    let cleanedResult = item.result;
-    
-    // If the result starts with ```json and ends with ```, extract the JSON
-    if (cleanedResult.startsWith('```json') && cleanedResult.endsWith('```')) {
-      cleanedResult = cleanedResult.slice(7, -3).trim();
-    }
-    
-    // Try to parse and format JSON
-    try {
-      const parsedResult = JSON.parse(cleanedResult);
-      cleanedResult = JSON.stringify(parsedResult, null, 2);
-    } catch (e) {
-      // If not valid JSON, keep as is
-    }
-    
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="${item.filename}_analysis.json"`);
-    res.send(cleanedResult);
-  } else {
-    res.status(404).json({ error: 'Result not found' });
+  
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
   }
+  
+  if (!item.result) {
+    return res.status(404).json({ error: 'Result not available yet' });
+  }
+  
+  // Clean up the result if it's a JSON string
+  let cleanedResult = item.result;
+  
+  // If the result starts with ```json and ends with ```, extract the JSON
+  if (cleanedResult.startsWith('```json') && cleanedResult.endsWith('```')) {
+    cleanedResult = cleanedResult.slice(7, -3).trim();
+  }
+  
+  // Try to parse and format JSON
+  try {
+    const parsedResult = JSON.parse(cleanedResult);
+    cleanedResult = JSON.stringify(parsedResult, null, 2);
+  } catch (e) {
+    // If not valid JSON, keep as is
+  }
+  
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="${item.filename}_analysis.json"`);
+  res.send(cleanedResult);
 });
 
 // Clear completed items
@@ -305,14 +317,14 @@ app.post('/clear-completed', (req, res) => {
       cleared++;
     }
   }
-  dataVersion++;
+  broadcast({ type: 'queue_update' });
   res.json({ success: true, cleared });
 });
 
 // Clear logs
 app.post('/clear-logs', (req, res) => {
   globalLogs = [];
-  dataVersion++;
+  broadcast({ type: 'logs_cleared' });
   res.json({ success: true });
 });
 
@@ -331,7 +343,9 @@ function addLog(message, type = 'info', filename = null) {
     globalLogs = globalLogs.slice(-1000);
   }
   
-  dataVersion++;
+  // Broadcast new log to all clients
+  broadcast({ type: 'new_log', log: logEntry });
+  
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
@@ -352,7 +366,7 @@ async function processNextInQueue() {
   
   currentlyProcessing = nextItem;
   nextItem.status = 'processing';
-  dataVersion++;
+  broadcast({ type: 'queue_update' });
   
   try {
     addLog(`Starting processing of ${nextItem.filename}`, 'info', nextItem.filename);
@@ -429,7 +443,7 @@ async function processNextInQueue() {
     nextItem.result = result;
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
-    dataVersion++;
+    broadcast({ type: 'queue_update' });
     
     addLog(`Processing completed successfully for ${nextItem.filename}`, 'success', nextItem.filename);
     
@@ -449,7 +463,7 @@ async function processNextInQueue() {
     addLog(`Error: ${errorMessage}`, 'error', nextItem.filename);
     nextItem.status = 'error';
     nextItem.error = errorMessage;
-    dataVersion++;
+    broadcast({ type: 'queue_update' });
   }
   
   // Clear current processing reference
