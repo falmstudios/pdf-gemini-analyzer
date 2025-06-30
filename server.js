@@ -49,7 +49,7 @@ let processingQueue = new Map();
 let currentlyProcessing = null;
 let llmSettings = {
   temperature: 0.7,
-  maxOutputTokens: 2048,
+  maxOutputTokens: 8192,
   prompt: "Analyze this PDF document and provide a comprehensive summary."
 };
 
@@ -119,7 +119,8 @@ app.get('/status', (req, res) => {
     currentlyProcessing: currentlyProcessing ? {
       id: currentlyProcessing.id,
       filename: currentlyProcessing.filename,
-      progress: currentlyProcessing.progress
+      progress: currentlyProcessing.progress,
+      status: currentlyProcessing.status
     } : null,
     totalProgress: calculateTotalProgress()
   });
@@ -144,9 +145,25 @@ app.get('/settings', (req, res) => {
 app.get('/download/:id', (req, res) => {
   const item = processingQueue.get(req.params.id);
   if (item && item.result) {
+    // Clean up the result if it's a JSON string
+    let cleanedResult = item.result;
+    
+    // If the result starts with ```json and ends with ```, extract the JSON
+    if (cleanedResult.startsWith('```json') && cleanedResult.endsWith('```')) {
+      cleanedResult = cleanedResult.slice(7, -3).trim();
+    }
+    
+    // Try to parse and format JSON
+    try {
+      const parsedResult = JSON.parse(cleanedResult);
+      cleanedResult = JSON.stringify(parsedResult, null, 2);
+    } catch (e) {
+      // If not valid JSON, keep as is
+    }
+    
     res.json({ 
       filename: item.filename,
-      result: item.result,
+      result: cleanedResult,
       processedAt: item.processedAt 
     });
   } else {
@@ -183,27 +200,26 @@ async function processNextInQueue() {
   
   currentlyProcessing = nextItem;
   nextItem.status = 'processing';
-  nextItem.progress = 0;
   
   try {
     console.log(`Processing PDF: ${nextItem.filename}`);
     
     // Extract text from PDF
-    updateProgress(nextItem, 20);
+    updateProgress(nextItem, 10, 'extracting');
     const pdfData = await pdfParse(nextItem.buffer);
     
     if (!pdfData.text || pdfData.text.trim().length === 0) {
       throw new Error('No text content found in PDF');
     }
     
-    // Process with Gemini
-    updateProgress(nextItem, 50);
+    updateProgress(nextItem, 30, 'preparing');
     
+    // Process with Gemini
     if (!process.env.GEMINI_API_KEY) {
       throw new Error('Gemini API key not configured');
     }
     
-    // Use gemini-2.5-pro - UPDATED MODEL NAME
+    // Use gemini-2.5-pro
     const model = genAI.getGenerativeModel({ 
       model: "gemini-2.5-pro",
       generationConfig: {
@@ -220,15 +236,18 @@ async function processNextInQueue() {
     
     const prompt = `${llmSettings.prompt}\n\nDocument content:\n${truncatedText}`;
     
-    updateProgress(nextItem, 70);
+    updateProgress(nextItem, 50, 'analyzing');
+    
+    console.log(`Sending to Gemini API...`);
     const result = await model.generateContent(prompt);
     const response = await result.response;
     
-    updateProgress(nextItem, 90);
+    updateProgress(nextItem, 80, 'finalizing');
+    
     nextItem.result = response.text();
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
-    updateProgress(nextItem, 100);
+    updateProgress(nextItem, 100, 'completed');
     
     console.log(`Completed processing: ${nextItem.filename}`);
     
@@ -252,8 +271,11 @@ async function processNextInQueue() {
 }
 
 // Helper function to update progress
-function updateProgress(item, progress) {
+function updateProgress(item, progress, subStatus = null) {
   item.progress = progress;
+  if (subStatus) {
+    item.subStatus = subStatus;
+  }
   // Ensure the update is reflected in the Map
   processingQueue.set(item.id, item);
 }
