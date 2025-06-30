@@ -1,10 +1,11 @@
 let statusInterval;
-let currentViewingId = null;
+let logInterval;
+let lastLogCount = 0;
 
 // Load settings on page load
 window.onload = async function() {
     await loadSettings();
-    startStatusPolling();
+    startPolling();
 };
 
 // Load current settings
@@ -76,12 +77,15 @@ async function uploadFiles() {
     }
 }
 
-// Start polling for status updates
-function startStatusPolling() {
-    // Update immediately
+// Start polling
+function startPolling() {
+    // Update status every second
     updateStatus();
-    // Then update every second
     statusInterval = setInterval(updateStatus, 1000);
+    
+    // Update logs every 500ms
+    updateLogs();
+    logInterval = setInterval(updateLogs, 500);
 }
 
 // Update status display
@@ -92,11 +96,6 @@ async function updateStatus() {
         
         // Update queue list
         updateQueueDisplay(status.queue);
-        
-        // If viewing a file, update its logs
-        if (currentViewingId) {
-            updateLogs(currentViewingId);
-        }
         
     } catch (error) {
         console.error('Error updating status:', error);
@@ -118,7 +117,7 @@ function updateQueueDisplay(queue) {
         div.className = `queue-item ${item.status}`;
         
         let statusBadge = '';
-        let actionButtons = '';
+        let actionButton = '';
         
         switch(item.status) {
             case 'queued':
@@ -126,18 +125,13 @@ function updateQueueDisplay(queue) {
                 break;
             case 'processing':
                 statusBadge = '<span class="status-badge processing">Processing...</span>';
-                actionButtons = `<button class="view-logs-btn" onclick="viewLogs('${item.id}')">View Logs</button>`;
                 break;
             case 'completed':
                 statusBadge = '<span class="status-badge completed">Completed</span>';
-                actionButtons = `
-                    <button class="view-logs-btn" onclick="viewLogs('${item.id}')">View Logs</button>
-                    <button class="download-btn" onclick="downloadResult('${item.id}')">Download Result</button>
-                `;
+                actionButton = `<button class="download-btn" onclick="downloadResult('${item.id}')">Download Result</button>`;
                 break;
             case 'error':
                 statusBadge = `<span class="status-badge error">Error: ${item.error || 'Unknown error'}</span>`;
-                actionButtons = `<button class="view-logs-btn" onclick="viewLogs('${item.id}')">View Logs</button>`;
                 break;
         }
         
@@ -147,7 +141,7 @@ function updateQueueDisplay(queue) {
                 ${statusBadge}
             </div>
             <div class="queue-item-actions">
-                ${actionButtons}
+                ${actionButton}
             </div>
         `;
         
@@ -155,17 +149,18 @@ function updateQueueDisplay(queue) {
     });
 }
 
-// View logs for a specific file
-async function viewLogs(id) {
-    currentViewingId = id;
-    await updateLogs(id);
-}
-
 // Update logs display
-async function updateLogs(id) {
+async function updateLogs() {
     try {
-        const response = await fetch(`/logs/${id}`);
+        const response = await fetch('/logs');
         const data = await response.json();
+        
+        // Only update if there are new logs
+        if (data.logs.length === lastLogCount) {
+            return;
+        }
+        
+        lastLogCount = data.logs.length;
         
         const consoleDiv = document.getElementById('console');
         consoleDiv.innerHTML = '';
@@ -180,7 +175,8 @@ async function updateLogs(id) {
             logEntry.className = `console-entry ${log.type}`;
             
             const timestamp = new Date(log.timestamp).toLocaleTimeString();
-            logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${log.message}`;
+            const filename = log.filename ? `[${log.filename}] ` : '';
+            logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${filename}${log.message}`;
             
             consoleDiv.appendChild(logEntry);
         });
@@ -212,20 +208,34 @@ async function clearCompleted() {
         const result = await response.json();
         if (result.success) {
             alert(`Cleared ${result.cleared} completed items`);
-            // Clear console if viewing a cleared item
-            if (currentViewingId) {
-                document.getElementById('console').innerHTML = '';
-                currentViewingId = null;
-            }
         }
     } catch (error) {
         alert('Error clearing completed items: ' + error.message);
     }
 }
 
-// Clean up interval when page unloads
+// Clear logs
+async function clearLogs() {
+    try {
+        const response = await fetch('/clear-logs', {
+            method: 'POST'
+        });
+        
+        if (response.ok) {
+            lastLogCount = 0;
+            document.getElementById('console').innerHTML = '<p class="console-empty">Logs cleared</p>';
+        }
+    } catch (error) {
+        alert('Error clearing logs: ' + error.message);
+    }
+}
+
+// Clean up intervals when page unloads
 window.onbeforeunload = function() {
     if (statusInterval) {
         clearInterval(statusInterval);
+    }
+    if (logInterval) {
+        clearInterval(logInterval);
     }
 };
