@@ -54,6 +54,12 @@ input[type="number"], input[type="file"], textarea {
     border-radius: 4px;
 }
 
+textarea {
+    resize: vertical;
+    font-family: monospace;
+    font-size: 12px;
+}
+
 button {
     background-color: #007bff;
     color: white;
@@ -123,6 +129,16 @@ button:hover {
     font-weight: bold;
 }
 
+.status-badge.error {
+    color: #721c24;
+}
+
 .total-progress, .current-file {
     margin-bottom: 20px;
+}
+
+.status-text {
+    font-size: 14px;
+    color: #666;
+    margin-top: 5px;
 }
