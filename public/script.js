@@ -1,4 +1,5 @@
 let statusInterval;
+let currentViewingId = null;
 
 // Load settings on page load
 window.onload = async function() {
@@ -89,29 +90,13 @@ async function updateStatus() {
         const response = await fetch('/status');
         const status = await response.json();
         
-        // Update total progress
-        const totalProgress = status.totalProgress || 0;
-        document.getElementById('totalProgress').style.width = totalProgress + '%';
-        document.getElementById('totalProgressText').textContent = totalProgress + '%';
-        
-        // Update current file progress
-        if (status.currentlyProcessing) {
-            document.getElementById('currentFile').style.display = 'block';
-            document.getElementById('currentFileName').textContent = status.currentlyProcessing.filename;
-            document.getElementById('currentProgress').style.width = status.currentlyProcessing.progress + '%';
-            document.getElementById('currentProgressText').textContent = status.currentlyProcessing.progress + '%';
-            
-            // Show sub-status if available
-            const statusText = document.getElementById('currentStatus');
-            if (status.currentlyProcessing.subStatus) {
-                statusText.textContent = `Status: ${status.currentlyProcessing.subStatus}`;
-            }
-        } else {
-            document.getElementById('currentFile').style.display = 'none';
-        }
-        
         // Update queue list
         updateQueueDisplay(status.queue);
+        
+        // If viewing a file, update its logs
+        if (currentViewingId) {
+            updateLogs(currentViewingId);
+        }
         
     } catch (error) {
         console.error('Error updating status:', error);
@@ -133,57 +118,85 @@ function updateQueueDisplay(queue) {
         div.className = `queue-item ${item.status}`;
         
         let statusBadge = '';
-        let actionButton = '';
+        let actionButtons = '';
         
         switch(item.status) {
             case 'queued':
-                statusBadge = '<span class="status-badge">Queued</span>';
+                statusBadge = '<span class="status-badge queued">Queued</span>';
                 break;
             case 'processing':
-                statusBadge = `<span class="status-badge">Processing... ${item.progress}%</span>`;
+                statusBadge = '<span class="status-badge processing">Processing...</span>';
+                actionButtons = `<button class="view-logs-btn" onclick="viewLogs('${item.id}')">View Logs</button>`;
                 break;
             case 'completed':
-                statusBadge = '<span class="status-badge">Completed</span>';
-                actionButton = `<button class="download-btn" onclick="downloadResult('${item.id}')">Download Result</button>`;
+                statusBadge = '<span class="status-badge completed">Completed</span>';
+                actionButtons = `
+                    <button class="view-logs-btn" onclick="viewLogs('${item.id}')">View Logs</button>
+                    <button class="download-btn" onclick="downloadResult('${item.id}')">Download Result</button>
+                `;
                 break;
             case 'error':
                 statusBadge = `<span class="status-badge error">Error: ${item.error || 'Unknown error'}</span>`;
+                actionButtons = `<button class="view-logs-btn" onclick="viewLogs('${item.id}')">View Logs</button>`;
                 break;
         }
         
         div.innerHTML = `
-            <div>
+            <div class="queue-item-info">
                 <strong>${item.filename}</strong>
                 ${statusBadge}
             </div>
-            ${actionButton}
+            <div class="queue-item-actions">
+                ${actionButtons}
+            </div>
         `;
         
         queueList.appendChild(div);
     });
 }
 
+// View logs for a specific file
+async function viewLogs(id) {
+    currentViewingId = id;
+    await updateLogs(id);
+}
+
+// Update logs display
+async function updateLogs(id) {
+    try {
+        const response = await fetch(`/logs/${id}`);
+        const data = await response.json();
+        
+        const consoleDiv = document.getElementById('console');
+        consoleDiv.innerHTML = '';
+        
+        if (data.logs.length === 0) {
+            consoleDiv.innerHTML = '<p class="console-empty">No logs available</p>';
+            return;
+        }
+        
+        data.logs.forEach(log => {
+            const logEntry = document.createElement('div');
+            logEntry.className = `console-entry ${log.type}`;
+            
+            const timestamp = new Date(log.timestamp).toLocaleTimeString();
+            logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${log.message}`;
+            
+            consoleDiv.appendChild(logEntry);
+        });
+        
+        // Auto-scroll to bottom
+        consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        
+    } catch (error) {
+        console.error('Error fetching logs:', error);
+    }
+}
+
 // Download result
 async function downloadResult(id) {
     try {
-        const response = await fetch(`/download/${id}`);
-        
-        if (!response.ok) {
-            throw new Error('Download failed');
-        }
-        
-        const data = await response.json();
-        
-        // Create a blob and download
-        const blob = new Blob([data.result], { type: 'application/json' });
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${data.filename}_analysis.json`;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
+        window.location.href = `/download/${id}`;
     } catch (error) {
         alert('Error downloading result: ' + error.message);
     }
@@ -199,6 +212,11 @@ async function clearCompleted() {
         const result = await response.json();
         if (result.success) {
             alert(`Cleared ${result.cleared} completed items`);
+            // Clear console if viewing a cleared item
+            if (currentViewingId) {
+                document.getElementById('console').innerHTML = '';
+                currentViewingId = null;
+            }
         }
     } catch (error) {
         alert('Error clearing completed items: ' + error.message);
