@@ -30,7 +30,7 @@ h2 {
     margin-bottom: 20px;
 }
 
-.settings-panel, .upload-section, .progress-section, .queue-section {
+.settings-panel, .upload-section, .queue-section, .console-section {
     margin-bottom: 30px;
     padding: 20px;
     border: 1px solid #ddd;
@@ -74,30 +74,23 @@ button:hover {
     background-color: #0056b3;
 }
 
-.progress-bar {
-    width: 100%;
-    height: 25px;
-    background-color: #f0f0f0;
-    border-radius: 12px;
-    overflow: hidden;
-    margin: 10px 0;
-}
-
-.progress-fill {
-    height: 100%;
-    background-color: #28a745;
-    transition: width 0.3s ease;
-    width: 0%;
-}
-
 .queue-item {
-    padding: 10px;
+    padding: 15px;
     margin: 5px 0;
     border: 1px solid #ddd;
     border-radius: 5px;
     display: flex;
     justify-content: space-between;
     align-items: center;
+}
+
+.queue-item-info {
+    flex-grow: 1;
+}
+
+.queue-item-actions {
+    display: flex;
+    gap: 10px;
 }
 
 .queue-item.completed {
@@ -112,6 +105,35 @@ button:hover {
     background-color: #f8d7da;
 }
 
+.status-badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-weight: bold;
+    margin-left: 10px;
+}
+
+.status-badge.queued {
+    background-color: #e9ecef;
+    color: #495057;
+}
+
+.status-badge.processing {
+    background-color: #ffc107;
+    color: #212529;
+}
+
+.status-badge.completed {
+    background-color: #28a745;
+    color: white;
+}
+
+.status-badge.error {
+    background-color: #dc3545;
+    color: white;
+}
+
 .download-btn {
     background-color: #28a745;
     font-size: 14px;
@@ -122,23 +144,73 @@ button:hover {
     background-color: #218838;
 }
 
-.status-badge {
-    padding: 3px 8px;
-    border-radius: 3px;
-    font-size: 12px;
-    font-weight: bold;
-}
-
-.status-badge.error {
-    color: #721c24;
-}
-
-.total-progress, .current-file {
-    margin-bottom: 20px;
-}
-
-.status-text {
+.view-logs-btn {
+    background-color: #6c757d;
     font-size: 14px;
-    color: #666;
-    margin-top: 5px;
+    padding: 5px 10px;
+}
+
+.view-logs-btn:hover {
+    background-color: #5a6268;
+}
+
+.console-output {
+    background-color: #1e1e1e;
+    color: #ffffff;
+    padding: 15px;
+    border-radius: 5px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 13px;
+    height: 400px;
+    overflow-y: auto;
+    line-height: 1.5;
+}
+
+.console-entry {
+    margin-bottom: 5px;
+}
+
+.console-entry.info {
+    color: #ffffff;
+}
+
+.console-entry.success {
+    color: #4caf50;
+}
+
+.console-entry.warning {
+    color: #ff9800;
+}
+
+.console-entry.error {
+    color: #f44336;
+}
+
+.timestamp {
+    color: #888;
+    margin-right: 10px;
+}
+
+.console-empty {
+    color: #888;
+    text-align: center;
+    margin-top: 50px;
+}
+
+/* Scrollbar styling for console */
+.console-output::-webkit-scrollbar {
+    width: 8px;
+}
+
+.console-output::-webkit-scrollbar-track {
+    background: #2e2e2e;
+}
+
+.console-output::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}
+
+.console-output::-webkit-scrollbar-thumb:hover {
+    background: #666;
 }
