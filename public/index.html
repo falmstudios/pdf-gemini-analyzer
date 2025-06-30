@@ -19,11 +19,11 @@
             </div>
             <div class="form-group">
                 <label for="maxTokens">Max Output Tokens:</label>
-                <input type="number" id="maxTokens" min="100" max="8192" value="8192">
+                <input type="number" id="maxTokens" min="100" max="50000" value="30000">
             </div>
             <div class="form-group">
                 <label for="prompt">Prompt:</label>
-                <textarea id="prompt" rows="6">Analysiere nun den folgenden Wörterbuchtext penibel genau und extrahiere ALLE Einträge gemäß den oben definierten, detaillierten Regeln und Heuristiken. Achte besonders auf die sense-zentrische Zerlegung, die korrekte Interpretation impliziter Zuordnungen und beachte auch Folgezeilen in den Quellenzitaten.</textarea>
+                <textarea id="prompt" rows="10"></textarea>
             </div>
             <button onclick="updateSettings()">Update Settings</button>
         </div>
@@ -35,32 +35,17 @@
             <button onclick="uploadFiles()">Upload and Process</button>
         </div>
         
-        <!-- Progress Section -->
-        <div class="progress-section">
-            <h2>Processing Progress</h2>
-            <div class="total-progress">
-                <label>Total Progress:</label>
-                <div class="progress-bar">
-                    <div id="totalProgress" class="progress-fill"></div>
-                </div>
-                <span id="totalProgressText">0%</span>
-            </div>
-            
-            <div id="currentFile" class="current-file" style="display:none;">
-                <label>Current File: <span id="currentFileName"></span></label>
-                <div class="progress-bar">
-                    <div id="currentProgress" class="progress-fill"></div>
-                </div>
-                <span id="currentProgressText">0%</span>
-                <div id="currentStatus" class="status-text"></div>
-            </div>
-        </div>
-        
         <!-- Queue Section -->
         <div class="queue-section">
             <h2>Processing Queue</h2>
             <div id="queueList"></div>
             <button onclick="clearCompleted()" style="margin-top: 10px;">Clear Completed</button>
+        </div>
+        
+        <!-- Console Section -->
+        <div class="console-section">
+            <h2>Processing Console</h2>
+            <div id="console" class="console-output"></div>
         </div>
     </div>
     
