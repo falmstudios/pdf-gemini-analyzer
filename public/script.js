@@ -67,6 +67,8 @@ async function uploadFiles() {
         if (result.success) {
             alert(result.message);
             fileInput.value = '';
+        } else {
+            alert('Error: ' + (result.error || 'Upload failed'));
         }
     } catch (error) {
         alert('Error uploading files: ' + error.message);
@@ -75,6 +77,9 @@ async function uploadFiles() {
 
 // Start polling for status updates
 function startStatusPolling() {
+    // Update immediately
+    updateStatus();
+    // Then update every second
     statusInterval = setInterval(updateStatus, 1000);
 }
 
@@ -85,7 +90,7 @@ async function updateStatus() {
         const status = await response.json();
         
         // Update total progress
-        const totalProgress = status.totalProgress;
+        const totalProgress = status.totalProgress || 0;
         document.getElementById('totalProgress').style.width = totalProgress + '%';
         document.getElementById('totalProgressText').textContent = totalProgress + '%';
         
@@ -95,6 +100,12 @@ async function updateStatus() {
             document.getElementById('currentFileName').textContent = status.currentlyProcessing.filename;
             document.getElementById('currentProgress').style.width = status.currentlyProcessing.progress + '%';
             document.getElementById('currentProgressText').textContent = status.currentlyProcessing.progress + '%';
+            
+            // Show sub-status if available
+            const statusText = document.getElementById('currentStatus');
+            if (status.currentlyProcessing.subStatus) {
+                statusText.textContent = `Status: ${status.currentlyProcessing.subStatus}`;
+            }
         } else {
             document.getElementById('currentFile').style.display = 'none';
         }
@@ -112,7 +123,7 @@ function updateQueueDisplay(queue) {
     const queueList = document.getElementById('queueList');
     queueList.innerHTML = '';
     
-    if (queue.length === 0) {
+    if (!queue || queue.length === 0) {
         queueList.innerHTML = '<p>No files in queue</p>';
         return;
     }
@@ -136,7 +147,7 @@ function updateQueueDisplay(queue) {
                 actionButton = `<button class="download-btn" onclick="downloadResult('${item.id}')">Download Result</button>`;
                 break;
             case 'error':
-                statusBadge = '<span class="status-badge">Error</span>';
+                statusBadge = `<span class="status-badge error">Error: ${item.error || 'Unknown error'}</span>`;
                 break;
         }
         
@@ -156,10 +167,15 @@ function updateQueueDisplay(queue) {
 async function downloadResult(id) {
     try {
         const response = await fetch(`/download/${id}`);
+        
+        if (!response.ok) {
+            throw new Error('Download failed');
+        }
+        
         const data = await response.json();
         
         // Create a blob and download
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const blob = new Blob([data.result], { type: 'application/json' });
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -172,3 +188,26 @@ async function downloadResult(id) {
         alert('Error downloading result: ' + error.message);
     }
 }
+
+// Clear completed items
+async function clearCompleted() {
+    try {
+        const response = await fetch('/clear-completed', {
+            method: 'POST'
+        });
+        
+        const result = await response.json();
+        if (result.success) {
+            alert(`Cleared ${result.cleared} completed items`);
+        }
+    } catch (error) {
+        alert('Error clearing completed items: ' + error.message);
+    }
+}
+
+// Clean up interval when page unloads
+window.onbeforeunload = function() {
+    if (statusInterval) {
+        clearInterval(statusInterval);
+    }
+};
