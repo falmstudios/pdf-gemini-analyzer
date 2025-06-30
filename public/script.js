@@ -1,13 +1,50 @@
+let eventSource;
 let statusInterval;
-let logInterval;
-let lastStatusVersion = -1;
-let lastLogVersion = -1;
 
 // Load settings on page load
 window.onload = async function() {
     await loadSettings();
-    startPolling();
+    setupEventSource();
+    // Only poll status every 5 seconds
+    updateStatus();
+    statusInterval = setInterval(updateStatus, 5000);
 };
+
+// Setup SSE connection
+function setupEventSource() {
+    eventSource = new EventSource('/events');
+    
+    eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        switch(data.type) {
+            case 'initial':
+                // Load initial logs
+                displayLogs(data.logs);
+                break;
+            case 'new_log':
+                // Append new log
+                appendLog(data.log);
+                break;
+            case 'queue_update':
+                // Update queue display
+                updateStatus();
+                break;
+            case 'logs_cleared':
+                // Clear console
+                document.getElementById('console').innerHTML = '<p class="console-empty">Logs cleared</p>';
+                break;
+        }
+    };
+    
+    eventSource.onerror = function(error) {
+        console.error('SSE error:', error);
+        // Reconnect after 5 seconds
+        setTimeout(() => {
+            setupEventSource();
+        }, 5000);
+    };
+}
 
 // Load current settings
 async function loadSettings() {
@@ -78,29 +115,11 @@ async function uploadFiles() {
     }
 }
 
-// Start polling
-function startPolling() {
-    // Update status every 2 seconds instead of 1
-    updateStatus();
-    statusInterval = setInterval(updateStatus, 2000);
-    
-    // Update logs every 1 second instead of 500ms
-    updateLogs();
-    logInterval = setInterval(updateLogs, 1000);
-}
-
 // Update status display
 async function updateStatus() {
     try {
         const response = await fetch('/status');
         const status = await response.json();
-        
-        // Only update if version changed
-        if (status.version === lastStatusVersion) {
-            return;
-        }
-        
-        lastStatusVersion = status.version;
         
         // Update queue list
         updateQueueDisplay(status.queue || []);
@@ -119,8 +138,7 @@ function updateQueueDisplay(queue) {
         return;
     }
     
-    // Build new HTML
-    let newHTML = '';
+    let html = '';
     queue.forEach(item => {
         let statusBadge = '';
         let actionButton = '';
@@ -141,7 +159,7 @@ function updateQueueDisplay(queue) {
                 break;
         }
         
-        newHTML += `
+        html += `
             <div class="queue-item ${item.status}">
                 <div class="queue-item-info">
                     <strong>${item.filename}</strong>
@@ -154,50 +172,56 @@ function updateQueueDisplay(queue) {
         `;
     });
     
-    queueList.innerHTML = newHTML;
+    queueList.innerHTML = html;
 }
 
-// Update logs display
-async function updateLogs() {
-    try {
-        const response = await fetch('/logs');
-        const data = await response.json();
-        
-        // Only update if version changed
-        if (data.version === lastLogVersion) {
-            return;
-        }
-        
-        lastLogVersion = data.version;
-        
-        const consoleDiv = document.getElementById('console');
-        const wasAtBottom = Math.abs(consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight) < 5;
-        
-        consoleDiv.innerHTML = '';
-        
-        if (!data.logs || data.logs.length === 0) {
-            consoleDiv.innerHTML = '<p class="console-empty">No logs available</p>';
-            return;
-        }
-        
-        data.logs.forEach(log => {
-            const logEntry = document.createElement('div');
-            logEntry.className = `console-entry ${log.type}`;
-            
-            const timestamp = new Date(log.timestamp).toLocaleTimeString();
-            const filename = log.filename ? `[${log.filename}] ` : '';
-            logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${filename}${log.message}`;
-            
-            consoleDiv.appendChild(logEntry);
-        });
-        
-        // Auto-scroll to bottom only if user was at bottom
-        if (wasAtBottom) {
+// Display initial logs
+function displayLogs(logs) {
+    const consoleDiv = document.getElementById('console');
+    consoleDiv.innerHTML = '';
+    
+    if (!logs || logs.length === 0) {
+        consoleDiv.innerHTML = '<p class="console-empty">No logs available</p>';
+        return;
+    }
+    
+    logs.forEach(log => {
+        appendLogToDiv(log, false);
+    });
+    
+    consoleDiv.scrollTop = consoleDiv.scrollHeight;
+}
+
+// Append a single log
+function appendLog(log) {
+    appendLogToDiv(log, true);
+}
+
+// Helper to append log to div
+function appendLogToDiv(log, shouldScroll) {
+    const consoleDiv = document.getElementById('console');
+    
+    // Remove empty message if exists
+    const emptyMsg = consoleDiv.querySelector('.console-empty');
+    if (emptyMsg) {
+        emptyMsg.remove();
+    }
+    
+    const logEntry = document.createElement('div');
+    logEntry.className = `console-entry ${log.type}`;
+    
+    const timestamp = new Date(log.timestamp).toLocaleTimeString();
+    const filename = log.filename ? `[${log.filename}] ` : '';
+    logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${filename}${log.message}`;
+    
+    consoleDiv.appendChild(logEntry);
+    
+    // Auto-scroll if at bottom
+    if (shouldScroll) {
+        const isAtBottom = Math.abs(consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight) < 50;
+        if (isAtBottom) {
             consoleDiv.scrollTop = consoleDiv.scrollHeight;
         }
-        
-    } catch (error) {
-        console.error('Error fetching logs:', error);
     }
 }
 
@@ -234,20 +258,19 @@ async function clearLogs() {
         });
         
         if (response.ok) {
-            lastLogVersion = -1;
-            document.getElementById('console').innerHTML = '<p class="console-empty">Logs cleared</p>';
+            // Console will be cleared by SSE event
         }
     } catch (error) {
         alert('Error clearing logs: ' + error.message);
     }
 }
 
-// Clean up intervals when page unloads
+// Clean up when page unloads
 window.onbeforeunload = function() {
+    if (eventSource) {
+        eventSource.close();
+    }
     if (statusInterval) {
         clearInterval(statusInterval);
-    }
-    if (logInterval) {
-        clearInterval(logInterval);
     }
 };
