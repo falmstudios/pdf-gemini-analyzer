@@ -59,7 +59,7 @@ let currentlyProcessing = null;
 
 let llmSettings = {
   temperature: 0.7,
-  maxOutputTokens: 50000,
+  maxOutputTokens: 65000,
   prompt: `Prompt für LLM zur Extraktion des Ahrhammar Wörterbuchs (V3.2 - Final & Optimiert)
 I. ROLLE & ZIEL
 Du bist ein hochpräziser linguistischer Daten-Extraktor. Deine Mission ist die fehlerfreie Analyse und Konvertierung von Einträgen aus dem Ahrhammar-Wörterbuch in ein perfekt strukturiertes, datenbankfähiges JSON-Format.
