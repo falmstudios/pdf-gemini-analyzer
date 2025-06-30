@@ -315,6 +315,16 @@ function addLog(message, type = 'info', filename = null) {
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
+// Process with timeout wrapper
+async function callGeminiWithTimeout(model, prompt, timeoutMs = 280000) { // 4.5 minutes timeout
+  return Promise.race([
+    model.generateContent(prompt),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Gemini API timeout')), timeoutMs)
+    )
+  ]);
+}
+
 // Process PDFs
 async function processNextInQueue() {
   if (currentlyProcessing) return;
@@ -352,37 +362,91 @@ async function processNextInQueue() {
       throw new Error('Gemini API key not configured');
     }
     
+    // Initialize model with shorter timeout settings
     const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.5-pro",
+      model: "gemini-2.0-flash-exp", // Use the faster Flash model for large documents
       generationConfig: {
         temperature: llmSettings.temperature,
-        maxOutputTokens: llmSettings.maxOutputTokens,
+        maxOutputTokens: Math.min(llmSettings.maxOutputTokens, 8192), // Limit to 8K for stability
       }
     });
     
-    // Increased text length limit
-    const maxTextLength = 1000000;
-    const truncatedText = pdfData.text.length > maxTextLength 
-      ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
-      : pdfData.text;
+    // For very large documents, use chunking
+    const maxTextLength = 30000; // Process in smaller chunks
+    let fullResult = [];
     
-    if (truncatedText !== pdfData.text) {
-      addLog(`Text truncated to ${maxTextLength} characters`, 'warning', nextItem.filename);
+    if (pdfData.text.length > maxTextLength) {
+      addLog(`Document is large (${textLength} chars), processing in chunks...`, 'info', nextItem.filename);
+      
+      // Split text into chunks
+      const chunks = [];
+      for (let i = 0; i < pdfData.text.length; i += maxTextLength) {
+        chunks.push(pdfData.text.substring(i, i + maxTextLength));
+      }
+      
+      addLog(`Split into ${chunks.length} chunks`, 'info', nextItem.filename);
+      
+      // Process each chunk
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkPrompt = `${llmSettings.prompt}\n\nDocument content (Teil ${i + 1} von ${chunks.length}):\n${chunk}`;
+        
+        addLog(`Processing chunk ${i + 1}/${chunks.length}...`, 'info', nextItem.filename);
+        
+        try {
+          const startTime = Date.now();
+          const result = await callGeminiWithTimeout(model, chunkPrompt);
+          const response = await result.response;
+          const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+          
+          addLog(`Chunk ${i + 1} completed in ${processingTime}s`, 'success', nextItem.filename);
+          
+          // Extract JSON from response
+          let chunkResult = response.text();
+          if (chunkResult.startsWith('```json') && chunkResult.endsWith('```')) {
+            chunkResult = chunkResult.slice(7, -3).trim();
+          }
+          
+          try {
+            const parsedChunk = JSON.parse(chunkResult);
+            if (Array.isArray(parsedChunk)) {
+              fullResult = fullResult.concat(parsedChunk);
+            }
+          } catch (e) {
+            addLog(`Warning: Chunk ${i + 1} did not return valid JSON`, 'warning', nextItem.filename);
+          }
+          
+          // Small delay between chunks
+          if (i < chunks.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+          
+        } catch (error) {
+          addLog(`Error processing chunk ${i + 1}: ${error.message}`, 'error', nextItem.filename);
+          // Continue with next chunk
+        }
+      }
+      
+      // Combine results
+      nextItem.result = JSON.stringify(fullResult, null, 2);
+      
+    } else {
+      // Process entire document at once
+      const prompt = `${llmSettings.prompt}\n\nDocument content:\n${pdfData.text}`;
+      
+      addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
+      addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${Math.min(llmSettings.maxOutputTokens, 8192)}`, 'info', nextItem.filename);
+      
+      const startTime = Date.now();
+      const result = await callGeminiWithTimeout(model, prompt);
+      const response = await result.response;
+      const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+      
+      addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
+      
+      nextItem.result = response.text();
     }
     
-    const prompt = `${llmSettings.prompt}\n\nDocument content:\n${truncatedText}`;
-    
-    addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
-    addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info', nextItem.filename);
-    
-    const startTime = Date.now();
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    
-    addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
-    
-    nextItem.result = response.text();
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
     
