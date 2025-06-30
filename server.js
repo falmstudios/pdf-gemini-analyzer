@@ -5,13 +5,55 @@ const pdfParse = require('pdf-parse');
 const cors = require('cors');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
+const https = require('https');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Create a custom fetch with no timeout
+const customFetch = (url, options) => {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const requestOptions = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: options.method || 'GET',
+      headers: options.headers,
+      // No timeout - let it run as long as needed
+      timeout: 0
+    };
+
+    const req = https.request(requestOptions, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          headers: res.headers,
+          text: async () => data,
+          json: async () => JSON.parse(data)
+        });
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => reject(new Error('Request timeout')));
+
+    if (options.body) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+};
+
+// Initialize Gemini with custom fetch
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY, {
+  apiVersion: 'v1beta',
+  customFetch: customFetch
+});
 
 // Initialize Supabase (only if credentials are provided)
 let supabase = null;
@@ -41,7 +83,7 @@ app.get('/health', (req, res) => {
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit per file
 });
 
 // Store processing queue in memory
@@ -165,8 +207,8 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Upload PDFs
-app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
+// Upload PDFs - allow up to 100 files
+app.post('/upload', upload.array('pdfs', 100), async (req, res) => {
   try {
     const files = req.files;
     
@@ -185,12 +227,15 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
         status: 'queued',
         result: null,
         error: null,
-        processedAt: null
+        processedAt: null,
+        retryCount: 0
       };
       
       processingQueue.set(id, fileData);
       uploadedFiles.push({ id, filename: file.originalname });
     }
+    
+    addLog(`${files.length} files added to queue. Total in queue: ${processingQueue.size}`, 'info');
     
     // Start processing if not already running
     if (!currentlyProcessing) {
@@ -303,29 +348,19 @@ function addLog(message, type = 'info', filename = null) {
     message,
     type,
     filename,
-    id: Date.now() + Math.random() // Unique ID for each log
+    id: Date.now() + Math.random()
   };
   globalLogs.push(logEntry);
   
-  // Keep only last 500 logs
-  if (globalLogs.length > 500) {
-    globalLogs = globalLogs.slice(-500);
+  // Keep only last 1000 logs for memory efficiency
+  if (globalLogs.length > 1000) {
+    globalLogs = globalLogs.slice(-1000);
   }
   
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
-// Process with timeout wrapper
-async function callGeminiWithTimeout(model, prompt, timeoutMs = 900000) { // 15 minutes timeout
-  return Promise.race([
-    model.generateContent(prompt),
-    new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Gemini API timeout after 15 minutes')), timeoutMs)
-    )
-  ]);
-}
-
-// Process PDFs with retry logic
+// Process PDFs - each file gets its own fresh timeout
 async function processNextInQueue() {
   if (currentlyProcessing) return;
   
@@ -338,13 +373,16 @@ async function processNextInQueue() {
     }
   }
   
-  if (!nextItem) return;
+  if (!nextItem) {
+    addLog('All files processed. Queue is empty.', 'success');
+    return;
+  }
   
   currentlyProcessing = nextItem;
   nextItem.status = 'processing';
   
   try {
-    addLog(`Starting processing of ${nextItem.filename}`, 'info', nextItem.filename);
+    addLog(`Starting processing of ${nextItem.filename} (${getQueuedCount()} more in queue)`, 'info', nextItem.filename);
     
     // Extract text from PDF
     addLog('Extracting text from PDF...', 'info', nextItem.filename);
@@ -362,7 +400,6 @@ async function processNextInQueue() {
       throw new Error('Gemini API key not configured');
     }
     
-    // Use gemini-2.5-pro
     const model = genAI.getGenerativeModel({ 
       model: "gemini-2.5-pro",
       generationConfig: {
@@ -386,36 +423,16 @@ async function processNextInQueue() {
     addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
     addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info', nextItem.filename);
     
-    // Try up to 3 times with exponential backoff
-    let result = null;
-    let lastError = null;
+    const startTime = Date.now();
     
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const startTime = Date.now();
-        const apiResult = await callGeminiWithTimeout(model, prompt);
-        const response = await apiResult.response;
-        const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
-        
-        addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
-        result = response.text();
-        break; // Success, exit retry loop
-        
-      } catch (error) {
-        lastError = error;
-        if (attempt < 3) {
-          const waitTime = attempt * 30; // 30s, 60s
-          addLog(`API call failed (attempt ${attempt}/3), retrying in ${waitTime}s: ${error.message}`, 'warning', nextItem.filename);
-          await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
-        }
-      }
-    }
+    // Make the API call - no timeout, let it run as long as needed
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
     
-    if (!result) {
-      throw lastError || new Error('Failed to get response from Gemini API after 3 attempts');
-    }
+    addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
     
-    nextItem.result = result;
+    nextItem.result = response.text();
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
     
@@ -434,16 +451,37 @@ async function processNextInQueue() {
   } catch (error) {
     console.error(`Error processing ${nextItem.filename}:`, error);
     const errorMessage = error.message || 'Unknown error';
-    addLog(`Error: ${errorMessage}`, 'error', nextItem.filename);
-    nextItem.status = 'error';
-    nextItem.error = errorMessage;
+    
+    // If it's a timeout or fetch error, retry up to 3 times
+    if ((errorMessage.includes('fetch failed') || errorMessage.includes('timeout')) && nextItem.retryCount < 3) {
+      nextItem.retryCount++;
+      nextItem.status = 'queued'; // Re-queue for retry
+      addLog(`Error: ${errorMessage}. Will retry (attempt ${nextItem.retryCount + 1}/4)`, 'warning', nextItem.filename);
+      
+      // Wait a bit before retrying
+      await new Promise(resolve => setTimeout(resolve, 30000)); // 30 seconds
+    } else {
+      // Max retries reached or non-retryable error
+      addLog(`Error: ${errorMessage}`, 'error', nextItem.filename);
+      nextItem.status = 'error';
+      nextItem.error = errorMessage;
+    }
   }
   
   // Clear current processing reference
   currentlyProcessing = null;
   
-  // Process next item after a short delay
-  setTimeout(() => processNextInQueue(), 2000);
+  // Small delay before processing next item
+  setTimeout(() => processNextInQueue(), 3000);
+}
+
+// Helper function to count queued items
+function getQueuedCount() {
+  let count = 0;
+  for (let [id, item] of processingQueue) {
+    if (item.status === 'queued') count++;
+  }
+  return count;
 }
 
 // Save results to Supabase
