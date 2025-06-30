@@ -170,6 +170,9 @@ AUFGABE:
 Analysiere nun den folgenden Wörterbuchtext penibel genau und extrahiere ALLE Einträge gemäß den oben definierten, detaillierten Regeln und Heuristiken. Achte besonders auf die sense-zentrische Zerlegung, die korrekte Interpretation impliziter Informationen und die vollständige Normalisierung aller Begriffe. Gib deine Ausgabe als eine einzelne JSON-Liste von Objekten aus, ohne irgendwelche zusätzlichen Sätze und Einleitungen wie "Hier ist die JSON", etc.`
 };
 
+// Version counter to track changes
+let dataVersion = 0;
+
 // Routes
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -201,6 +204,8 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
       processingQueue.set(id, fileData);
       uploadedFiles.push({ id, filename: file.originalname });
     }
+    
+    dataVersion++;
     
     // Start processing if not already running
     if (!currentlyProcessing) {
@@ -235,7 +240,8 @@ app.get('/status', (req, res) => {
       id: currentlyProcessing.id,
       filename: currentlyProcessing.filename,
       status: currentlyProcessing.status
-    } : null
+    } : null,
+    version: dataVersion
   });
 });
 
@@ -243,7 +249,7 @@ app.get('/status', (req, res) => {
 app.get('/logs', (req, res) => {
   res.json({ 
     logs: globalLogs,
-    timestamp: Date.now() // Add timestamp to prevent caching
+    version: dataVersion
   });
 });
 
@@ -299,12 +305,14 @@ app.post('/clear-completed', (req, res) => {
       cleared++;
     }
   }
+  dataVersion++;
   res.json({ success: true, cleared });
 });
 
 // Clear logs
 app.post('/clear-logs', (req, res) => {
   globalLogs = [];
+  dataVersion++;
   res.json({ success: true });
 });
 
@@ -323,10 +331,11 @@ function addLog(message, type = 'info', filename = null) {
     globalLogs = globalLogs.slice(-1000);
   }
   
+  dataVersion++;
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
-// Process PDFs
+// Process PDFs with retry logic
 async function processNextInQueue() {
   if (currentlyProcessing) return;
   
@@ -343,6 +352,7 @@ async function processNextInQueue() {
   
   currentlyProcessing = nextItem;
   nextItem.status = 'processing';
+  dataVersion++;
   
   try {
     addLog(`Starting processing of ${nextItem.filename}`, 'info', nextItem.filename);
@@ -363,7 +373,7 @@ async function processNextInQueue() {
       throw new Error('Gemini API key not configured');
     }
     
-    // Use gemini-2.5-pro
+    // Use gemini-2.5-pro with retry logic
     const model = genAI.getGenerativeModel({ 
       model: "gemini-2.5-pro",
       generationConfig: {
@@ -387,16 +397,39 @@ async function processNextInQueue() {
     addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
     addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info', nextItem.filename);
     
-    const startTime = Date.now();
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    // Try up to 3 times with exponential backoff
+    let result = null;
+    let lastError = null;
     
-    addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const startTime = Date.now();
+        const apiResult = await model.generateContent(prompt);
+        const response = await apiResult.response;
+        const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+        
+        addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
+        result = response.text();
+        break; // Success, exit retry loop
+        
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) {
+          const waitTime = attempt * 30; // 30s, 60s
+          addLog(`API call failed (attempt ${attempt}/3), retrying in ${waitTime}s: ${error.message}`, 'warning', nextItem.filename);
+          await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
+        }
+      }
+    }
     
-    nextItem.result = response.text();
+    if (!result) {
+      throw lastError || new Error('Failed to get response from Gemini API after 3 attempts');
+    }
+    
+    nextItem.result = result;
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
+    dataVersion++;
     
     addLog(`Processing completed successfully for ${nextItem.filename}`, 'success', nextItem.filename);
     
@@ -412,16 +445,18 @@ async function processNextInQueue() {
     
   } catch (error) {
     console.error(`Error processing ${nextItem.filename}:`, error);
-    addLog(`Error: ${error.message}`, 'error', nextItem.filename);
+    const errorMessage = error.message || 'Unknown error';
+    addLog(`Error: ${errorMessage}`, 'error', nextItem.filename);
     nextItem.status = 'error';
-    nextItem.error = error.message;
+    nextItem.error = errorMessage;
+    dataVersion++;
   }
   
   // Clear current processing reference
   currentlyProcessing = null;
   
   // Process next item after a short delay
-  setTimeout(() => processNextInQueue(), 1000);
+  setTimeout(() => processNextInQueue(), 2000);
 }
 
 // Save results to Supabase
