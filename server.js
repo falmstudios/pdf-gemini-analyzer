@@ -24,8 +24,19 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
+
+// Disable caching for API endpoints
+app.use('/status', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  next();
+});
+
+app.use('/logs', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  next();
+});
 
 // Health check route
 app.get('/health', (req, res) => {
@@ -50,7 +61,7 @@ let globalLogs = []; // Single global log array
 let currentlyProcessing = null;
 let llmSettings = {
   temperature: 0.7,
-  maxOutputTokens: 30000,
+  maxOutputTokens: 50000,
   prompt: `Prompt für LLM zur Extraktion des Ahrhammar Wörterbuchs (V3.2 - Final & Optimiert)
 I. ROLLE & ZIEL
 Du bist ein hochpräziser linguistischer Daten-Extraktor. Deine Mission ist die fehlerfreie Analyse und Konvertierung von Einträgen aus dem Ahrhammar-Wörterbuch in ein perfekt strukturiertes, datenbankfähiges JSON-Format.
@@ -230,7 +241,10 @@ app.get('/status', (req, res) => {
 
 // Get all logs
 app.get('/logs', (req, res) => {
-  res.json({ logs: globalLogs });
+  res.json({ 
+    logs: globalLogs,
+    timestamp: Date.now() // Add timestamp to prevent caching
+  });
 });
 
 // Update LLM settings
@@ -358,8 +372,8 @@ async function processNextInQueue() {
       }
     });
     
-    // Increased text length limit to 500,000 characters
-    const maxTextLength = 500000;
+    // Increased text length limit to 1,000,000 characters
+    const maxTextLength = 1000000;
     const truncatedText = pdfData.text.length > maxTextLength 
       ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
       : pdfData.text;
