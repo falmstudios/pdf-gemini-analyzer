@@ -1,6 +1,6 @@
 let statusInterval;
 let logInterval;
-let lastLogCount = 0;
+let lastLogTimestamp = 0;
 
 // Load settings on page load
 window.onload = async function() {
@@ -91,11 +91,11 @@ function startPolling() {
 // Update status display
 async function updateStatus() {
     try {
-        const response = await fetch('/status');
+        const response = await fetch('/status?t=' + Date.now());
         const status = await response.json();
         
         // Update queue list
-        updateQueueDisplay(status.queue);
+        updateQueueDisplay(status.queue || []);
         
     } catch (error) {
         console.error('Error updating status:', error);
@@ -105,17 +105,17 @@ async function updateStatus() {
 // Update queue display
 function updateQueueDisplay(queue) {
     const queueList = document.getElementById('queueList');
-    queueList.innerHTML = '';
     
     if (!queue || queue.length === 0) {
-        queueList.innerHTML = '<p>No files in queue</p>';
+        if (queueList.innerHTML !== '<p>No files in queue</p>') {
+            queueList.innerHTML = '<p>No files in queue</p>';
+        }
         return;
     }
     
+    // Build new HTML
+    let newHTML = '';
     queue.forEach(item => {
-        const div = document.createElement('div');
-        div.className = `queue-item ${item.status}`;
-        
         let statusBadge = '';
         let actionButton = '';
         
@@ -135,37 +135,44 @@ function updateQueueDisplay(queue) {
                 break;
         }
         
-        div.innerHTML = `
-            <div class="queue-item-info">
-                <strong>${item.filename}</strong>
-                ${statusBadge}
-            </div>
-            <div class="queue-item-actions">
-                ${actionButton}
+        newHTML += `
+            <div class="queue-item ${item.status}">
+                <div class="queue-item-info">
+                    <strong>${item.filename}</strong>
+                    ${statusBadge}
+                </div>
+                <div class="queue-item-actions">
+                    ${actionButton}
+                </div>
             </div>
         `;
-        
-        queueList.appendChild(div);
     });
+    
+    // Only update if content changed
+    if (queueList.innerHTML !== newHTML) {
+        queueList.innerHTML = newHTML;
+    }
 }
 
 // Update logs display
 async function updateLogs() {
     try {
-        const response = await fetch('/logs');
+        const response = await fetch('/logs?t=' + Date.now());
         const data = await response.json();
         
-        // Only update if there are new logs
-        if (data.logs.length === lastLogCount) {
+        // Only update if timestamp changed
+        if (data.timestamp === lastLogTimestamp) {
             return;
         }
         
-        lastLogCount = data.logs.length;
+        lastLogTimestamp = data.timestamp;
         
         const consoleDiv = document.getElementById('console');
+        const wasAtBottom = consoleDiv.scrollHeight - consoleDiv.scrollTop === consoleDiv.clientHeight;
+        
         consoleDiv.innerHTML = '';
         
-        if (data.logs.length === 0) {
+        if (!data.logs || data.logs.length === 0) {
             consoleDiv.innerHTML = '<p class="console-empty">No logs available</p>';
             return;
         }
@@ -181,8 +188,10 @@ async function updateLogs() {
             consoleDiv.appendChild(logEntry);
         });
         
-        // Auto-scroll to bottom
-        consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        // Auto-scroll to bottom only if user was at bottom
+        if (wasAtBottom) {
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
         
     } catch (error) {
         console.error('Error fetching logs:', error);
@@ -222,7 +231,7 @@ async function clearLogs() {
         });
         
         if (response.ok) {
-            lastLogCount = 0;
+            lastLogTimestamp = 0;
             document.getElementById('console').innerHTML = '<p class="console-empty">Logs cleared</p>';
         }
     } catch (error) {
