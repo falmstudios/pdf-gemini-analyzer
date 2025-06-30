@@ -48,7 +48,6 @@ const upload = multer({
 let processingQueue = new Map();
 let globalLogs = [];
 let currentlyProcessing = null;
-let sseClients = new Set(); // Store SSE connections
 
 let llmSettings = {
   temperature: 0.7,
@@ -161,34 +160,6 @@ AUFGABE:
 Analysiere nun den folgenden Wörterbuchtext penibel genau und extrahiere ALLE Einträge gemäß den oben definierten, detaillierten Regeln und Heuristiken. Achte besonders auf die sense-zentrische Zerlegung, die korrekte Interpretation impliziter Informationen und die vollständige Normalisierung aller Begriffe. Gib deine Ausgabe als eine einzelne JSON-Liste von Objekten aus, ohne irgendwelche zusätzlichen Sätze und Einleitungen wie "Hier ist die JSON", etc.`
 };
 
-// SSE endpoint for real-time logs
-app.get('/events', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
-  
-  // Send initial logs
-  res.write(`data: ${JSON.stringify({ type: 'initial', logs: globalLogs })}\n\n`);
-  
-  // Add client to set
-  sseClients.add(res);
-  
-  // Remove client on disconnect
-  req.on('close', () => {
-    sseClients.delete(res);
-  });
-});
-
-// Broadcast to all SSE clients
-function broadcast(data) {
-  const message = `data: ${JSON.stringify(data)}\n\n`;
-  sseClients.forEach(client => {
-    client.write(message);
-  });
-}
-
 // Routes
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -221,8 +192,6 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
       uploadedFiles.push({ id, filename: file.originalname });
     }
     
-    broadcast({ type: 'queue_update' });
-    
     // Start processing if not already running
     if (!currentlyProcessing) {
       processNextInQueue();
@@ -240,7 +209,7 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
   }
 });
 
-// Get queue status
+// Get status (queue and logs combined)
 app.get('/status', (req, res) => {
   const queueArray = Array.from(processingQueue.values()).map(item => ({
     id: item.id,
@@ -252,6 +221,7 @@ app.get('/status', (req, res) => {
   
   res.json({
     queue: queueArray,
+    logs: globalLogs,
     currentlyProcessing: currentlyProcessing ? {
       id: currentlyProcessing.id,
       filename: currentlyProcessing.filename,
@@ -317,14 +287,12 @@ app.post('/clear-completed', (req, res) => {
       cleared++;
     }
   }
-  broadcast({ type: 'queue_update' });
   res.json({ success: true, cleared });
 });
 
 // Clear logs
 app.post('/clear-logs', (req, res) => {
   globalLogs = [];
-  broadcast({ type: 'logs_cleared' });
   res.json({ success: true });
 });
 
@@ -334,22 +302,20 @@ function addLog(message, type = 'info', filename = null) {
     timestamp: new Date().toISOString(),
     message,
     type,
-    filename
+    filename,
+    id: Date.now() + Math.random() // Unique ID for each log
   };
   globalLogs.push(logEntry);
   
-  // Keep only last 1000 logs
-  if (globalLogs.length > 1000) {
-    globalLogs = globalLogs.slice(-1000);
+  // Keep only last 500 logs
+  if (globalLogs.length > 500) {
+    globalLogs = globalLogs.slice(-500);
   }
-  
-  // Broadcast new log to all clients
-  broadcast({ type: 'new_log', log: logEntry });
   
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
-// Process PDFs with retry logic
+// Process PDFs
 async function processNextInQueue() {
   if (currentlyProcessing) return;
   
@@ -366,7 +332,6 @@ async function processNextInQueue() {
   
   currentlyProcessing = nextItem;
   nextItem.status = 'processing';
-  broadcast({ type: 'queue_update' });
   
   try {
     addLog(`Starting processing of ${nextItem.filename}`, 'info', nextItem.filename);
@@ -387,7 +352,6 @@ async function processNextInQueue() {
       throw new Error('Gemini API key not configured');
     }
     
-    // Use gemini-2.5-pro with retry logic
     const model = genAI.getGenerativeModel({ 
       model: "gemini-2.5-pro",
       generationConfig: {
@@ -396,7 +360,7 @@ async function processNextInQueue() {
       }
     });
     
-    // Increased text length limit to 1,000,000 characters
+    // Increased text length limit
     const maxTextLength = 1000000;
     const truncatedText = pdfData.text.length > maxTextLength 
       ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
@@ -411,39 +375,16 @@ async function processNextInQueue() {
     addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
     addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info', nextItem.filename);
     
-    // Try up to 3 times with exponential backoff
-    let result = null;
-    let lastError = null;
+    const startTime = Date.now();
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
     
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const startTime = Date.now();
-        const apiResult = await model.generateContent(prompt);
-        const response = await apiResult.response;
-        const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
-        
-        addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
-        result = response.text();
-        break; // Success, exit retry loop
-        
-      } catch (error) {
-        lastError = error;
-        if (attempt < 3) {
-          const waitTime = attempt * 30; // 30s, 60s
-          addLog(`API call failed (attempt ${attempt}/3), retrying in ${waitTime}s: ${error.message}`, 'warning', nextItem.filename);
-          await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
-        }
-      }
-    }
+    addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
     
-    if (!result) {
-      throw lastError || new Error('Failed to get response from Gemini API after 3 attempts');
-    }
-    
-    nextItem.result = result;
+    nextItem.result = response.text();
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
-    broadcast({ type: 'queue_update' });
     
     addLog(`Processing completed successfully for ${nextItem.filename}`, 'success', nextItem.filename);
     
@@ -463,7 +404,6 @@ async function processNextInQueue() {
     addLog(`Error: ${errorMessage}`, 'error', nextItem.filename);
     nextItem.status = 'error';
     nextItem.error = errorMessage;
-    broadcast({ type: 'queue_update' });
   }
   
   // Clear current processing reference
