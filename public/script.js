@@ -1,6 +1,7 @@
 let statusInterval;
 let logInterval;
-let lastLogTimestamp = 0;
+let lastStatusVersion = -1;
+let lastLogVersion = -1;
 
 // Load settings on page load
 window.onload = async function() {
@@ -79,20 +80,27 @@ async function uploadFiles() {
 
 // Start polling
 function startPolling() {
-    // Update status every second
+    // Update status every 2 seconds instead of 1
     updateStatus();
-    statusInterval = setInterval(updateStatus, 1000);
+    statusInterval = setInterval(updateStatus, 2000);
     
-    // Update logs every 500ms
+    // Update logs every 1 second instead of 500ms
     updateLogs();
-    logInterval = setInterval(updateLogs, 500);
+    logInterval = setInterval(updateLogs, 1000);
 }
 
 // Update status display
 async function updateStatus() {
     try {
-        const response = await fetch('/status?t=' + Date.now());
+        const response = await fetch('/status');
         const status = await response.json();
+        
+        // Only update if version changed
+        if (status.version === lastStatusVersion) {
+            return;
+        }
+        
+        lastStatusVersion = status.version;
         
         // Update queue list
         updateQueueDisplay(status.queue || []);
@@ -107,9 +115,7 @@ function updateQueueDisplay(queue) {
     const queueList = document.getElementById('queueList');
     
     if (!queue || queue.length === 0) {
-        if (queueList.innerHTML !== '<p>No files in queue</p>') {
-            queueList.innerHTML = '<p>No files in queue</p>';
-        }
+        queueList.innerHTML = '<p>No files in queue</p>';
         return;
     }
     
@@ -148,27 +154,24 @@ function updateQueueDisplay(queue) {
         `;
     });
     
-    // Only update if content changed
-    if (queueList.innerHTML !== newHTML) {
-        queueList.innerHTML = newHTML;
-    }
+    queueList.innerHTML = newHTML;
 }
 
 // Update logs display
 async function updateLogs() {
     try {
-        const response = await fetch('/logs?t=' + Date.now());
+        const response = await fetch('/logs');
         const data = await response.json();
         
-        // Only update if timestamp changed
-        if (data.timestamp === lastLogTimestamp) {
+        // Only update if version changed
+        if (data.version === lastLogVersion) {
             return;
         }
         
-        lastLogTimestamp = data.timestamp;
+        lastLogVersion = data.version;
         
         const consoleDiv = document.getElementById('console');
-        const wasAtBottom = consoleDiv.scrollHeight - consoleDiv.scrollTop === consoleDiv.clientHeight;
+        const wasAtBottom = Math.abs(consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight) < 5;
         
         consoleDiv.innerHTML = '';
         
@@ -231,7 +234,7 @@ async function clearLogs() {
         });
         
         if (response.ok) {
-            lastLogTimestamp = 0;
+            lastLogVersion = -1;
             document.getElementById('console').innerHTML = '<p class="console-empty">Logs cleared</p>';
         }
     } catch (error) {
