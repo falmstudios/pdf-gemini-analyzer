@@ -144,13 +144,20 @@ button:hover {
     background-color: #218838;
 }
 
-.view-logs-btn {
+.console-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+
+.clear-logs-btn {
     background-color: #6c757d;
     font-size: 14px;
     padding: 5px 10px;
 }
 
-.view-logs-btn:hover {
+.clear-logs-btn:hover {
     background-color: #5a6268;
 }
 
