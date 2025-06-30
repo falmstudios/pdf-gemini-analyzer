@@ -5,55 +5,21 @@ const pdfParse = require('pdf-parse');
 const cors = require('cors');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
-const https = require('https');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Create a custom fetch with no timeout
-const customFetch = (url, options) => {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const requestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: options.method || 'GET',
-      headers: options.headers,
-      // No timeout - let it run as long as needed
-      timeout: 0
-    };
-
-    const req = https.request(requestOptions, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        resolve({
-          ok: res.statusCode >= 200 && res.statusCode < 300,
-          status: res.statusCode,
-          statusText: res.statusMessage,
-          headers: res.headers,
-          text: async () => data,
-          json: async () => JSON.parse(data)
-        });
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => reject(new Error('Request timeout')));
-
-    if (options.body) {
-      req.write(options.body);
-    }
-    req.end();
-  });
-};
-
-// Initialize Gemini with custom fetch
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY, {
-  apiVersion: 'v1beta',
-  customFetch: customFetch
+// Create axios instance with no timeout
+const axiosInstance = axios.create({
+  timeout: 0, // No timeout
+  maxContentLength: Infinity,
+  maxBodyLength: Infinity
 });
+
+// Initialize Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Initialize Supabase (only if credentials are provided)
 let supabase = null;
@@ -360,7 +326,51 @@ function addLog(message, type = 'info', filename = null) {
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
-// Process PDFs - each file gets its own fresh timeout
+// Direct API call to Gemini with proper timeout handling
+async function callGeminiAPI(prompt, temperature, maxTokens) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
+  
+  try {
+    const response = await axiosInstance.post(
+      apiUrl,
+      {
+        contents: [{
+          parts: [{
+            text: prompt
+          }]
+        }],
+        generationConfig: {
+          temperature: temperature,
+          maxOutputTokens: maxTokens,
+          candidateCount: 1
+        }
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        }
+      }
+    );
+    
+    if (response.data && response.data.candidates && response.data.candidates[0]) {
+      return response.data.candidates[0].content.parts[0].text;
+    }
+    throw new Error('Invalid response format from Gemini API');
+    
+  } catch (error) {
+    if (error.response) {
+      throw new Error(`Gemini API error: ${error.response.status} - ${error.response.data.error?.message || error.response.statusText}`);
+    } else if (error.request) {
+      throw new Error('No response from Gemini API - request timeout or network error');
+    } else {
+      throw error;
+    }
+  }
+}
+
+// Process PDFs - each file gets its own fresh connection
 async function processNextInQueue() {
   if (currentlyProcessing) return;
   
@@ -400,14 +410,6 @@ async function processNextInQueue() {
       throw new Error('Gemini API key not configured');
     }
     
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.5-pro",
-      generationConfig: {
-        temperature: llmSettings.temperature,
-        maxOutputTokens: llmSettings.maxOutputTokens,
-      }
-    });
-    
     // Increased text length limit
     const maxTextLength = 1000000;
     const truncatedText = pdfData.text.length > maxTextLength 
@@ -425,14 +427,13 @@ async function processNextInQueue() {
     
     const startTime = Date.now();
     
-    // Make the API call - no timeout, let it run as long as needed
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    // Make the API call directly with axios - no timeout
+    const result = await callGeminiAPI(prompt, llmSettings.temperature, llmSettings.maxOutputTokens);
     
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
     addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
     
-    nextItem.result = response.text();
+    nextItem.result = result;
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
     
@@ -452,8 +453,8 @@ async function processNextInQueue() {
     console.error(`Error processing ${nextItem.filename}:`, error);
     const errorMessage = error.message || 'Unknown error';
     
-    // If it's a timeout or fetch error, retry up to 3 times
-    if ((errorMessage.includes('fetch failed') || errorMessage.includes('timeout')) && nextItem.retryCount < 3) {
+    // If it's a timeout or network error, retry up to 3 times
+    if ((errorMessage.includes('timeout') || errorMessage.includes('network') || errorMessage.includes('ECONNRESET')) && nextItem.retryCount < 3) {
       nextItem.retryCount++;
       nextItem.status = 'queued'; // Re-queue for retry
       addLog(`Error: ${errorMessage}. Will retry (attempt ${nextItem.retryCount + 1}/4)`, 'warning', nextItem.filename);
