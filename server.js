@@ -58,7 +58,7 @@ let globalLogs = [];
 let currentlyProcessing = null;
 
 let llmSettings = {
-  temperature: 0.7,
+  temperature: 0.6,
   maxOutputTokens: 65000,
   prompt: `Prompt für LLM zur Extraktion des Ahrhammar Wörterbuchs (V3.2 - Final & Optimiert)
 I. ROLLE & ZIEL
