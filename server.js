@@ -46,7 +46,7 @@ const upload = multer({
 
 // Store processing queue in memory - use Map for better state management
 let processingQueue = new Map();
-let processingLogs = new Map(); // Store logs for each file
+let globalLogs = []; // Single global log array
 let currentlyProcessing = null;
 let llmSettings = {
   temperature: 0.7,
@@ -188,7 +188,6 @@ app.post('/upload', upload.array('pdfs', 20), async (req, res) => {
       };
       
       processingQueue.set(id, fileData);
-      processingLogs.set(id, []); // Initialize empty log array
       uploadedFiles.push({ id, filename: file.originalname });
     }
     
@@ -229,10 +228,9 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Get logs for a specific file
-app.get('/logs/:id', (req, res) => {
-  const logs = processingLogs.get(req.params.id) || [];
-  res.json({ logs });
+// Get all logs
+app.get('/logs', (req, res) => {
+  res.json({ logs: globalLogs });
 });
 
 // Update LLM settings
@@ -278,29 +276,40 @@ app.get('/download/:id', (req, res) => {
   }
 });
 
-// Clear completed items (optional endpoint)
+// Clear completed items
 app.post('/clear-completed', (req, res) => {
   let cleared = 0;
   for (let [id, item] of processingQueue) {
     if (item.status === 'completed' || item.status === 'error') {
       processingQueue.delete(id);
-      processingLogs.delete(id);
       cleared++;
     }
   }
   res.json({ success: true, cleared });
 });
 
+// Clear logs
+app.post('/clear-logs', (req, res) => {
+  globalLogs = [];
+  res.json({ success: true });
+});
+
 // Add log entry
-function addLog(id, message, type = 'info') {
-  const logs = processingLogs.get(id) || [];
-  logs.push({
+function addLog(message, type = 'info', filename = null) {
+  const logEntry = {
     timestamp: new Date().toISOString(),
     message,
-    type
-  });
-  processingLogs.set(id, logs);
-  console.log(`[${id}] ${message}`);
+    type,
+    filename
+  };
+  globalLogs.push(logEntry);
+  
+  // Keep only last 1000 logs
+  if (globalLogs.length > 1000) {
+    globalLogs = globalLogs.slice(-1000);
+  }
+  
+  console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
 // Process PDFs
@@ -322,10 +331,10 @@ async function processNextInQueue() {
   nextItem.status = 'processing';
   
   try {
-    addLog(nextItem.id, `Starting processing of ${nextItem.filename}`, 'info');
+    addLog(`Starting processing of ${nextItem.filename}`, 'info', nextItem.filename);
     
     // Extract text from PDF
-    addLog(nextItem.id, 'Extracting text from PDF...', 'info');
+    addLog('Extracting text from PDF...', 'info', nextItem.filename);
     const pdfData = await pdfParse(nextItem.buffer);
     
     if (!pdfData.text || pdfData.text.trim().length === 0) {
@@ -333,7 +342,7 @@ async function processNextInQueue() {
     }
     
     const textLength = pdfData.text.length;
-    addLog(nextItem.id, `Extracted ${textLength} characters from PDF`, 'info');
+    addLog(`Extracted ${textLength} characters from PDF`, 'info', nextItem.filename);
     
     // Process with Gemini
     if (!process.env.GEMINI_API_KEY) {
@@ -356,40 +365,40 @@ async function processNextInQueue() {
       : pdfData.text;
     
     if (truncatedText !== pdfData.text) {
-      addLog(nextItem.id, `Text truncated to ${maxTextLength} characters`, 'warning');
+      addLog(`Text truncated to ${maxTextLength} characters`, 'warning', nextItem.filename);
     }
     
     const prompt = `${llmSettings.prompt}\n\nDocument content:\n${truncatedText}`;
     
-    addLog(nextItem.id, 'Sending to Gemini API for analysis...', 'info');
-    addLog(nextItem.id, `Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info');
+    addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
+    addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info', nextItem.filename);
     
     const startTime = Date.now();
     const result = await model.generateContent(prompt);
     const response = await result.response;
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
     
-    addLog(nextItem.id, `Received response from Gemini API after ${processingTime}s`, 'success');
+    addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
     
     nextItem.result = response.text();
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
     
-    addLog(nextItem.id, `Processing completed successfully`, 'success');
+    addLog(`Processing completed successfully for ${nextItem.filename}`, 'success', nextItem.filename);
     
     // Save to Supabase if configured
     if (supabase) {
       try {
         await saveToSupabase(nextItem);
-        addLog(nextItem.id, 'Saved to Supabase', 'success');
+        addLog('Saved to Supabase', 'success', nextItem.filename);
       } catch (error) {
-        addLog(nextItem.id, `Supabase save failed: ${error.message}`, 'warning');
+        addLog(`Supabase save failed: ${error.message}`, 'warning', nextItem.filename);
       }
     }
     
   } catch (error) {
     console.error(`Error processing ${nextItem.filename}:`, error);
-    addLog(nextItem.id, `Error: ${error.message}`, 'error');
+    addLog(`Error: ${error.message}`, 'error', nextItem.filename);
     nextItem.status = 'error';
     nextItem.error = error.message;
   }
