@@ -4,11 +4,25 @@ const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const stringSimilarity = require('string-similarity');
 
-// Initialize connections
-const sourceSupabase = createClient(
-    process.env.SOURCE_SUPABASE_URL,
-    process.env.SOURCE_SUPABASE_ANON_KEY
-);
+// Initialize connections with error checking
+console.log('Initializing linguistic routes...');
+console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
+console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
+console.log('SUPABASE_URL exists:', !!process.env.SUPABASE_URL);
+console.log('SUPABASE_ANON_KEY exists:', !!process.env.SUPABASE_ANON_KEY);
+console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
+
+// Check if we have the required environment variables
+if (!process.env.SOURCE_SUPABASE_URL || !process.env.SOURCE_SUPABASE_ANON_KEY) {
+    console.error('WARNING: Source Supabase credentials not found!');
+}
+
+const sourceSupabase = process.env.SOURCE_SUPABASE_URL && process.env.SOURCE_SUPABASE_ANON_KEY
+    ? createClient(
+        process.env.SOURCE_SUPABASE_URL,
+        process.env.SOURCE_SUPABASE_ANON_KEY
+    )
+    : null;
 
 const destSupabase = createClient(
     process.env.SUPABASE_URL,
@@ -49,55 +63,120 @@ function addLog(message, type = 'info') {
 // Get statistics
 router.get('/stats', async (req, res) => {
     try {
+        console.log('Getting statistics...');
+        
+        // Check if source database is configured
+        if (!sourceSupabase) {
+            console.log('Source Supabase not configured, returning mock data');
+            return res.json({
+                linguisticFeatures: 0,
+                translationAids: 0,
+                total: 0,
+                processed: 0,
+                error: 'Source database not configured'
+            });
+        }
+        
         // Get counts from source database
-        const { count: linguisticCount } = await sourceSupabase
+        console.log('Fetching linguistic_features count...');
+        const { count: linguisticCount, error: linguisticError } = await sourceSupabase
             .from('linguistic_features')
             .select('*', { count: 'exact', head: true });
             
-        const { count: translationCount } = await sourceSupabase
+        if (linguisticError) {
+            console.error('Error fetching linguistic_features:', linguisticError);
+        }
+            
+        console.log('Fetching translation_aids count...');
+        const { count: translationCount, error: translationError } = await sourceSupabase
             .from('translation_aids')
             .select('*', { count: 'exact', head: true });
             
+        if (translationError) {
+            console.error('Error fetching translation_aids:', translationError);
+        }
+            
         // Get processed count from destination database
-        const { count: processedCount } = await destSupabase
+        console.log('Fetching cleaned count...');
+        const { count: processedCount, error: processedError } = await destSupabase
             .from('cleaned_linguistic_examples')
             .select('*', { count: 'exact', head: true });
+            
+        if (processedError) {
+            console.error('Error fetching cleaned_linguistic_examples:', processedError);
+        }
         
-        res.json({
+        const response = {
             linguisticFeatures: linguisticCount || 0,
             translationAids: translationCount || 0,
             total: (linguisticCount || 0) + (translationCount || 0),
             processed: processedCount || 0
-        });
+        };
+        
+        console.log('Statistics response:', response);
+        res.json(response);
+        
     } catch (error) {
         console.error('Stats error:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ 
+            error: error.message,
+            linguisticFeatures: 0,
+            translationAids: 0,
+            total: 0,
+            processed: 0
+        });
     }
 });
 
 // Start cleaning process
 router.post('/start-cleaning', async (req, res) => {
-    if (processingState.isProcessing) {
-        return res.status(400).json({ error: 'Processing already in progress' });
+    try {
+        console.log('Start cleaning request received:', req.body);
+        
+        if (!sourceSupabase) {
+            return res.status(400).json({ 
+                error: 'Source database not configured. Please add SOURCE_SUPABASE_URL and SOURCE_SUPABASE_ANON_KEY to environment variables.' 
+            });
+        }
+        
+        if (processingState.isProcessing) {
+            return res.status(400).json({ error: 'Processing already in progress' });
+        }
+        
+        const { processLinguistic, processTranslation, batchSize } = req.body;
+        
+        // Validate input
+        if (!processLinguistic && !processTranslation) {
+            return res.status(400).json({ error: 'No data sources selected for processing' });
+        }
+        
+        // Reset state
+        processingState = {
+            isProcessing: true,
+            progress: 0,
+            status: 'Starting...',
+            details: '',
+            logs: [],
+            results: null,
+            startTime: Date.now()
+        };
+        
+        // Start processing in background
+        processData(processLinguistic, processTranslation, batchSize || 250)
+            .catch(error => {
+                console.error('Background processing error:', error);
+                addLog(`Critical error: ${error.message}`, 'error');
+                processingState.status = 'Error';
+                processingState.details = error.message;
+                processingState.isProcessing = false;
+            });
+        
+        res.json({ success: true, message: 'Processing started' });
+        
+    } catch (error) {
+        console.error('Start cleaning error:', error);
+        res.status(500).json({ error: error.message });
     }
-    
-    const { processLinguistic, processTranslation, batchSize } = req.body;
-    
-    // Reset state
-    processingState = {
-        isProcessing: true,
-        progress: 0,
-        status: 'Starting...',
-        details: '',
-        logs: [],
-        results: null,
-        startTime: Date.now()
-    };
-    
-    // Start processing in background
-    processData(processLinguistic, processTranslation, batchSize);
-    
-    res.json({ success: true, message: 'Processing started' });
 });
 
 // Get progress
@@ -109,7 +188,7 @@ router.get('/progress', (req, res) => {
         percentage,
         status: processingState.status,
         details: processingState.details,
-        logs: processingState.logs,
+        logs: processingState.logs.slice(-50), // Send only last 50 logs
         completed,
         results: processingState.results
     });
@@ -119,6 +198,7 @@ router.get('/progress', (req, res) => {
 async function processData(processLinguistic, processTranslation, batchSize) {
     try {
         addLog('Starting data cleaning process', 'info');
+        addLog(`Batch size: ${batchSize}`, 'info');
         
         let allRecords = [];
         let totalRecords = 0;
@@ -126,46 +206,75 @@ async function processData(processLinguistic, processTranslation, batchSize) {
         // Fetch linguistic features
         if (processLinguistic) {
             addLog('Fetching linguistic features...', 'info');
-            const { data: linguisticData, error } = await sourceSupabase
-                .from('linguistic_features')
-                .select('*');
+            try {
+                const { data: linguisticData, error } = await sourceSupabase
+                    .from('linguistic_features')
+                    .select('*');
+                    
+                if (error) {
+                    addLog(`Error fetching linguistic features: ${error.message}`, 'error');
+                    throw error;
+                }
                 
-            if (error) throw error;
-            
-            const mappedData = linguisticData.map(item => ({
-                ...item,
-                source_table: 'linguistic_features',
-                term: item.halunder_term
-            }));
-            
-            allRecords = allRecords.concat(mappedData);
-            addLog(`Fetched ${linguisticData.length} linguistic features`, 'success');
+                if (!linguisticData) {
+                    addLog('No linguistic features data returned', 'warning');
+                } else {
+                    const mappedData = linguisticData.map(item => ({
+                        ...item,
+                        source_table: 'linguistic_features',
+                        term: item.halunder_term
+                    }));
+                    
+                    allRecords = allRecords.concat(mappedData);
+                    addLog(`Fetched ${linguisticData.length} linguistic features`, 'success');
+                }
+            } catch (error) {
+                addLog(`Failed to fetch linguistic features: ${error.message}`, 'error');
+                if (!processTranslation) throw error; // Only throw if not processing translation aids
+            }
         }
         
         // Fetch translation aids
         if (processTranslation) {
             addLog('Fetching translation aids...', 'info');
-            const { data: translationData, error } = await sourceSupabase
-                .from('translation_aids')
-                .select('*');
+            try {
+                const { data: translationData, error } = await sourceSupabase
+                    .from('translation_aids')
+                    .select('*');
+                    
+                if (error) {
+                    addLog(`Error fetching translation aids: ${error.message}`, 'error');
+                    throw error;
+                }
                 
-            if (error) throw error;
-            
-            const mappedData = translationData.map(item => ({
-                id: item.id,
-                halunder_term: item.term,
-                german_equivalent: null,
-                explanation: item.explanation,
-                feature_type: 'translation_aid',
-                source_table: 'translation_aids',
-                term: item.term
-            }));
-            
-            allRecords = allRecords.concat(mappedData);
-            addLog(`Fetched ${translationData.length} translation aids`, 'success');
+                if (!translationData) {
+                    addLog('No translation aids data returned', 'warning');
+                } else {
+                    const mappedData = translationData.map(item => ({
+                        id: item.id,
+                        halunder_term: item.term,
+                        german_equivalent: null,
+                        explanation: item.explanation,
+                        feature_type: 'translation_aid',
+                        source_table: 'translation_aids',
+                        term: item.term
+                    }));
+                    
+                    allRecords = allRecords.concat(mappedData);
+                    addLog(`Fetched ${translationData.length} translation aids`, 'success');
+                }
+            } catch (error) {
+                addLog(`Failed to fetch translation aids: ${error.message}`, 'error');
+                if (!processLinguistic || allRecords.length === 0) throw error;
+            }
         }
         
         totalRecords = allRecords.length;
+        
+        if (totalRecords === 0) {
+            throw new Error('No records found to process');
+        }
+        
         addLog(`Total records to process: ${totalRecords}`, 'info');
         
         // Group similar entries
@@ -192,20 +301,25 @@ async function processData(processLinguistic, processTranslation, batchSize) {
             
             addLog(`Processing batch ${batchNum}/${totalBatches}`, 'info');
             
-            // Process this batch with Gemini
-            const processedBatch = await processBatchWithGemini(batch);
-            
-            // Save to database
-            for (const entry of processedBatch) {
-                try {
-                    await saveCleanedEntry(entry);
-                    results.uniqueEntries++;
-                    results.duplicatesFound += entry.sourceIds.length - 1;
-                    results.totalProcessed += entry.sourceIds.length;
-                } catch (error) {
-                    addLog(`Error saving entry: ${error.message}`, 'error');
-                    results.errors++;
+            try {
+                // Process this batch with Gemini
+                const processedBatch = await processBatchWithGemini(batch);
+                
+                // Save to database
+                for (const entry of processedBatch) {
+                    try {
+                        await saveCleanedEntry(entry);
+                        results.uniqueEntries++;
+                        results.duplicatesFound += entry.sourceIds.length - 1;
+                        results.totalProcessed += entry.sourceIds.length;
+                    } catch (error) {
+                        addLog(`Error saving entry: ${error.message}`, 'error');
+                        results.errors++;
+                    }
                 }
+            } catch (error) {
+                addLog(`Error processing batch ${batchNum}: ${error.message}`, 'error');
+                results.errors += batch.length;
             }
             
             // Small delay to avoid rate limits
@@ -227,6 +341,7 @@ async function processData(processLinguistic, processTranslation, batchSize) {
         addLog(`Critical error: ${error.message}`, 'error');
         processingState.status = 'Error';
         processingState.details = error.message;
+        throw error;
     } finally {
         processingState.isProcessing = false;
     }
@@ -260,8 +375,8 @@ function findSimilarEntries(records) {
 
 // Check if two entries are similar
 function areSimilar(entry1, entry2) {
-    const term1 = entry1.term.toLowerCase().trim();
-    const term2 = entry2.term.toLowerCase().trim();
+    const term1 = (entry1.term || '').toLowerCase().trim();
+    const term2 = (entry2.term || '').toLowerCase().trim();
     
     // Exact match
     if (term1 === term2) return true;
