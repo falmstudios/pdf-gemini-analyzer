@@ -11,27 +11,8 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Find where you have these lines in your server.js:
-const linguisticRoutes = require('./linguistic-routes');
-
-// Make sure you have these middlewares BEFORE the linguistic routes:
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.static('public'));
-
-// THEN add the linguistic routes:
-app.use('/linguistic', linguisticRoutes);
-
 // Add this near the top with other requires
 const linguisticRoutes = require('./linguistic-routes');
-
-// Add this after your existing routes
-app.use('/linguistic', linguisticRoutes);
-
-// Add this route to serve the linguistic cleaner page
-app.get('/linguistic-cleaner', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'linguistic.html'));
-});
 
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
@@ -56,6 +37,14 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
+
+// Add this after your existing routes
+app.use('/linguistic', linguisticRoutes);
+
+// Add this route to serve the linguistic cleaner page
+app.get('/linguistic-cleaner', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'linguistic.html'));
+});
 
 // Health check route
 app.get('/health', (req, res) => {
