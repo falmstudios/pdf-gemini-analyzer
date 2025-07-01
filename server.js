@@ -11,6 +11,17 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Add this near the top with other requires
+const linguisticRoutes = require('./linguistic-routes');
+
+// Add this after your existing routes
+app.use('/linguistic', linguisticRoutes);
+
+// Add this route to serve the linguistic cleaner page
+app.get('/linguistic-cleaner', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'linguistic.html'));
+});
+
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
   timeout: 0, // No timeout
