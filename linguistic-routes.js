@@ -271,6 +271,8 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         processingState.status = 'Processing with Gemini 2.5 Pro...';
         const processedEntries = [];
         const totalBatches = Math.ceil(mergedEntries.length / batchSize);
+        let successfulBatches = 0;
+        let failedBatches = 0;
         
         for (let i = 0; i < mergedEntries.length; i += batchSize) {
             const batch = mergedEntries.slice(i, Math.min(i + batchSize, mergedEntries.length));
@@ -284,17 +286,25 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
             
             try {
                 const cleanedBatch = await processWithGemini(batch);
-                processedEntries.push(...cleanedBatch);
+                if (cleanedBatch && cleanedBatch.length > 0) {
+                    processedEntries.push(...cleanedBatch);
+                    successfulBatches++;
+                } else {
+                    failedBatches++;
+                    addLog(`Batch ${batchNum} returned no results`, 'warning');
+                }
                 
                 // Add delay to respect rate limits (10 requests per minute = 6 seconds between requests)
                 await new Promise(resolve => setTimeout(resolve, 6000));
                 
             } catch (error) {
+                failedBatches++;
                 addLog(`Error processing batch ${batchNum}: ${error.message}`, 'error');
                 // Continue with next batch even if one fails
             }
         }
         
+        addLog(`Batch processing complete: ${successfulBatches} successful, ${failedBatches} failed`, 'info');
         processingState.progress = 0.9;
         
         // Step 5: Save to database
@@ -308,24 +318,25 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         };
         
         // Save all processed entries
-        for (const entryGroup of processedEntries) {
-            for (const entry of entryGroup) {
-                try {
-                    // Get original data from mergedMap
-                    const originalData = mergedMap.get(entry.halunder_term?.toLowerCase().trim());
-                    if (!originalData) continue;
-                    
-                    await saveCleanedEntry({
-                        ...entry,
-                        source_ids: originalData.source_ids,
-                        source_tables: originalData.source_tables
-                    });
-                    
-                    results.entriesCreated++;
-                } catch (error) {
-                    addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
-                    results.errors++;
+        for (const entry of processedEntries) {
+            try {
+                // Get original data from mergedMap
+                const originalData = mergedMap.get(entry.halunder_term?.toLowerCase().trim());
+                if (!originalData) {
+                    addLog(`No original data found for ${entry.halunder_term}`, 'warning');
+                    continue;
                 }
+                
+                await saveCleanedEntry({
+                    ...entry,
+                    source_ids: originalData.source_ids,
+                    source_tables: originalData.source_tables
+                });
+                
+                results.entriesCreated++;
+            } catch (error) {
+                addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
+                results.errors++;
             }
         }
         
@@ -350,7 +361,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
     }
 }
 
-// Process batch with Gemini
+// Process batch with Gemini - IMPROVED VERSION
 async function processWithGemini(batch) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
     
@@ -367,6 +378,7 @@ Wichtig:
 - NUR konkrete, nachprüfbare Fakten
 - Bei Varianten: Markiere die Hauptform als "primary", Nebenformen als "secondary"
 - Behalte alle wichtigen Informationen aus den Originaltexten
+- WICHTIG: Escape alle Anführungszeichen in den Texten mit Backslash
 
 Eingabe (${batch.length} Einträge):
 ${JSON.stringify(batch, null, 2)}
@@ -382,24 +394,63 @@ Ausgabe als JSON-Array mit dieser Struktur:
   }
 ]
 
-Erstelle separate Einträge für Haupt- und Nebenschreibweisen.`;
+WICHTIG: Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!`;
 
     try {
         const result = await model.generateContent(prompt);
-        const response = result.response.text();
+        let response = result.response.text();
         
-        // Extract JSON from response
+        // Clean up the response
+        response = response.trim();
+        
+        // Remove markdown code blocks if present
+        response = response.replace(/```json\s*/gi, '');
+        response = response.replace(/```\s*/gi, '');
+        
+        // Try to extract JSON array
         const jsonMatch = response.match(/\[[\s\S]*\]/);
-        if (jsonMatch) {
-            return JSON.parse(jsonMatch[0]);
+        if (!jsonMatch) {
+            throw new Error('No JSON array found in response');
         }
         
-        throw new Error('Failed to parse Gemini response');
+        let jsonString = jsonMatch[0];
+        
+        // Try to parse
+        try {
+            return JSON.parse(jsonString);
+        } catch (parseError) {
+            // If parsing fails, try to fix common issues
+            addLog(`Initial JSON parse failed, attempting to fix...`, 'warning');
+            
+            // Log the error position
+            const errorPos = parseError.message.match(/position (\d+)/)?.[1];
+            if (errorPos) {
+                const start = Math.max(0, parseInt(errorPos) - 100);
+                const end = Math.min(jsonString.length, parseInt(errorPos) + 100);
+                console.error('JSON error near:', jsonString.substring(start, end));
+            }
+            
+            // Try one more time with a more lenient approach
+            try {
+                // Remove any control characters
+                jsonString = jsonString.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+                // Fix escaped quotes that might be causing issues
+                jsonString = jsonString.replace(/\\"/g, '\\"');
+                return JSON.parse(jsonString);
+            } catch (secondError) {
+                // If it still fails, return empty array for this batch
+                addLog(`Failed to parse batch, skipping: ${secondError.message}`, 'error');
+                return [];
+            }
+        }
+        
     } catch (error) {
         if (error.message?.includes('quota')) {
             throw new Error('Gemini API quota exceeded. Please wait before retrying.');
         }
-        throw error;
+        addLog(`Gemini API error: ${error.message}`, 'error');
+        // Return empty array to continue processing other batches
+        return [];
     }
 }
 
