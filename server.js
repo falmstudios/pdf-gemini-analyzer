@@ -11,6 +11,17 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Find where you have these lines in your server.js:
+const linguisticRoutes = require('./linguistic-routes');
+
+// Make sure you have these middlewares BEFORE the linguistic routes:
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.static('public'));
+
+// THEN add the linguistic routes:
+app.use('/linguistic', linguisticRoutes);
+
 // Add this near the top with other requires
 const linguisticRoutes = require('./linguistic-routes');
 
