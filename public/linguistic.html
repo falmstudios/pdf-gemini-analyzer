@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Linguistic Data Cleaner</title>
+    <link rel="stylesheet" href="linguistic-styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Linguistic Data Cleaner</h1>
+            <a href="/" class="back-link">← Back to PDF Analyzer</a>
+        </div>
+        
+        <div class="main-content">
+            <div class="info-panel">
+                <h2>About This Tool</h2>
+                <p>This tool cleans and consolidates linguistic features and translation aids from the source database, removing duplicates and merging similar entries.</p>
+            </div>
+            
+            <div class="stats-panel">
+                <h2>Source Data Statistics</h2>
+                <div id="stats-loading" class="loading">Loading statistics...</div>
+                <div id="stats-content" style="display: none;">
+                    <div class="stat-item">
+                        <span class="stat-label">Linguistic Features:</span>
+                        <span id="linguistic-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Translation Aids:</span>
+                        <span id="translation-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Total Records:</span>
+                        <span id="total-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Already Processed:</span>
+                        <span id="processed-count" class="stat-value">-</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="control-panel">
+                <h2>Cleaning Controls</h2>
+                <div class="control-buttons">
+                    <button id="start-btn" onclick="startCleaning()" class="primary-btn">
+                        Start Cleaning Process
+                    </button>
+                    <button onclick="refreshStats()" class="secondary-btn">
+                        Refresh Statistics
+                    </button>
+                    <button onclick="clearLogs()" class="secondary-btn">
+                        Clear Logs
+                    </button>
+                </div>
+                
+                <div class="options-panel">
+                    <h3>Processing Options</h3>
+                    <label>
+                        <input type="checkbox" id="process-linguistic" checked>
+                        Process Linguistic Features
+                    </label>
+                    <label>
+                        <input type="checkbox" id="process-translation" checked>
+                        Process Translation Aids
+                    </label>
+                    <label>
+                        Batch Size:
+                        <select id="batch-size">
+                            <option value="100">100 records</option>
+                            <option value="250" selected>250 records</option>
+                            <option value="500">500 records</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            
+            <div class="progress-panel" id="progress-panel" style="display: none;">
+                <h2>Processing Progress</h2>
+                <div class="progress-bar">
+                    <div id="progress-fill" class="progress-fill"></div>
+                </div>
+                <p id="progress-text" class="progress-text">Initializing...</p>
+                <p id="progress-details" class="progress-details"></p>
+            </div>
+            
+            <div class="results-panel" id="results-panel" style="display: none;">
+                <h2>Cleaning Results</h2>
+                <div id="results-content"></div>
+            </div>
+            
+            <div class="console-panel">
+                <h2>Processing Log</h2>
+                <div id="console" class="console-output"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="linguistic-script.js"></script>
+</body>
+</html>
