@@ -2,10 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const stringSimilarity = require('string-similarity');
+
+// Add body parser middleware to this router
+router.use(express.json());
 
 // Initialize connections with error checking
-console.log('Initializing linguistic routes...');
+console.log('Initializing linguistic routes v2...');
 console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
 console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
 console.log('SUPABASE_URL exists:', !!process.env.SUPABASE_URL);
@@ -63,11 +65,8 @@ function addLog(message, type = 'info') {
 // Get statistics
 router.get('/stats', async (req, res) => {
     try {
-        console.log('Getting statistics...');
-        
         // Check if source database is configured
         if (!sourceSupabase) {
-            console.log('Source Supabase not configured, returning mock data');
             return res.json({
                 linguisticFeatures: 0,
                 translationAids: 0,
@@ -78,43 +77,25 @@ router.get('/stats', async (req, res) => {
         }
         
         // Get counts from source database
-        console.log('Fetching linguistic_features count...');
-        const { count: linguisticCount, error: linguisticError } = await sourceSupabase
+        const { count: linguisticCount } = await sourceSupabase
             .from('linguistic_features')
             .select('*', { count: 'exact', head: true });
             
-        if (linguisticError) {
-            console.error('Error fetching linguistic_features:', linguisticError);
-        }
-            
-        console.log('Fetching translation_aids count...');
-        const { count: translationCount, error: translationError } = await sourceSupabase
+        const { count: translationCount } = await sourceSupabase
             .from('translation_aids')
             .select('*', { count: 'exact', head: true });
             
-        if (translationError) {
-            console.error('Error fetching translation_aids:', translationError);
-        }
-            
         // Get processed count from destination database
-        console.log('Fetching cleaned count...');
-        const { count: processedCount, error: processedError } = await destSupabase
+        const { count: processedCount } = await destSupabase
             .from('cleaned_linguistic_examples')
             .select('*', { count: 'exact', head: true });
-            
-        if (processedError) {
-            console.error('Error fetching cleaned_linguistic_examples:', processedError);
-        }
         
-        const response = {
+        res.json({
             linguisticFeatures: linguisticCount || 0,
             translationAids: translationCount || 0,
             total: (linguisticCount || 0) + (translationCount || 0),
             processed: processedCount || 0
-        };
-        
-        console.log('Statistics response:', response);
-        res.json(response);
+        });
         
     } catch (error) {
         console.error('Stats error:', error);
@@ -131,8 +112,6 @@ router.get('/stats', async (req, res) => {
 // Start cleaning process
 router.post('/start-cleaning', async (req, res) => {
     try {
-        console.log('Start cleaning request received:', req.body);
-        
         if (!sourceSupabase) {
             return res.status(400).json({ 
                 error: 'Source database not configured. Please add SOURCE_SUPABASE_URL and SOURCE_SUPABASE_ANON_KEY to environment variables.' 
@@ -144,11 +123,6 @@ router.post('/start-cleaning', async (req, res) => {
         }
         
         const { processLinguistic, processTranslation, batchSize } = req.body;
-        
-        // Validate input
-        if (!processLinguistic && !processTranslation) {
-            return res.status(400).json({ error: 'No data sources selected for processing' });
-        }
         
         // Reset state
         processingState = {
@@ -162,7 +136,7 @@ router.post('/start-cleaning', async (req, res) => {
         };
         
         // Start processing in background
-        processData(processLinguistic, processTranslation, batchSize || 250)
+        processDataV2(processLinguistic, processTranslation, batchSize || 250)
             .catch(error => {
                 console.error('Background processing error:', error);
                 addLog(`Critical error: ${error.message}`, 'error');
@@ -188,142 +162,171 @@ router.get('/progress', (req, res) => {
         percentage,
         status: processingState.status,
         details: processingState.details,
-        logs: processingState.logs.slice(-50), // Send only last 50 logs
+        logs: processingState.logs.slice(-50),
         completed,
         results: processingState.results
     });
 });
 
-// Main processing function
-async function processData(processLinguistic, processTranslation, batchSize) {
+// Main processing function V2
+async function processDataV2(processLinguistic, processTranslation, batchSize) {
     try {
-        addLog('Starting data cleaning process', 'info');
-        addLog(`Batch size: ${batchSize}`, 'info');
+        addLog('Starting data cleaning process V2', 'info');
         
+        // Step 1: Fetch all data
         let allRecords = [];
-        let totalRecords = 0;
         
-        // Fetch linguistic features
         if (processLinguistic) {
             addLog('Fetching linguistic features...', 'info');
-            try {
-                const { data: linguisticData, error } = await sourceSupabase
-                    .from('linguistic_features')
-                    .select('*');
-                    
-                if (error) {
-                    addLog(`Error fetching linguistic features: ${error.message}`, 'error');
-                    throw error;
-                }
+            const { data: linguisticData, error } = await sourceSupabase
+                .from('linguistic_features')
+                .select('*')
+                .order('halunder_term');
                 
-                if (!linguisticData) {
-                    addLog('No linguistic features data returned', 'warning');
-                } else {
-                    const mappedData = linguisticData.map(item => ({
-                        ...item,
-                        source_table: 'linguistic_features',
-                        term: item.halunder_term
-                    }));
-                    
-                    allRecords = allRecords.concat(mappedData);
-                    addLog(`Fetched ${linguisticData.length} linguistic features`, 'success');
-                }
-            } catch (error) {
-                addLog(`Failed to fetch linguistic features: ${error.message}`, 'error');
-                if (!processTranslation) throw error; // Only throw if not processing translation aids
-            }
+            if (error) throw error;
+            
+            allRecords = allRecords.concat(linguisticData.map(item => ({
+                ...item,
+                source_table: 'linguistic_features',
+                term: item.halunder_term?.toLowerCase().trim()
+            })));
+            
+            addLog(`Fetched ${linguisticData.length} linguistic features`, 'success');
         }
         
-        // Fetch translation aids
         if (processTranslation) {
             addLog('Fetching translation aids...', 'info');
-            try {
-                const { data: translationData, error } = await sourceSupabase
-                    .from('translation_aids')
-                    .select('*');
-                    
-                if (error) {
-                    addLog(`Error fetching translation aids: ${error.message}`, 'error');
-                    throw error;
-                }
+            const { data: translationData, error } = await sourceSupabase
+                .from('translation_aids')
+                .select('*')
+                .order('term');
                 
-                if (!translationData) {
-                    addLog('No translation aids data returned', 'warning');
-                } else {
-                    const mappedData = translationData.map(item => ({
-                        id: item.id,
-                        halunder_term: item.term,
-                        german_equivalent: null,
-                        explanation: item.explanation,
-                        feature_type: 'translation_aid',
-                        source_table: 'translation_aids',
-                        term: item.term
-                    }));
-                    
-                    allRecords = allRecords.concat(mappedData);
-                    addLog(`Fetched ${translationData.length} translation aids`, 'success');
-                }
-            } catch (error) {
-                addLog(`Failed to fetch translation aids: ${error.message}`, 'error');
-                if (!processLinguistic || allRecords.length === 0) throw error;
+            if (error) throw error;
+            
+            allRecords = allRecords.concat(translationData.map(item => ({
+                ...item,
+                halunder_term: item.term,
+                source_table: 'translation_aids',
+                term: item.term?.toLowerCase().trim()
+            })));
+            
+            addLog(`Fetched ${translationData.length} translation aids`, 'success');
+        }
+        
+        addLog(`Total records fetched: ${allRecords.length}`, 'info');
+        processingState.progress = 0.2;
+        
+        // Step 2: Simple merge by exact term match
+        processingState.status = 'Merging duplicates...';
+        const mergedMap = new Map();
+        
+        for (const record of allRecords) {
+            if (!record.term) continue;
+            
+            if (mergedMap.has(record.term)) {
+                // Append explanation with separator
+                const existing = mergedMap.get(record.term);
+                existing.explanations.push(record.explanation);
+                existing.source_ids.push(record.id);
+                existing.source_tables.push(record.source_table);
+            } else {
+                // Create new entry
+                mergedMap.set(record.term, {
+                    halunder_term: record.halunder_term,
+                    german_equivalent: record.german_equivalent || null,
+                    explanations: [record.explanation],
+                    feature_type: record.feature_type || 'general',
+                    source_ids: [record.id],
+                    source_tables: [record.source_table],
+                    original_count: 1
+                });
             }
         }
         
-        totalRecords = allRecords.length;
+        addLog(`Merged into ${mergedMap.size} unique terms`, 'info');
+        processingState.progress = 0.4;
         
-        if (totalRecords === 0) {
-            throw new Error('No records found to process');
+        // Calculate statistics
+        let totalDuplicates = 0;
+        for (const [term, data] of mergedMap) {
+            if (data.explanations.length > 1) {
+                totalDuplicates += data.explanations.length - 1;
+            }
+        }
+        addLog(`Found ${totalDuplicates} duplicates`, 'info');
+        
+        // Step 3: Prepare data for LLM processing
+        processingState.status = 'Preparing for LLM processing...';
+        const mergedEntries = Array.from(mergedMap.values()).map(entry => ({
+            halunder_term: entry.halunder_term,
+            german_equivalent: entry.german_equivalent,
+            merged_explanation: entry.explanations.join(' ++ '),
+            feature_type: entry.feature_type,
+            duplicate_count: entry.explanations.length
+        }));
+        
+        processingState.progress = 0.5;
+        
+        // Step 4: Process with LLM in batches
+        processingState.status = 'Processing with Gemini 2.5 Pro...';
+        const processedEntries = [];
+        const totalBatches = Math.ceil(mergedEntries.length / batchSize);
+        
+        for (let i = 0; i < mergedEntries.length; i += batchSize) {
+            const batch = mergedEntries.slice(i, Math.min(i + batchSize, mergedEntries.length));
+            const batchNum = Math.floor(i / batchSize) + 1;
+            
+            processingState.status = `Processing batch ${batchNum} of ${totalBatches}`;
+            processingState.details = `Processing entries ${i + 1} to ${Math.min(i + batchSize, mergedEntries.length)}`;
+            processingState.progress = 0.5 + (0.4 * (i / mergedEntries.length));
+            
+            addLog(`Processing batch ${batchNum}/${totalBatches} (${batch.length} entries)`, 'info');
+            
+            try {
+                const cleanedBatch = await processWithGemini(batch);
+                processedEntries.push(...cleanedBatch);
+                
+                // Add delay to respect rate limits (10 requests per minute = 6 seconds between requests)
+                await new Promise(resolve => setTimeout(resolve, 6000));
+                
+            } catch (error) {
+                addLog(`Error processing batch ${batchNum}: ${error.message}`, 'error');
+                // Continue with next batch even if one fails
+            }
         }
         
-        addLog(`Total records to process: ${totalRecords}`, 'info');
+        processingState.progress = 0.9;
         
-        // Group similar entries
-        processingState.status = 'Finding duplicates...';
-        const groups = findSimilarEntries(allRecords);
-        addLog(`Found ${groups.length} unique groups`, 'info');
-        
-        // Process in batches
+        // Step 5: Save to database
+        processingState.status = 'Saving to database...';
         const results = {
-            totalProcessed: 0,
-            uniqueEntries: 0,
-            duplicatesFound: 0,
+            totalProcessed: allRecords.length,
+            uniqueTerms: mergedMap.size,
+            duplicatesFound: totalDuplicates,
+            entriesCreated: 0,
             errors: 0
         };
         
-        for (let i = 0; i < groups.length; i += batchSize) {
-            const batch = groups.slice(i, Math.min(i + batchSize, groups.length));
-            const batchNum = Math.floor(i / batchSize) + 1;
-            const totalBatches = Math.ceil(groups.length / batchSize);
-            
-            processingState.status = `Processing batch ${batchNum} of ${totalBatches}`;
-            processingState.details = `Processing entries ${i + 1} to ${Math.min(i + batchSize, groups.length)} of ${groups.length}`;
-            processingState.progress = (i + batch.length) / groups.length;
-            
-            addLog(`Processing batch ${batchNum}/${totalBatches}`, 'info');
-            
-            try {
-                // Process this batch with Gemini
-                const processedBatch = await processBatchWithGemini(batch);
-                
-                // Save to database
-                for (const entry of processedBatch) {
-                    try {
-                        await saveCleanedEntry(entry);
-                        results.uniqueEntries++;
-                        results.duplicatesFound += entry.sourceIds.length - 1;
-                        results.totalProcessed += entry.sourceIds.length;
-                    } catch (error) {
-                        addLog(`Error saving entry: ${error.message}`, 'error');
-                        results.errors++;
-                    }
+        // Save all processed entries
+        for (const entryGroup of processedEntries) {
+            for (const entry of entryGroup) {
+                try {
+                    // Get original data from mergedMap
+                    const originalData = mergedMap.get(entry.halunder_term?.toLowerCase().trim());
+                    if (!originalData) continue;
+                    
+                    await saveCleanedEntry({
+                        ...entry,
+                        source_ids: originalData.source_ids,
+                        source_tables: originalData.source_tables
+                    });
+                    
+                    results.entriesCreated++;
+                } catch (error) {
+                    addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
+                    results.errors++;
                 }
-            } catch (error) {
-                addLog(`Error processing batch ${batchNum}: ${error.message}`, 'error');
-                results.errors += batch.length;
             }
-            
-            // Small delay to avoid rate limits
-            await new Promise(resolve => setTimeout(resolve, 1000));
         }
         
         // Calculate processing time
@@ -332,7 +335,7 @@ async function processData(processLinguistic, processTranslation, batchSize) {
         
         processingState.results = results;
         processingState.status = 'Completed';
-        processingState.details = `Processed ${results.totalProcessed} records, created ${results.uniqueEntries} unique entries`;
+        processingState.details = `Created ${results.entriesCreated} entries from ${results.uniqueTerms} unique terms`;
         processingState.progress = 1;
         
         addLog('Processing completed successfully', 'success');
@@ -347,181 +350,91 @@ async function processData(processLinguistic, processTranslation, batchSize) {
     }
 }
 
-// Find similar entries
-function findSimilarEntries(records) {
-    const groups = [];
-    const processed = new Set();
-    
-    for (let i = 0; i < records.length; i++) {
-        if (processed.has(i)) continue;
-        
-        const group = [records[i]];
-        processed.add(i);
-        
-        for (let j = i + 1; j < records.length; j++) {
-            if (processed.has(j)) continue;
-            
-            if (areSimilar(records[i], records[j])) {
-                group.push(records[j]);
-                processed.add(j);
-            }
-        }
-        
-        groups.push(group);
-    }
-    
-    return groups;
-}
-
-// Check if two entries are similar
-function areSimilar(entry1, entry2) {
-    const term1 = (entry1.term || '').toLowerCase().trim();
-    const term2 = (entry2.term || '').toLowerCase().trim();
-    
-    // Exact match
-    if (term1 === term2) return true;
-    
-    // Check if one is subset of another (e.g., "Hog" and "Hog/Pig")
-    if (term1.includes(term2) || term2.includes(term1)) {
-        // Make sure it's a meaningful subset (not just partial word match)
-        const separators = [' ', '/', ',', ';', '(', ')'];
-        for (const sep of separators) {
-            if (term1.split(sep).includes(term2) || term2.split(sep).includes(term1)) {
-                return true;
-            }
-        }
-    }
-    
-    // Check explanation similarity (only if terms are somewhat similar)
-    const termSimilarity = stringSimilarity.compareTwoStrings(term1, term2);
-    if (termSimilarity > 0.8) {
-        const exp1 = (entry1.explanation || '').toLowerCase();
-        const exp2 = (entry2.explanation || '').toLowerCase();
-        const expSimilarity = stringSimilarity.compareTwoStrings(exp1, exp2);
-        return expSimilarity > 0.7;
-    }
-    
-    return false;
-}
-
 // Process batch with Gemini
-async function processBatchWithGemini(groups) {
-    const processed = [];
+async function processWithGemini(batch) {
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
     
-    for (const group of groups) {
-        if (group.length === 1) {
-            // Single entry, no need for Gemini
-            processed.push({
-                halunder_term: group[0].halunder_term || group[0].term,
-                german_equivalent: group[0].german_equivalent,
-                explanation: group[0].explanation,
-                feature_type: group[0].feature_type,
-                source_table: group[0].source_table,
-                sourceIds: [group[0].id]
-            });
-        } else {
-            // Multiple entries, use Gemini to consolidate
-            try {
-                const consolidated = await consolidateWithGemini(group);
-                processed.push({
-                    ...consolidated,
-                    sourceIds: group.map(g => g.id)
-                });
-            } catch (error) {
-                addLog(`Error consolidating group: ${error.message}`, 'warning');
-                // Fallback: use the most complete entry
-                const best = group.reduce((a, b) => 
-                    (a.explanation || '').length > (b.explanation || '').length ? a : b
-                );
-                processed.push({
-                    halunder_term: best.halunder_term || best.term,
-                    german_equivalent: best.german_equivalent,
-                    explanation: best.explanation,
-                    feature_type: best.feature_type,
-                    source_table: best.source_table,
-                    sourceIds: group.map(g => g.id)
-                });
-            }
+    const prompt = `Du bist ein Experte für die Halunder Sprache (Helgoländisch) und sollst linguistische Erklärungen für ein Wörterbuch aufbereiten.
+
+Aufgabe:
+1. Bereinige die zusammengeführten Erklärungen
+2. Erstelle präzise, faktische Erklärungen die Übersetzern helfen
+3. Identifiziere Hauptschreibweisen und Varianten
+4. Füge kulturellen/historischen Kontext hinzu wo relevant
+
+Wichtig:
+- KEINE generischen Phrasen wie "traditionell auf Helgoland verwendet"
+- NUR konkrete, nachprüfbare Fakten
+- Bei Varianten: Markiere die Hauptform als "primary", Nebenformen als "secondary"
+- Behalte alle wichtigen Informationen aus den Originaltexten
+
+Eingabe (${batch.length} Einträge):
+${JSON.stringify(batch, null, 2)}
+
+Ausgabe als JSON-Array mit dieser Struktur:
+[
+  {
+    "halunder_term": "Hauptschreibweise",
+    "german_equivalent": "Deutsche Entsprechung",
+    "explanation": "Bereinigte, vollständige Erklärung",
+    "feature_type": "primary|secondary|general",
+    "related_to": "Hauptterm bei secondary entries"
+  }
+]
+
+Erstelle separate Einträge für Haupt- und Nebenschreibweisen.`;
+
+    try {
+        const result = await model.generateContent(prompt);
+        const response = result.response.text();
+        
+        // Extract JSON from response
+        const jsonMatch = response.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+            return JSON.parse(jsonMatch[0]);
         }
+        
+        throw new Error('Failed to parse Gemini response');
+    } catch (error) {
+        if (error.message?.includes('quota')) {
+            throw new Error('Gemini API quota exceeded. Please wait before retrying.');
+        }
+        throw error;
     }
-    
-    return processed;
-}
-
-// Consolidate entries with Gemini
-async function consolidateWithGemini(group) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
-    
-    const prompt = `You are a linguistic expert consolidating duplicate dictionary entries. 
-Analyze these similar entries and create ONE consolidated entry that combines the best information from all:
-
-${group.map((g, i) => `Entry ${i + 1}:
-- Term: ${g.halunder_term || g.term}
-- German: ${g.german_equivalent || 'N/A'}
-- Explanation: ${g.explanation}
-- Type: ${g.feature_type || 'N/A'}`).join('\n\n')}
-
-Create a single consolidated entry with:
-1. The most complete/correct Halunder term
-2. The German equivalent (if available)
-3. A comprehensive explanation combining all useful information
-4. The most appropriate feature type
-
-Respond in JSON format:
-{
-    "halunder_term": "...",
-    "german_equivalent": "...",
-    "explanation": "...",
-    "feature_type": "..."
-}`;
-
-    const result = await model.generateContent(prompt);
-    const response = result.response.text();
-    
-    // Extract JSON from response
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        return {
-            ...parsed,
-            source_table: group[0].source_table // Keep original source table
-        };
-    }
-    
-    throw new Error('Failed to parse Gemini response');
 }
 
 // Save cleaned entry to database
 async function saveCleanedEntry(entry) {
-    // Insert the cleaned entry
-    const { data: cleanedData, error: cleanedError } = await destSupabase
+    const { data, error } = await destSupabase
         .from('cleaned_linguistic_examples')
         .insert([{
             halunder_term: entry.halunder_term,
             german_equivalent: entry.german_equivalent,
             explanation: entry.explanation,
-            feature_type: entry.feature_type,
-            source_table: entry.source_table,
-            source_ids: entry.sourceIds
+            feature_type: entry.feature_type || 'general',
+            source_table: entry.source_tables?.[0] || 'mixed',
+            source_ids: entry.source_ids || []
         }])
         .select()
         .single();
         
-    if (cleanedError) throw cleanedError;
+    if (error) throw error;
     
     // Insert duplicate mappings
-    const mappings = entry.sourceIds.map(sourceId => ({
-        original_id: sourceId,
-        source_table: entry.source_table,
-        cleaned_id: cleanedData.id,
-        similarity_score: 1.0
-    }));
-    
-    const { error: mappingError } = await destSupabase
-        .from('linguistic_duplicates_map')
-        .insert(mappings);
+    if (entry.source_ids && entry.source_ids.length > 0) {
+        const mappings = entry.source_ids.map((sourceId, index) => ({
+            original_id: sourceId,
+            source_table: entry.source_tables?.[index] || 'unknown',
+            cleaned_id: data.id,
+            similarity_score: 1.0
+        }));
         
-    if (mappingError) throw mappingError;
+        const { error: mappingError } = await destSupabase
+            .from('linguistic_duplicates_map')
+            .insert(mappings);
+            
+        if (mappingError) throw mappingError;
+    }
 }
 
 module.exports = router;
