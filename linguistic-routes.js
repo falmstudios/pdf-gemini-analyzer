@@ -10,8 +10,6 @@ router.use(express.json());
 console.log('Initializing linguistic routes v2...');
 console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
 console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
-console.log('SUPABASE_URL exists:', !!process.env.SUPABASE_URL);
-console.log('SUPABASE_ANON_KEY exists:', !!process.env.SUPABASE_ANON_KEY);
 console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
 
 // Check if we have the required environment variables
@@ -19,17 +17,13 @@ if (!process.env.SOURCE_SUPABASE_URL || !process.env.SOURCE_SUPABASE_ANON_KEY) {
     console.error('WARNING: Source Supabase credentials not found!');
 }
 
-const sourceSupabase = process.env.SOURCE_SUPABASE_URL && process.env.SOURCE_SUPABASE_ANON_KEY
+// Use SOURCE Supabase for everything
+const supabase = process.env.SOURCE_SUPABASE_URL && process.env.SOURCE_SUPABASE_ANON_KEY
     ? createClient(
         process.env.SOURCE_SUPABASE_URL,
         process.env.SOURCE_SUPABASE_ANON_KEY
     )
     : null;
-
-const destSupabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY
-);
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -68,28 +62,28 @@ function addLog(message, type = 'info') {
 // Get statistics
 router.get('/stats', async (req, res) => {
     try {
-        // Check if source database is configured
-        if (!sourceSupabase) {
+        // Check if database is configured
+        if (!supabase) {
             return res.json({
                 linguisticFeatures: 0,
                 translationAids: 0,
                 total: 0,
                 processed: 0,
-                error: 'Source database not configured'
+                error: 'Database not configured'
             });
         }
         
-        // Get counts from source database
-        const { count: linguisticCount } = await sourceSupabase
+        // Get counts from database
+        const { count: linguisticCount } = await supabase
             .from('linguistic_features')
             .select('*', { count: 'exact', head: true });
             
-        const { count: translationCount } = await sourceSupabase
+        const { count: translationCount } = await supabase
             .from('translation_aids')
             .select('*', { count: 'exact', head: true });
             
-        // Get processed count from destination database
-        const { count: processedCount } = await destSupabase
+        // Get processed count
+        const { count: processedCount } = await supabase
             .from('cleaned_linguistic_examples')
             .select('*', { count: 'exact', head: true });
         
@@ -127,7 +121,7 @@ router.get('/test-save', async (req, res) => {
         
         console.log('Attempting to insert:', testEntry);
         
-        const { data, error } = await destSupabase
+        const { data, error } = await supabase
             .from('cleaned_linguistic_examples')
             .insert([testEntry])
             .select()
@@ -161,7 +155,7 @@ router.get('/test-save', async (req, res) => {
 router.get('/test-table', async (req, res) => {
     try {
         // Get table schema
-        const { data, error } = await destSupabase
+        const { data, error } = await supabase
             .from('cleaned_linguistic_examples')
             .select('*')
             .limit(1);
@@ -183,9 +177,9 @@ router.get('/test-table', async (req, res) => {
 // Start cleaning process
 router.post('/start-cleaning', async (req, res) => {
     try {
-        if (!sourceSupabase) {
+        if (!supabase) {
             return res.status(400).json({ 
-                error: 'Source database not configured. Please add SOURCE_SUPABASE_URL and SOURCE_SUPABASE_ANON_KEY to environment variables.' 
+                error: 'Database not configured. Please add SOURCE_SUPABASE_URL and SOURCE_SUPABASE_ANON_KEY to environment variables.' 
             });
         }
         
@@ -252,7 +246,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         
         if (processLinguistic) {
             addLog('Fetching linguistic features...', 'info');
-            const { data: linguisticData, error } = await sourceSupabase
+            const { data: linguisticData, error } = await supabase
                 .from('linguistic_features')
                 .select('*')
                 .order('halunder_term');
@@ -270,7 +264,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         
         if (processTranslation) {
             addLog('Fetching translation aids...', 'info');
-            const { data: translationData, error } = await sourceSupabase
+            const { data: translationData, error } = await supabase
                 .from('translation_aids')
                 .select('*')
                 .order('term');
@@ -567,7 +561,7 @@ async function saveCleanedEntry(entry) {
         
         console.log('Inserting:', JSON.stringify(insertData, null, 2));
         
-        const { data, error } = await destSupabase
+        const { data, error } = await supabase
             .from('cleaned_linguistic_examples')
             .insert([insertData])
             .select()
@@ -592,7 +586,7 @@ async function saveCleanedEntry(entry) {
                 similarity_score: 1.0
             }));
             
-            const { error: mappingError } = await destSupabase
+            const { error: mappingError } = await supabase
                 .from('linguistic_duplicates_map')
                 .insert(mappings);
                 
