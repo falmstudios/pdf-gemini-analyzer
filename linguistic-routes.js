@@ -44,6 +44,9 @@ let processingState = {
     startTime: null
 };
 
+// Store the merged data globally for the processing session
+let currentMergedMap = null;
+
 // Helper function to add logs
 function addLog(message, type = 'info') {
     const log = {
@@ -134,6 +137,9 @@ router.post('/start-cleaning', async (req, res) => {
             results: null,
             startTime: Date.now()
         };
+        
+        // Clear previous session data
+        currentMergedMap = null;
         
         // Start processing in background
         processDataV2(processLinguistic, processTranslation, batchSize || 250)
@@ -243,6 +249,9 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
             }
         }
         
+        // Store merged map globally for this session
+        currentMergedMap = mergedMap;
+        
         addLog(`Merged into ${mergedMap.size} unique terms`, 'info');
         processingState.progress = 0.4;
         
@@ -257,7 +266,8 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         
         // Step 3: Prepare data for LLM processing
         processingState.status = 'Preparing for LLM processing...';
-        const mergedEntries = Array.from(mergedMap.values()).map(entry => ({
+        const mergedEntries = Array.from(mergedMap.entries()).map(([term, entry]) => ({
+            original_term_key: term, // Keep the lowercase key for lookup
             halunder_term: entry.halunder_term,
             german_equivalent: entry.german_equivalent,
             merged_explanation: entry.explanations.join(' ++ '),
@@ -287,6 +297,17 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
             try {
                 const cleanedBatch = await processWithGemini(batch);
                 if (cleanedBatch && cleanedBatch.length > 0) {
+                    // Add original term keys to the cleaned entries
+                    for (const cleanedEntry of cleanedBatch) {
+                        // Find the original entry in the batch
+                        const originalEntry = batch.find(b => 
+                            b.halunder_term === cleanedEntry.halunder_term ||
+                            b.halunder_term?.toLowerCase() === cleanedEntry.halunder_term?.toLowerCase()
+                        );
+                        if (originalEntry) {
+                            cleanedEntry.original_term_key = originalEntry.original_term_key;
+                        }
+                    }
                     processedEntries.push(...cleanedBatch);
                     successfulBatches++;
                 } else {
@@ -294,13 +315,12 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
                     addLog(`Batch ${batchNum} returned no results`, 'warning');
                 }
                 
-                // Add delay to respect rate limits (10 requests per minute = 6 seconds between requests)
+                // Add delay to respect rate limits
                 await new Promise(resolve => setTimeout(resolve, 6000));
                 
             } catch (error) {
                 failedBatches++;
                 addLog(`Error processing batch ${batchNum}: ${error.message}`, 'error');
-                // Continue with next batch even if one fails
             }
         }
         
@@ -320,19 +340,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         // Save all processed entries
         for (const entry of processedEntries) {
             try {
-                // Get original data from mergedMap
-                const originalData = mergedMap.get(entry.halunder_term?.toLowerCase().trim());
-                if (!originalData) {
-                    addLog(`No original data found for ${entry.halunder_term}`, 'warning');
-                    continue;
-                }
-                
-                await saveCleanedEntry({
-                    ...entry,
-                    source_ids: originalData.source_ids,
-                    source_tables: originalData.source_tables
-                });
-                
+                await saveCleanedEntry(entry);
                 results.entriesCreated++;
             } catch (error) {
                 addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
@@ -358,10 +366,11 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         throw error;
     } finally {
         processingState.isProcessing = false;
+        currentMergedMap = null; // Clear the session data
     }
 }
 
-// Process batch with Gemini - IMPROVED VERSION
+// Process batch with Gemini
 async function processWithGemini(batch) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
     
@@ -381,7 +390,7 @@ Wichtig:
 - WICHTIG: Escape alle Anführungszeichen in den Texten mit Backslash
 
 Eingabe (${batch.length} Einträge):
-${JSON.stringify(batch, null, 2)}
+${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
 
 Ausgabe als JSON-Array mit dieser Struktur:
 [
@@ -434,8 +443,6 @@ WICHTIG: Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!`;
             try {
                 // Remove any control characters
                 jsonString = jsonString.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
-                // Fix escaped quotes that might be causing issues
-                jsonString = jsonString.replace(/\\"/g, '\\"');
                 return JSON.parse(jsonString);
             } catch (secondError) {
                 // If it still fails, return empty array for this batch
@@ -456,35 +463,64 @@ WICHTIG: Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!`;
 
 // Save cleaned entry to database
 async function saveCleanedEntry(entry) {
-    const { data, error } = await destSupabase
-        .from('cleaned_linguistic_examples')
-        .insert([{
-            halunder_term: entry.halunder_term,
-            german_equivalent: entry.german_equivalent,
-            explanation: entry.explanation,
-            feature_type: entry.feature_type || 'general',
-            source_table: entry.source_tables?.[0] || 'mixed',
-            source_ids: entry.source_ids || []
-        }])
-        .select()
-        .single();
+    try {
+        // Get original data using the key
+        let originalData = null;
         
-    if (error) throw error;
-    
-    // Insert duplicate mappings
-    if (entry.source_ids && entry.source_ids.length > 0) {
-        const mappings = entry.source_ids.map((sourceId, index) => ({
-            original_id: sourceId,
-            source_table: entry.source_tables?.[index] || 'unknown',
-            cleaned_id: data.id,
-            similarity_score: 1.0
-        }));
+        if (entry.original_term_key && currentMergedMap) {
+            originalData = currentMergedMap.get(entry.original_term_key);
+        }
         
-        const { error: mappingError } = await destSupabase
-            .from('linguistic_duplicates_map')
-            .insert(mappings);
+        // If not found by key, try to find by term
+        if (!originalData && currentMergedMap) {
+            const searchTerm = entry.halunder_term?.toLowerCase().trim();
+            originalData = currentMergedMap.get(searchTerm);
+        }
+        
+        if (!originalData) {
+            addLog(`No original data found for ${entry.halunder_term}`, 'warning');
+            return;
+        }
+        
+        const { data, error } = await destSupabase
+            .from('cleaned_linguistic_examples')
+            .insert([{
+                halunder_term: entry.halunder_term,
+                german_equivalent: entry.german_equivalent,
+                explanation: entry.explanation,
+                feature_type: entry.feature_type || 'general',
+                source_table: originalData.source_tables?.[0] || 'mixed',
+                source_ids: originalData.source_ids || []
+            }])
+            .select()
+            .single();
             
-        if (mappingError) throw mappingError;
+        if (error) {
+            console.error('Supabase insert error:', error);
+            throw new Error(error.message);
+        }
+        
+        // Insert duplicate mappings
+        if (originalData.source_ids && originalData.source_ids.length > 0) {
+            const mappings = originalData.source_ids.map((sourceId, index) => ({
+                original_id: sourceId,
+                source_table: originalData.source_tables?.[index] || 'unknown',
+                cleaned_id: data.id,
+                similarity_score: 1.0
+            }));
+            
+            const { error: mappingError } = await destSupabase
+                .from('linguistic_duplicates_map')
+                .insert(mappings);
+                
+            if (mappingError) {
+                console.error('Mapping insert error:', mappingError);
+                throw new Error(mappingError.message);
+            }
+        }
+    } catch (error) {
+        console.error('Save error details:', error);
+        throw error;
     }
 }
 
