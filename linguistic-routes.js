@@ -112,6 +112,74 @@ router.get('/stats', async (req, res) => {
     }
 });
 
+// Test route for debugging
+router.get('/test-save', async (req, res) => {
+    try {
+        // Test with a simple entry
+        const testEntry = {
+            halunder_term: 'test_term',
+            german_equivalent: 'test_german',
+            explanation: 'test explanation',
+            feature_type: 'general',
+            source_table: 'linguistic_features',
+            source_ids: ['123e4567-e89b-12d3-a456-426614174000']
+        };
+        
+        console.log('Attempting to insert:', testEntry);
+        
+        const { data, error } = await destSupabase
+            .from('cleaned_linguistic_examples')
+            .insert([testEntry])
+            .select()
+            .single();
+            
+        if (error) {
+            console.error('Detailed error:', error);
+            return res.json({ 
+                success: false, 
+                error: error,
+                errorMessage: error.message,
+                errorDetails: error.details,
+                errorHint: error.hint,
+                errorCode: error.code
+            });
+        }
+        
+        res.json({ success: true, data });
+        
+    } catch (error) {
+        console.error('Catch error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message,
+            stack: error.stack 
+        });
+    }
+});
+
+// Test what columns exist in the table
+router.get('/test-table', async (req, res) => {
+    try {
+        // Get table schema
+        const { data, error } = await destSupabase
+            .from('cleaned_linguistic_examples')
+            .select('*')
+            .limit(1);
+            
+        if (error) {
+            return res.json({ error });
+        }
+        
+        res.json({ 
+            sampleData: data,
+            message: 'Check if columns match what we are trying to insert'
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Start cleaning process
 router.post('/start-cleaning', async (req, res) => {
     try {
@@ -461,7 +529,7 @@ WICHTIG: Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!`;
     }
 }
 
-// Save cleaned entry to database
+// Save cleaned entry to database - FIXED VERSION
 async function saveCleanedEntry(entry) {
     try {
         // Get original data using the key
@@ -482,29 +550,44 @@ async function saveCleanedEntry(entry) {
             return;
         }
         
+        // Ensure source_ids are valid UUIDs
+        const validSourceIds = originalData.source_ids.filter(id => {
+            // Basic UUID validation
+            return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        });
+        
+        const insertData = {
+            halunder_term: entry.halunder_term || '',
+            german_equivalent: entry.german_equivalent || null,
+            explanation: entry.explanation || '',
+            feature_type: entry.feature_type || 'general',
+            source_table: originalData.source_tables?.[0] || 'mixed',
+            source_ids: validSourceIds.length > 0 ? validSourceIds : null
+        };
+        
+        console.log('Inserting:', JSON.stringify(insertData, null, 2));
+        
         const { data, error } = await destSupabase
             .from('cleaned_linguistic_examples')
-            .insert([{
-                halunder_term: entry.halunder_term,
-                german_equivalent: entry.german_equivalent,
-                explanation: entry.explanation,
-                feature_type: entry.feature_type || 'general',
-                source_table: originalData.source_tables?.[0] || 'mixed',
-                source_ids: originalData.source_ids || []
-            }])
+            .insert([insertData])
             .select()
             .single();
             
         if (error) {
-            console.error('Supabase insert error:', error);
-            throw new Error(error.message);
+            console.error('Supabase detailed error:', {
+                message: error.message,
+                details: error.details,
+                hint: error.hint,
+                code: error.code
+            });
+            throw new Error(error.message || 'Insert failed');
         }
         
-        // Insert duplicate mappings
-        if (originalData.source_ids && originalData.source_ids.length > 0) {
-            const mappings = originalData.source_ids.map((sourceId, index) => ({
+        // Only insert mappings if we have valid IDs
+        if (validSourceIds.length > 0) {
+            const mappings = validSourceIds.map((sourceId, index) => ({
                 original_id: sourceId,
-                source_table: originalData.source_tables?.[index] || 'unknown',
+                source_table: originalData.source_tables?.[index] || originalData.source_tables?.[0] || 'unknown',
                 cleaned_id: data.id,
                 similarity_score: 1.0
             }));
@@ -515,7 +598,7 @@ async function saveCleanedEntry(entry) {
                 
             if (mappingError) {
                 console.error('Mapping insert error:', mappingError);
-                throw new Error(mappingError.message);
+                // Don't throw here, main record was saved
             }
         }
     } catch (error) {
