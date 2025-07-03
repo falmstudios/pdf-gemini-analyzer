@@ -7,7 +7,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 router.use(express.json());
 
 // Initialize connections with error checking
-console.log('Initializing linguistic routes v3...');
+console.log('Initializing linguistic routes v4 with relevance and tags...');
 console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
 console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
 console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
@@ -140,14 +140,16 @@ router.get('/stats', async (req, res) => {
 // Test route for debugging
 router.get('/test-save', async (req, res) => {
     try {
-        // Test with a simple entry
+        // Test with a simple entry including new fields
         const testEntry = {
             halunder_term: 'test_term_' + Date.now(),
             german_equivalent: 'test_german',
             explanation: 'test explanation',
             feature_type: 'general',
             source_table: 'linguistic_features',
-            source_ids: ['123e4567-e89b-12d3-a456-426614174000']
+            source_ids: ['123e4567-e89b-12d3-a456-426614174000'],
+            relevance_score: 5,
+            tags: ['test', 'debug']
         };
         
         console.log('Attempting to insert:', testEntry);
@@ -261,7 +263,7 @@ router.post('/start-cleaning', async (req, res) => {
         currentMergedMap = null;
         
         // Start processing in background
-        processDataV3(processLinguistic, processTranslation, batchSize || 250)
+        processDataV4(processLinguistic, processTranslation, batchSize || 100) // Smaller batches for more complex processing
             .catch(error => {
                 console.error('Background processing error:', error);
                 addLog(`Critical error: ${error.message}`, 'error');
@@ -293,10 +295,10 @@ router.get('/progress', (req, res) => {
     });
 });
 
-// Main processing function V3 - Fixed pagination and duplicate detection
-async function processDataV3(processLinguistic, processTranslation, batchSize) {
+// Main processing function V4 - With relevance and tags
+async function processDataV4(processLinguistic, processTranslation, batchSize) {
     try {
-        addLog('Starting data cleaning process V3', 'info');
+        addLog('Starting data cleaning process V4 with relevance scoring and tags', 'info');
         
         // Get already processed terms
         processingState.status = 'Checking already processed terms...';
@@ -434,7 +436,7 @@ async function processDataV3(processLinguistic, processTranslation, batchSize) {
             addLog(`Processing batch ${batchNum}/${totalBatches} (${batch.length} entries)`, 'info');
             
             try {
-                const cleanedBatch = await processWithGemini(batch);
+                const cleanedBatch = await processWithGeminiV4(batch);
                 if (cleanedBatch && cleanedBatch.length > 0) {
                     // Add original term keys to the cleaned entries
                     for (const cleanedEntry of cleanedBatch) {
@@ -463,7 +465,7 @@ async function processDataV3(processLinguistic, processTranslation, batchSize) {
                 }
                 
                 // Add delay to respect rate limits
-                await new Promise(resolve => setTimeout(resolve, 6000));
+                await new Promise(resolve => setTimeout(resolve, 8000)); // Slightly longer delay for more complex processing
                 
             } catch (error) {
                 failedBatches++;
@@ -488,7 +490,7 @@ async function processDataV3(processLinguistic, processTranslation, batchSize) {
         // Save all processed entries
         for (const entry of processedEntries) {
             try {
-                await saveCleanedEntry(entry);
+                await saveCleanedEntryV4(entry);
                 results.entriesCreated++;
             } catch (error) {
                 addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
@@ -518,21 +520,30 @@ async function processDataV3(processLinguistic, processTranslation, batchSize) {
     }
 }
 
-// Process batch with Gemini - FIXED VERSION
-async function processWithGemini(batch) {
+// Process batch with Gemini V4 - With relevance and tags
+async function processWithGeminiV4(batch) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
         
-        // Simpler prompt with clearer instructions
-        const prompt = `Bereinige diese Halunder Wörterbucheinträge. Erstelle für jeden Eintrag eine präzise Erklärung.
+        const prompt = `Analysiere diese Halunder Wörterbucheinträge. Für jeden Eintrag:
+1. Bereinige die Erklärung
+2. Bewerte die Relevanz (0-10): Kulturelle Bedeutung, unerwartete Bedeutungen, reichhaltige Informationen = hoch (8-10). Einfache Pluralformen oder direkte Übersetzungen = niedrig (1-3)
+3. Vergib passende Tags aus: cultural, idiom, grammar, false_friend, misspelling, etymology, person, place, building, date, maritime, food, tradition, archaic
 
 Eingabe: ${batch.length} Einträge
 ${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
 
-Gib NUR ein JSON-Array zurück im Format:
-[{"halunder_term":"term","german_equivalent":"übersetzung","explanation":"erklärung","feature_type":"general"}]
+Ausgabe als JSON-Array:
+[{
+  "halunder_term": "EXAKT wie im Input",
+  "german_equivalent": "deutsche Übersetzung",
+  "explanation": "bereinigte Erklärung",
+  "feature_type": "general/primary/secondary",
+  "relevance_score": 5,
+  "tags": ["cultural", "place"]
+}]
 
-WICHTIG: NUR das JSON-Array, keine anderen Texte!`;
+NUR das JSON-Array zurückgeben!`;
 
         const result = await model.generateContent(prompt);
         let response = result.response.text();
@@ -548,7 +559,6 @@ WICHTIG: NUR das JSON-Array, keine anderen Texte!`;
         response = response.replace(/```\s*/gi, '');
         
         // Try to find JSON array in the response
-        // Look for array start and end
         const arrayStart = response.indexOf('[');
         const arrayEnd = response.lastIndexOf(']');
         
@@ -563,14 +573,26 @@ WICHTIG: NUR das JSON-Array, keine anderen Texte!`;
         try {
             const parsed = JSON.parse(jsonString);
             if (Array.isArray(parsed)) {
-                addLog(`Successfully parsed ${parsed.length} entries from Gemini`, 'success');
-                return parsed;
+                // Validate and fix entries
+                const validatedEntries = parsed.map(entry => {
+                    // Ensure relevance_score is a number between 0-10
+                    if (typeof entry.relevance_score !== 'number' || entry.relevance_score < 0 || entry.relevance_score > 10) {
+                        entry.relevance_score = 5; // Default to middle value
+                    }
+                    // Ensure tags is an array
+                    if (!Array.isArray(entry.tags)) {
+                        entry.tags = [];
+                    }
+                    return entry;
+                });
+                
+                addLog(`Successfully parsed ${validatedEntries.length} entries from Gemini`, 'success');
+                return validatedEntries;
             } else {
                 throw new Error('Parsed result is not an array');
             }
         } catch (parseError) {
             console.error('JSON parse error:', parseError.message);
-            console.error('Attempted to parse:', jsonString.substring(0, 200) + '...');
             
             // Try to fix common JSON issues
             try {
@@ -590,26 +612,6 @@ WICHTIG: NUR das JSON-Array, keine anderen Texte!`;
                 console.error('Second parse attempt failed:', secondError.message);
             }
             
-            // If all parsing fails, try to extract individual objects
-            const objectMatches = jsonString.match(/\{[^{}]*\}/g);
-            if (objectMatches && objectMatches.length > 0) {
-                const parsedObjects = [];
-                for (const objStr of objectMatches) {
-                    try {
-                        const obj = JSON.parse(objStr);
-                        if (obj.halunder_term) {
-                            parsedObjects.push(obj);
-                        }
-                    } catch (e) {
-                        // Skip unparseable objects
-                    }
-                }
-                if (parsedObjects.length > 0) {
-                    addLog(`Recovered ${parsedObjects.length} entries from partial parsing`, 'warning');
-                    return parsedObjects;
-                }
-            }
-            
             throw new Error(`Failed to parse response: ${parseError.message}`);
         }
         
@@ -623,8 +625,8 @@ WICHTIG: NUR das JSON-Array, keine anderen Texte!`;
     }
 }
 
-// Save cleaned entry to database - FIXED VERSION V2
-async function saveCleanedEntry(entry) {
+// Save cleaned entry to database V4 - With relevance and tags
+async function saveCleanedEntryV4(entry) {
     try {
         // Get original data using the key
         let originalData = null;
@@ -637,12 +639,6 @@ async function saveCleanedEntry(entry) {
         if (!originalData && currentMergedMap && entry.halunder_term) {
             const searchTerm = entry.halunder_term.toLowerCase().trim();
             originalData = currentMergedMap.get(searchTerm);
-            
-            // Debug log
-            if (!originalData) {
-                console.log(`Failed to find data for term: "${entry.halunder_term}" (key: "${entry.original_term_key}")`);
-                console.log('Available keys sample:', Array.from(currentMergedMap.keys()).slice(0, 5));
-            }
         }
         
         if (!originalData) {
@@ -662,7 +658,9 @@ async function saveCleanedEntry(entry) {
             explanation: entry.explanation || '',
             feature_type: entry.feature_type || 'general',
             source_table: originalData.source_tables?.[0] || 'mixed',
-            source_ids: validSourceIds.length > 0 ? validSourceIds : null
+            source_ids: validSourceIds.length > 0 ? validSourceIds : null,
+            relevance_score: entry.relevance_score || 5,
+            tags: entry.tags || []
         };
         
         console.log('Inserting:', JSON.stringify(insertData, null, 2));
