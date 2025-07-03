@@ -260,7 +260,7 @@ async function processAhrhammarData() {
     try {
         addLog('ahrhammar', 'Starting Ahrhammar data processing', 'info');
         
-        // Fetch all PDF analyses, ordered by ID to ensure consistent processing
+        // Fetch all PDF analyses ordered by ID
         state.status = 'Fetching PDF analyses...';
         const { data: pdfAnalyses, error } = await supabase
             .from('pdf_analyses')
@@ -282,17 +282,15 @@ async function processAhrhammarData() {
         };
         
         // First pass: Create all concepts and terms
-        addLog('ahrhammar', 'First pass: Creating concepts and terms...', 'info');
-        const conceptsMap = new Map(); // Store headword -> concept_id mapping
-        
+        addLog('ahrhammar', 'First pass: Creating concepts and terms', 'info');
         for (let i = 0; i < pdfAnalyses.length; i++) {
             const analysis = pdfAnalyses[i];
-            state.status = `First pass: Processing ${analysis.filename}`;
+            state.status = `First pass: ${analysis.filename}`;
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.1 + (0.4 * (i / pdfAnalyses.length));
             
             try {
-                // Clean the JSON (remove wrapper)
+                // Clean the JSON
                 let jsonData = analysis.result;
                 if (jsonData.startsWith('```json')) {
                     jsonData = jsonData.substring(7);
@@ -303,21 +301,15 @@ async function processAhrhammarData() {
                 
                 const entries = JSON.parse(jsonData);
                 
-                // Process each entry (first pass - concepts only)
                 for (const entry of entries) {
                     try {
-                        const conceptId = await createConceptAndTerms(entry, results);
-                        if (conceptId) {
-                            conceptsMap.set(entry.headword, conceptId);
-                        }
+                        await processAhrhammarEntryFirstPass(entry, results);
                         results.totalProcessed++;
                     } catch (error) {
-                        addLog('ahrhammar', `Error processing entry ${entry.headword}: ${error.message}`, 'warning');
+                        addLog('ahrhammar', `Error in first pass for ${entry.headword}: ${error.message}`, 'warning');
                         results.errors++;
                     }
                 }
-                
-                addLog('ahrhammar', `First pass completed for ${analysis.filename}: ${entries.length} entries`, 'info');
                 
             } catch (error) {
                 addLog('ahrhammar', `Error processing ${analysis.filename}: ${error.message}`, 'error');
@@ -325,17 +317,15 @@ async function processAhrhammarData() {
             }
         }
         
-        // Second pass: Create relations now that all concepts exist
-        addLog('ahrhammar', 'Second pass: Creating relations...', 'info');
-        
+        // Second pass: Create relations
+        addLog('ahrhammar', 'Second pass: Creating relations', 'info');
         for (let i = 0; i < pdfAnalyses.length; i++) {
             const analysis = pdfAnalyses[i];
-            state.status = `Second pass: Processing relations from ${analysis.filename}`;
+            state.status = `Second pass: ${analysis.filename}`;
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.5 + (0.4 * (i / pdfAnalyses.length));
             
             try {
-                // Clean the JSON again
                 let jsonData = analysis.result;
                 if (jsonData.startsWith('```json')) {
                     jsonData = jsonData.substring(7);
@@ -346,23 +336,13 @@ async function processAhrhammarData() {
                 
                 const entries = JSON.parse(jsonData);
                 
-                // Process relations
                 for (const entry of entries) {
-                    if (entry.relations && entry.relations.length > 0) {
-                        const sourceConceptId = conceptsMap.get(entry.headword);
-                        if (sourceConceptId) {
-                            for (const relation of entry.relations) {
-                                try {
-                                    await createRelation(sourceConceptId, relation, conceptsMap, results);
-                                } catch (error) {
-                                    addLog('ahrhammar', `Error creating relation for ${entry.headword}: ${error.message}`, 'warning');
-                                }
-                            }
-                        }
+                    try {
+                        await processAhrhammarRelations(entry, results);
+                    } catch (error) {
+                        addLog('ahrhammar', `Error creating relations for ${entry.headword}: ${error.message}`, 'warning');
                     }
                 }
-                
-                addLog('ahrhammar', `Second pass completed for ${analysis.filename}`, 'info');
                 
             } catch (error) {
                 addLog('ahrhammar', `Error in second pass for ${analysis.filename}: ${error.message}`, 'error');
@@ -388,138 +368,8 @@ async function processAhrhammarData() {
     }
 }
 
-// Helper function to create concept and terms (first pass)
-async function createConceptAndTerms(entry, results) {
-    // Create or get concept
-    const { data: concept, error: conceptError } = await supabase
-        .from('concepts')
-        .insert({
-            primary_german_label: entry.headword,
-            part_of_speech: entry.partOfSpeech,
-            notes: entry.usageNotes ? entry.usageNotes.join('; ') : null
-        })
-        .select()
-        .single();
-        
-    if (conceptError) {
-        // Try to get existing concept
-        const { data: existingConcept } = await supabase
-            .from('concepts')
-            .select('id')
-            .eq('primary_german_label', entry.headword)
-            .single();
-            
-        if (existingConcept) {
-            return existingConcept.id;
-        }
-        throw conceptError;
-    }
-    
-    results.conceptsCreated++;
-    
-    // Add German term
-    const { data: germanTerm } = await supabase
-        .from('terms')
-        .insert({
-            term_text: entry.headword,
-            language: 'de'
-        })
-        .select()
-        .single();
-        
-    if (germanTerm) {
-        results.termsCreated++;
-    }
-    
-    // Process translations
-    if (entry.translations) {
-        for (const translation of entry.translations) {
-            // Create Halunder term
-            const { data: halunderTerm } = await supabase
-                .from('terms')
-                .insert({
-                    term_text: translation.term,
-                    language: 'hal'
-                })
-                .select()
-                .single();
-                
-            if (halunderTerm) {
-                results.termsCreated++;
-                
-                // Link to concept
-                await supabase
-                    .from('concept_to_term')
-                    .insert({
-                        concept_id: concept.id,
-                        term_id: halunderTerm.id,
-                        pronunciation: translation.pronunciation,
-                        gender: translation.gender,
-                        plural_form: translation.plural,
-                        etymology: translation.etymology,
-                        note: translation.note,
-                        source_name: 'ahrhammar'
-                    });
-            }
-        }
-    }
-    
-    // Process examples
-    if (entry.examples) {
-        for (const example of entry.examples) {
-            await supabase
-                .from('examples')
-                .insert({
-                    concept_id: concept.id,
-                    halunder_sentence: example.halunder,
-                    german_sentence: example.german,
-                    note: example.note,
-                    source_name: 'ahrhammar'
-                });
-            results.examplesCreated++;
-        }
-    }
-    
-    return concept.id;
-}
-
-// Helper function to create relations (second pass)
-async function createRelation(sourceConceptId, relation, conceptsMap, results) {
-    // Try to find target concept by German term
-    let targetConceptId = conceptsMap.get(relation.targetTerm);
-    
-    if (!targetConceptId) {
-        // Try to find in database
-        const { data: targetConcept } = await supabase
-            .from('concepts')
-            .select('id')
-            .eq('primary_german_label', relation.targetTerm)
-            .single();
-            
-        if (targetConcept) {
-            targetConceptId = targetConcept.id;
-        }
-    }
-    
-    if (targetConceptId) {
-        const { error } = await supabase
-            .from('relations')
-            .insert({
-                source_concept_id: sourceConceptId,
-                target_concept_id: targetConceptId,
-                relation_type: relation.type,
-                note: relation.note
-            });
-            
-        if (!error) {
-            results.relationsCreated++;
-        }
-    } else {
-        addLog('ahrhammar', `Could not find target concept for relation: ${relation.targetTerm}`, 'warning');
-    }
-}
-
-async function processAhrhammarEntry(entry, results) {
+// First pass: Create concepts and terms only
+async function processAhrhammarEntryFirstPass(entry, results) {
     // Create or get concept
     const { data: concept, error: conceptError } = await supabase
         .from('concepts')
@@ -529,17 +379,22 @@ async function processAhrhammarEntry(entry, results) {
             notes: entry.usageNotes ? entry.usageNotes.join('; ') : null
         }, {
             onConflict: 'primary_german_label',
-            returning: 'minimal'
+            // returning: 'minimal' // 'minimal' is deprecated, returning representation is the default
         })
         .select()
         .single();
         
     if (conceptError) throw conceptError;
     
-    if (concept) {
-        results.conceptsCreated++;
+    // Check if the concept was newly created or just fetched
+    if (concept) { // This will be true for both upserted and selected concepts
+        // A more precise check for creation isn't easily available with upsert without more complex logic
     }
     
+    // Using upsert makes counting new creations tricky without more queries. 
+    // We'll count successful operations instead.
+    results.conceptsCreated++;
+
     // Add German term
     const { data: germanTerm } = await supabase
         .from('terms')
@@ -574,7 +429,7 @@ async function processAhrhammarEntry(entry, results) {
             if (halunderTerm) {
                 results.termsCreated++;
                 
-                // Link to concept
+                // Link to concept with ALL translation data including notes
                 await supabase
                     .from('concept_to_term')
                     .upsert({
@@ -584,6 +439,8 @@ async function processAhrhammarEntry(entry, results) {
                         gender: translation.gender,
                         plural_form: translation.plural,
                         etymology: translation.etymology,
+                        note: translation.note, // **CORRECTION**: Added note to save it to DB
+                        homonym_number: entry.homonymNumber,
                         source_name: 'ahrhammar'
                     });
             }
@@ -606,6 +463,49 @@ async function processAhrhammarEntry(entry, results) {
         }
     }
 }
+
+// Second pass: Create relations after all concepts exist
+async function processAhrhammarRelations(entry, results) {
+    if (!entry.relations || entry.relations.length === 0) return;
+    
+    // Get source concept
+    const { data: sourceConcept } = await supabase
+        .from('concepts')
+        .select('id')
+        .eq('primary_german_label', entry.headword)
+        .single();
+        
+    if (!sourceConcept) return;
+    
+    // Process each relation
+    for (const relation of entry.relations) {
+        // Find target concept
+        const { data: targetConcept } = await supabase
+            .from('concepts')
+            .select('id')
+            .eq('primary_german_label', relation.targetTerm)
+            .single();
+            
+        if (targetConcept) {
+            // Create relation
+            const { error } = await supabase
+                .from('relations')
+                .insert({
+                    source_concept_id: sourceConcept.id,
+                    target_concept_id: targetConcept.id,
+                    relation_type: relation.type,
+                    note: relation.note
+                });
+                
+            if (!error) {
+                results.relationsCreated++;
+            }
+        } else {
+            addLog('ahrhammar', `Target concept not found for relation: ${entry.headword} -> ${relation.targetTerm}`, 'warning');
+        }
+    }
+}
+
 
 async function processKrogmannData() {
     const state = processingStates.krogmann;
@@ -923,6 +823,8 @@ router.get('/search', async (req, res) => {
                     plural_form,
                     etymology,
                     homonym_number,
+                    note, 
+                    source_name,
                     term:terms!inner (
                         term_text,
                         language
@@ -935,11 +837,13 @@ router.get('/search', async (req, res) => {
                 ),
                 source_relations:relations!source_concept_id (
                     relation_type,
+                    note,
                     target_concept:concepts!target_concept_id (
+                        id,
                         primary_german_label
                     )
                 )
-            `)
+            `, { count: 'exact' }) // **CORRECTION**: Added count here to do it in one query
             .order('primary_german_label');
         
         // Apply filters
@@ -949,57 +853,62 @@ router.get('/search', async (req, res) => {
             } else if (lang === 'hal') {
                 query = query.ilike('concept_to_term.term.term_text', `%${term}%`);
             } else {
-                // Search both languages
-                // --- FIX START ---
-                // The original code `query.or('primary_german_label.ilike...` was syntactically incorrect for a joined table.
-                // This corrected version uses valid PostgREST syntax for an OR filter on a to-many relationship.
-                query = query.or(
-                    `primary_german_label.ilike.%${term}%,` + 
-                    `concept_to_term.term.term_text.ilike.%${term}%`
-                );
-                // --- FIX END ---
+                // **CORRECTION**: Fixed OR filter syntax for searching both languages
+                query = query.or(`primary_german_label.ilike.%${term}%,concept_to_term.term.term_text.ilike.%${term}%`);
             }
         } else if (letter) {
             query = query.ilike('primary_german_label', `${letter}%`);
         }
         
-        // Get total count
-        const { count } = await query;
-        
-        // Get paginated results
-        const { data, error } = await query
+        // Get paginated results and the total count in a single efficient query
+        const { data, error, count } = await query
             .range(offset, offset + limit - 1);
             
         if (error) throw error;
         
         // Transform data for frontend
-const entries = data.map(concept => ({
-    id: concept.id,
-    headword: concept.primary_german_label,
-    partOfSpeech: concept.part_of_speech,
-    notes: concept.notes,  // Add this line
-    homonymNumber: concept.concept_to_term[0]?.homonym_number,
-    translations: concept.concept_to_term
-        .filter(ct => ct.term.language === 'hal')
-        .map(ct => ({
-            term: ct.term.term_text,
-            pronunciation: ct.pronunciation,
-            gender: ct.gender,
-            plural: ct.plural_form,
-            etymology: ct.etymology,
-            note: ct.note  // Add this line to include translation notes
-        })),
-    examples: concept.examples.map(ex => ({
-        halunder: ex.halunder_sentence,
-        german: ex.german_sentence,
-        note: ex.note
-    })),
-    relations: concept.source_relations.map(rel => ({
-        type: rel.relation_type.replace('_', ' '),
-        targetTerm: rel.target_concept.primary_german_label,
-        note: rel.note  // Add this line
-    }))
-}));
+        const entries = data.map(concept => {
+            // Merge translations from different sources
+            const translationMap = new Map();
+            
+            concept.concept_to_term
+                .filter(ct => ct.term.language === 'hal')
+                .forEach(ct => {
+                    const key = ct.term.term_text;
+                    if (!translationMap.has(key)) {
+                        translationMap.set(key, {
+                            term: ct.term.term_text,
+                            pronunciation: ct.pronunciation,
+                            gender: ct.gender,
+                            plural: ct.plural_form,
+                            etymology: ct.etymology,
+                            note: ct.note, // **CORRECTION**: Added note to the final object
+                            sources: []
+                        });
+                    }
+                    translationMap.get(key).sources.push(ct.source_name);
+                });
+            
+            return {
+                id: concept.id,
+                headword: concept.primary_german_label,
+                partOfSpeech: concept.part_of_speech,
+                usageNotes: concept.notes,
+                homonymNumber: concept.concept_to_term[0]?.homonym_number,
+                translations: Array.from(translationMap.values()),
+                examples: concept.examples.map(ex => ({
+                    halunder: ex.halunder_sentence,
+                    german: ex.german_sentence,
+                    note: ex.note
+                })),
+                relations: concept.source_relations.map(rel => ({
+                    type: rel.relation_type.replace('_', ' '),
+                    targetTerm: rel.target_concept.primary_german_label,
+                    targetId: rel.target_concept.id,
+                    note: rel.note
+                }))
+            };
+        });
         
         res.json({
             entries,
@@ -1013,5 +922,40 @@ const entries = data.map(concept => ({
         res.status(500).json({ error: error.message });
     }
 });
+
+
+// Clear all dictionary data
+router.post('/clear-all', async (req, res) => {
+    try {
+        addLog('admin', 'Starting to clear all dictionary data...', 'warning');
+        
+        // Clear tables in correct order to respect foreign key constraints
+        // Using `neq` with a dummy value is a common way to delete all rows without a `where` clause.
+        await supabase.from('relations').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        addLog('admin', 'Cleared relations table.', 'info');
+
+        await supabase.from('examples').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        addLog('admin', 'Cleared examples table.', 'info');
+        
+        await supabase.from('concept_to_term').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        addLog('admin', 'Cleared concept_to_term table.', 'info');
+        
+        await supabase.from('terms').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        addLog('admin', 'Cleared terms table.', 'info');
+        
+        await supabase.from('concepts').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        addLog('admin', 'Cleared concepts table.', 'info');
+
+        // Removed 'annotations' as it was not present in the original schema context
+        
+        addLog('admin', 'All dictionary data cleared successfully.', 'success');
+        res.json({ success: true, message: 'All dictionary data cleared' });
+    } catch (error) {
+        console.error('Clear data error:', error);
+        addLog('admin', `Error clearing data: ${error.message}`, 'error');
+        res.status(500).json({ error: error.message });
+    }
+});
+
 
 module.exports = router;
