@@ -37,8 +37,6 @@ let processingStates = {
         logs: [],
         results: null
     },
-    // --- FIX START ---
-    // Add a state for 'admin' actions to prevent crashes when logging.
     admin: {
         isProcessing: false,
         progress: 0,
@@ -47,11 +45,14 @@ let processingStates = {
         logs: [],
         results: null
     }
-    // --- FIX END ---
 };
 
 // Helper function to add logs
 function addLog(processType, message, type = 'info') {
+    if (!processingStates[processType]) {
+        console.error(`[LOGGING ERROR] Invalid process type: ${processType}. Message: ${message}`);
+        return;
+    }
     const log = {
         id: Date.now() + Math.random(),
         message,
@@ -391,20 +392,12 @@ async function processAhrhammarEntryFirstPass(entry, results) {
             notes: entry.usageNotes ? entry.usageNotes.join('; ') : null
         }, {
             onConflict: 'primary_german_label',
-            // returning: 'minimal' // 'minimal' is deprecated, returning representation is the default
         })
         .select()
         .single();
         
     if (conceptError) throw conceptError;
     
-    // Check if the concept was newly created or just fetched
-    if (concept) { // This will be true for both upserted and selected concepts
-        // A more precise check for creation isn't easily available with upsert without more complex logic
-    }
-    
-    // Using upsert makes counting new creations tricky without more queries. 
-    // We'll count successful operations instead.
     results.conceptsCreated++;
 
     // Add German term
@@ -451,7 +444,7 @@ async function processAhrhammarEntryFirstPass(entry, results) {
                         gender: translation.gender,
                         plural_form: translation.plural,
                         etymology: translation.etymology,
-                        note: translation.note, // **CORRECTION**: Added note to save it to DB
+                        note: translation.note,
                         homonym_number: entry.homonymNumber,
                         source_name: 'ahrhammar'
                     });
@@ -476,7 +469,67 @@ async function processAhrhammarEntryFirstPass(entry, results) {
     }
 }
 
-// Second pass: Create relations after all concepts exist
+// --- NEW HELPER FUNCTION: Cleans a German term for lookup ---
+function cleanGermanTerm(term) {
+    if (!term) return null;
+    return term
+        .replace(/\s*\(.*\)\s*$/, '') // Remove anything in parentheses
+        .replace(/\s*,\s*sich\s*$/, '') // Remove ", sich"
+        .replace(/\*$/, '') // Remove trailing asterisk
+        .trim();
+}
+
+// --- NEW HELPER FUNCTION: Finds a target concept ID using multiple strategies ---
+async function findTargetConceptId(dirtyTerm) {
+    if (!dirtyTerm) return null;
+
+    // Attempt 1: Exact match
+    let { data: targetConcept } = await supabase
+        .from('concepts')
+        .select('id')
+        .eq('primary_german_label', dirtyTerm)
+        .single();
+    if (targetConcept) return targetConcept.id;
+
+    // Attempt 2: Cleaned German term match
+    const cleanedTerm = cleanGermanTerm(dirtyTerm);
+    if (cleanedTerm && cleanedTerm !== dirtyTerm) {
+        let { data: cleanedTarget } = await supabase
+            .from('concepts')
+            .select('id')
+            .eq('primary_german_label', cleanedTerm)
+            .single();
+        if (cleanedTarget) return cleanedTarget.id;
+    }
+
+    // Attempt 3: First word of a phrase match
+    const firstWord = dirtyTerm.split(' ')[0];
+    if (firstWord && firstWord !== dirtyTerm) {
+        let { data: firstWordTarget } = await supabase
+            .from('concepts')
+            .select('id')
+            .eq('primary_german_label', firstWord)
+            .single();
+        if (firstWordTarget) return firstWordTarget.id;
+    }
+
+    // Attempt 4: Halunder term match (in case the targetTerm is a translation)
+    const { data: halunderMatch } = await supabase
+        .from('terms')
+        .select('concept_to_term!inner(concept_id)')
+        .eq('term_text', dirtyTerm)
+        .eq('language', 'hal')
+        .maybeSingle(); // Use maybeSingle to avoid error if not found
+        
+    if (halunderMatch && halunderMatch.concept_to_term) {
+        return halunderMatch.concept_to_term.concept_id;
+    }
+    
+    return null; // All attempts failed
+}
+
+
+// --- UPDATED Second pass: Uses the new findTargetConceptId function ---
 async function processAhrhammarRelations(entry, results) {
     if (!entry.relations || entry.relations.length === 0) return;
     
@@ -491,20 +544,15 @@ async function processAhrhammarRelations(entry, results) {
     
     // Process each relation
     for (const relation of entry.relations) {
-        // Find target concept
-        const { data: targetConcept } = await supabase
-            .from('concepts')
-            .select('id')
-            .eq('primary_german_label', relation.targetTerm)
-            .single();
+        const targetConceptId = await findTargetConceptId(relation.targetTerm);
             
-        if (targetConcept) {
+        if (targetConceptId) {
             // Create relation
             const { error } = await supabase
                 .from('relations')
                 .insert({
                     source_concept_id: sourceConcept.id,
-                    target_concept_id: targetConcept.id,
+                    target_concept_id: targetConceptId,
                     relation_type: relation.type,
                     note: relation.note
                 });
@@ -741,7 +789,6 @@ async function processCSVData() {
 
 async function processCSVEntry(entry, results) {
     // Extract German and Halunder terms from CSV
-    // Adjust these field names based on your actual CSV structure
     const germanTerm = entry.German || entry.german || entry.Deutsch;
     const halunderTerm = entry.Halunder || entry.halunder || entry.Helgoländisch;
     
@@ -777,16 +824,14 @@ async function processCSVEntry(entry, results) {
     
     if (concept) {
         // Create terms
-        const { data: germanTermData } = await supabase
+        await supabase
             .from('terms')
             .upsert({
                 term_text: germanTerm,
                 language: 'de'
             }, {
                 onConflict: 'term_text,language'
-            })
-            .select()
-            .single();
+            });
             
         const { data: halunderTermData } = await supabase
             .from('terms')
@@ -799,8 +844,7 @@ async function processCSVEntry(entry, results) {
             .select()
             .single();
             
-        if (germanTermData) results.termsCreated++;
-        if (halunderTermData) results.termsCreated++;
+        results.termsCreated += 2;
         
         // Link Halunder term to concept
         if (halunderTermData) {
@@ -855,7 +899,7 @@ router.get('/search', async (req, res) => {
                         primary_german_label
                     )
                 )
-            `, { count: 'exact' }) // **CORRECTION**: Added count here to do it in one query
+            `, { count: 'exact' })
             .order('primary_german_label');
         
         // Apply filters
@@ -865,22 +909,18 @@ router.get('/search', async (req, res) => {
             } else if (lang === 'hal') {
                 query = query.ilike('concept_to_term.term.term_text', `%${term}%`);
             } else {
-                // **CORRECTION**: Fixed OR filter syntax for searching both languages
                 query = query.or(`primary_german_label.ilike.%${term}%,concept_to_term.term.term_text.ilike.%${term}%`);
             }
         } else if (letter) {
             query = query.ilike('primary_german_label', `${letter}%`);
         }
         
-        // Get paginated results and the total count in a single efficient query
         const { data, error, count } = await query
             .range(offset, offset + limit - 1);
             
         if (error) throw error;
         
-        // Transform data for frontend
         const entries = data.map(concept => {
-            // Merge translations from different sources
             const translationMap = new Map();
             
             concept.concept_to_term
@@ -894,7 +934,7 @@ router.get('/search', async (req, res) => {
                             gender: ct.gender,
                             plural: ct.plural_form,
                             etymology: ct.etymology,
-                            note: ct.note, // **CORRECTION**: Added note to the final object
+                            note: ct.note,
                             sources: []
                         });
                     }
@@ -935,14 +975,11 @@ router.get('/search', async (req, res) => {
     }
 });
 
-
 // Clear all dictionary data
 router.post('/clear-all', async (req, res) => {
     try {
         addLog('admin', 'Starting to clear all dictionary data...', 'warning');
         
-        // Clear tables in correct order to respect foreign key constraints
-        // Using `neq` with a dummy value is a common way to delete all rows without a `where` clause.
         await supabase.from('relations').delete().neq('id', '00000000-0000-0000-0000-000000000000');
         addLog('admin', 'Cleared relations table.', 'info');
 
@@ -957,8 +994,6 @@ router.post('/clear-all', async (req, res) => {
         
         await supabase.from('concepts').delete().neq('id', '00000000-0000-0000-0000-000000000000');
         addLog('admin', 'Cleared concepts table.', 'info');
-
-        // Removed 'annotations' as it was not present in the original schema context
         
         addLog('admin', 'All dictionary data cleared successfully.', 'success');
         res.json({ success: true, message: 'All dictionary data cleared' });
