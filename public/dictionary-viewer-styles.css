@@ -374,3 +374,25 @@ h1 {
     color: #95a5a6;
     font-size: 0.8em;
 }
+
+.usage-note {
+    background-color: #fff3cd;
+    color: #856404;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 0.85em;
+    margin-left: 10px;
+    font-style: italic;
+}
+
+.translation-note {
+    color: #666;
+    font-style: italic;
+    font-size: 0.9em;
+}
+
+.relation-note {
+    color: #7f8c8d;
+    font-size: 0.85em;
+    font-style: italic;
+}
