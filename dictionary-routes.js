@@ -965,31 +965,33 @@ router.get('/search', async (req, res) => {
         if (error) throw error;
         
         // Transform data for frontend
-        const entries = data.map(concept => ({
-            id: concept.id,
-            headword: concept.primary_german_label,
-            partOfSpeech: concept.part_of_speech,
-            notes: concept.notes,
-            homonymNumber: concept.concept_to_term[0]?.homonym_number,
-            translations: concept.concept_to_term
-                .filter(ct => ct.term.language === 'hal')
-                .map(ct => ({
-                    term: ct.term.term_text,
-                    pronunciation: ct.pronunciation,
-                    gender: ct.gender,
-                    plural: ct.plural_form,
-                    etymology: ct.etymology
-                })),
-            examples: concept.examples.map(ex => ({
-                halunder: ex.halunder_sentence,
-                german: ex.german_sentence,
-                note: ex.note
-            })),
-            relations: concept.source_relations.map(rel => ({
-                type: rel.relation_type.replace('_', ' '),
-                targetTerm: rel.target_concept.primary_german_label
-            }))
-        }));
+const entries = data.map(concept => ({
+    id: concept.id,
+    headword: concept.primary_german_label,
+    partOfSpeech: concept.part_of_speech,
+    notes: concept.notes,  // Add this line
+    homonymNumber: concept.concept_to_term[0]?.homonym_number,
+    translations: concept.concept_to_term
+        .filter(ct => ct.term.language === 'hal')
+        .map(ct => ({
+            term: ct.term.term_text,
+            pronunciation: ct.pronunciation,
+            gender: ct.gender,
+            plural: ct.plural_form,
+            etymology: ct.etymology,
+            note: ct.note  // Add this line to include translation notes
+        })),
+    examples: concept.examples.map(ex => ({
+        halunder: ex.halunder_sentence,
+        german: ex.german_sentence,
+        note: ex.note
+    })),
+    relations: concept.source_relations.map(rel => ({
+        type: rel.relation_type.replace('_', ' '),
+        targetTerm: rel.target_concept.primary_german_label,
+        note: rel.note  // Add this line
+    }))
+}));
         
         res.json({
             entries,
