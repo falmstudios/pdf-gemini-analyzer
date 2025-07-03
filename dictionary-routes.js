@@ -721,4 +721,106 @@ async function processCSVEntry(entry, results) {
     }
 }
 
+// Search dictionary entries
+router.get('/search', async (req, res) => {
+    try {
+        const { term, letter, lang = 'both', page = 1 } = req.query;
+        const limit = 20;
+        const offset = (page - 1) * limit;
+        
+        let query = supabase
+            .from('concepts')
+            .select(`
+                id,
+                primary_german_label,
+                part_of_speech,
+                notes,
+                concept_to_term!inner (
+                    pronunciation,
+                    gender,
+                    plural_form,
+                    etymology,
+                    homonym_number,
+                    term:terms!inner (
+                        term_text,
+                        language
+                    )
+                ),
+                examples (
+                    halunder_sentence,
+                    german_sentence,
+                    note
+                ),
+                source_relations:relations!source_concept_id (
+                    relation_type,
+                    target_concept:concepts!target_concept_id (
+                        primary_german_label
+                    )
+                )
+            `)
+            .order('primary_german_label');
+        
+        // Apply filters
+        if (term) {
+            if (lang === 'de') {
+                query = query.ilike('primary_german_label', `%${term}%`);
+            } else if (lang === 'hal') {
+                query = query.ilike('concept_to_term.term.term_text', `%${term}%`);
+            } else {
+                // Search both languages
+                query = query.or(`primary_german_label.ilike.%${term}%,concept_to_term.term.term_text.ilike.%${term}%`);
+            }
+        } else if (letter) {
+            query = query.ilike('primary_german_label', `${letter}%`);
+        }
+        
+        // Get total count
+        const { count } = await query;
+        
+        // Get paginated results
+        const { data, error } = await query
+            .range(offset, offset + limit - 1);
+            
+        if (error) throw error;
+        
+        // Transform data for frontend
+        const entries = data.map(concept => ({
+            id: concept.id,
+            headword: concept.primary_german_label,
+            partOfSpeech: concept.part_of_speech,
+            notes: concept.notes,
+            homonymNumber: concept.concept_to_term[0]?.homonym_number,
+            translations: concept.concept_to_term
+                .filter(ct => ct.term.language === 'hal')
+                .map(ct => ({
+                    term: ct.term.term_text,
+                    pronunciation: ct.pronunciation,
+                    gender: ct.gender,
+                    plural: ct.plural_form,
+                    etymology: ct.etymology
+                })),
+            examples: concept.examples.map(ex => ({
+                halunder: ex.halunder_sentence,
+                german: ex.german_sentence,
+                note: ex.note
+            })),
+            relations: concept.source_relations.map(rel => ({
+                type: rel.relation_type.replace('_', ' '),
+                targetTerm: rel.target_concept.primary_german_label
+            }))
+        }));
+        
+        res.json({
+            entries,
+            totalEntries: count || 0,
+            totalPages: Math.ceil((count || 0) / limit),
+            currentPage: parseInt(page)
+        });
+        
+    } catch (error) {
+        console.error('Search error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 module.exports = router;
