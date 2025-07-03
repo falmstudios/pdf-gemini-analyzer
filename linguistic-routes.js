@@ -7,7 +7,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 router.use(express.json());
 
 // Initialize connections with error checking
-console.log('Initializing linguistic routes v2...');
+console.log('Initializing linguistic routes v3...');
 console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
 console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
 console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
@@ -57,6 +57,37 @@ function addLog(message, type = 'info') {
     }
     
     console.log(`[${type.toUpperCase()}] ${message}`);
+}
+
+// Helper function to fetch all records with pagination
+async function fetchAllRecords(tableName, orderColumn) {
+    const pageSize = 1000;
+    let allRecords = [];
+    let page = 0;
+    let hasMore = true;
+    
+    while (hasMore) {
+        const from = page * pageSize;
+        const to = from + pageSize - 1;
+        
+        const { data, error, count } = await supabase
+            .from(tableName)
+            .select('*', { count: 'exact' })
+            .order(orderColumn)
+            .range(from, to);
+            
+        if (error) throw error;
+        
+        if (data && data.length > 0) {
+            allRecords = allRecords.concat(data);
+            addLog(`Fetched ${data.length} records from ${tableName} (page ${page + 1})`, 'info');
+        }
+        
+        hasMore = data && data.length === pageSize;
+        page++;
+    }
+    
+    return allRecords;
 }
 
 // Get statistics
@@ -111,7 +142,7 @@ router.get('/test-save', async (req, res) => {
     try {
         // Test with a simple entry
         const testEntry = {
-            halunder_term: 'test_term',
+            halunder_term: 'test_term_' + Date.now(),
             german_equivalent: 'test_german',
             explanation: 'test explanation',
             feature_type: 'general',
@@ -174,6 +205,32 @@ router.get('/test-table', async (req, res) => {
     }
 });
 
+// Check which terms are already processed
+async function getProcessedTerms() {
+    try {
+        const { data, error } = await supabase
+            .from('cleaned_linguistic_examples')
+            .select('halunder_term');
+            
+        if (error) throw error;
+        
+        // Create a Set of processed terms (lowercase for comparison)
+        const processedSet = new Set();
+        if (data) {
+            data.forEach(item => {
+                if (item.halunder_term) {
+                    processedSet.add(item.halunder_term.toLowerCase().trim());
+                }
+            });
+        }
+        
+        return processedSet;
+    } catch (error) {
+        addLog(`Error fetching processed terms: ${error.message}`, 'warning');
+        return new Set();
+    }
+}
+
 // Start cleaning process
 router.post('/start-cleaning', async (req, res) => {
     try {
@@ -204,7 +261,7 @@ router.post('/start-cleaning', async (req, res) => {
         currentMergedMap = null;
         
         // Start processing in background
-        processDataV2(processLinguistic, processTranslation, batchSize || 250)
+        processDataV3(processLinguistic, processTranslation, batchSize || 250)
             .catch(error => {
                 console.error('Background processing error:', error);
                 addLog(`Critical error: ${error.message}`, 'error');
@@ -236,22 +293,22 @@ router.get('/progress', (req, res) => {
     });
 });
 
-// Main processing function V2
-async function processDataV2(processLinguistic, processTranslation, batchSize) {
+// Main processing function V3 - Fixed pagination and duplicate detection
+async function processDataV3(processLinguistic, processTranslation, batchSize) {
     try {
-        addLog('Starting data cleaning process V2', 'info');
+        addLog('Starting data cleaning process V3', 'info');
         
-        // Step 1: Fetch all data
+        // Get already processed terms
+        processingState.status = 'Checking already processed terms...';
+        const processedTerms = await getProcessedTerms();
+        addLog(`Found ${processedTerms.size} already processed terms`, 'info');
+        
+        // Step 1: Fetch all data with pagination
         let allRecords = [];
         
         if (processLinguistic) {
-            addLog('Fetching linguistic features...', 'info');
-            const { data: linguisticData, error } = await supabase
-                .from('linguistic_features')
-                .select('*')
-                .order('halunder_term');
-                
-            if (error) throw error;
+            addLog('Fetching ALL linguistic features with pagination...', 'info');
+            const linguisticData = await fetchAllRecords('linguistic_features', 'halunder_term');
             
             allRecords = allRecords.concat(linguisticData.map(item => ({
                 ...item,
@@ -259,17 +316,12 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
                 term: item.halunder_term?.toLowerCase().trim()
             })));
             
-            addLog(`Fetched ${linguisticData.length} linguistic features`, 'success');
+            addLog(`Fetched total ${linguisticData.length} linguistic features`, 'success');
         }
         
         if (processTranslation) {
-            addLog('Fetching translation aids...', 'info');
-            const { data: translationData, error } = await supabase
-                .from('translation_aids')
-                .select('*')
-                .order('term');
-                
-            if (error) throw error;
+            addLog('Fetching ALL translation aids with pagination...', 'info');
+            const translationData = await fetchAllRecords('translation_aids', 'term');
             
             allRecords = allRecords.concat(translationData.map(item => ({
                 ...item,
@@ -278,18 +330,25 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
                 term: item.term?.toLowerCase().trim()
             })));
             
-            addLog(`Fetched ${translationData.length} translation aids`, 'success');
+            addLog(`Fetched total ${translationData.length} translation aids`, 'success');
         }
         
         addLog(`Total records fetched: ${allRecords.length}`, 'info');
         processingState.progress = 0.2;
         
-        // Step 2: Simple merge by exact term match
-        processingState.status = 'Merging duplicates...';
+        // Step 2: Filter out already processed terms and merge duplicates
+        processingState.status = 'Merging duplicates and filtering processed terms...';
         const mergedMap = new Map();
+        let skippedCount = 0;
         
         for (const record of allRecords) {
             if (!record.term) continue;
+            
+            // Skip if already processed
+            if (processedTerms.has(record.term)) {
+                skippedCount++;
+                continue;
+            }
             
             if (mergedMap.has(record.term)) {
                 // Append explanation with separator
@@ -314,7 +373,8 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         // Store merged map globally for this session
         currentMergedMap = mergedMap;
         
-        addLog(`Merged into ${mergedMap.size} unique terms`, 'info');
+        addLog(`Skipped ${skippedCount} already processed records`, 'info');
+        addLog(`Merged into ${mergedMap.size} unique unprocessed terms`, 'info');
         processingState.progress = 0.4;
         
         // Calculate statistics
@@ -324,7 +384,24 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
                 totalDuplicates += data.explanations.length - 1;
             }
         }
-        addLog(`Found ${totalDuplicates} duplicates`, 'info');
+        addLog(`Found ${totalDuplicates} duplicates in unprocessed data`, 'info');
+        
+        // If no unprocessed terms, exit early
+        if (mergedMap.size === 0) {
+            processingState.results = {
+                totalProcessed: 0,
+                uniqueTerms: 0,
+                duplicatesFound: 0,
+                entriesCreated: 0,
+                errors: 0,
+                processingTime: '0m 0s',
+                message: 'All terms have already been processed'
+            };
+            processingState.status = 'Completed';
+            processingState.progress = 1;
+            addLog('No new terms to process', 'info');
+            return;
+        }
         
         // Step 3: Prepare data for LLM processing
         processingState.status = 'Preparing for LLM processing...';
@@ -361,13 +438,21 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
                 if (cleanedBatch && cleanedBatch.length > 0) {
                     // Add original term keys to the cleaned entries
                     for (const cleanedEntry of cleanedBatch) {
-                        // Find the original entry in the batch
-                        const originalEntry = batch.find(b => 
-                            b.halunder_term === cleanedEntry.halunder_term ||
-                            b.halunder_term?.toLowerCase() === cleanedEntry.halunder_term?.toLowerCase()
-                        );
+                        // Find the original entry in the batch by matching halunder_term
+                        const originalEntry = batch.find(b => {
+                            const bTerm = b.halunder_term?.toLowerCase().trim();
+                            const cTerm = cleanedEntry.halunder_term?.toLowerCase().trim();
+                            return bTerm === cTerm;
+                        });
+                        
                         if (originalEntry) {
                             cleanedEntry.original_term_key = originalEntry.original_term_key;
+                        } else {
+                            // If exact match fails, try to find by the key directly
+                            const termKey = cleanedEntry.halunder_term?.toLowerCase().trim();
+                            if (currentMergedMap.has(termKey)) {
+                                cleanedEntry.original_term_key = termKey;
+                            }
                         }
                     }
                     processedEntries.push(...cleanedBatch);
@@ -393,6 +478,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         processingState.status = 'Saving to database...';
         const results = {
             totalProcessed: allRecords.length,
+            skippedAlreadyProcessed: skippedCount,
             uniqueTerms: mergedMap.size,
             duplicatesFound: totalDuplicates,
             entriesCreated: 0,
@@ -416,7 +502,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
         
         processingState.results = results;
         processingState.status = 'Completed';
-        processingState.details = `Created ${results.entriesCreated} entries from ${results.uniqueTerms} unique terms`;
+        processingState.details = `Created ${results.entriesCreated} entries from ${results.uniqueTerms} unique unprocessed terms`;
         processingState.progress = 1;
         
         addLog('Processing completed successfully', 'success');
@@ -434,7 +520,7 @@ async function processDataV2(processLinguistic, processTranslation, batchSize) {
 
 // Process batch with Gemini
 async function processWithGemini(batch) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
     
     const prompt = `Du bist ein Experte für die Halunder Sprache (Helgoländisch) und sollst linguistische Erklärungen für ein Wörterbuch aufbereiten.
 
@@ -450,6 +536,7 @@ Wichtig:
 - Bei Varianten: Markiere die Hauptform als "primary", Nebenformen als "secondary"
 - Behalte alle wichtigen Informationen aus den Originaltexten
 - WICHTIG: Escape alle Anführungszeichen in den Texten mit Backslash
+- Behalte EXAKT die Schreibweise des halunder_term bei, ändere keine Groß-/Kleinschreibung
 
 Eingabe (${batch.length} Einträge):
 ${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
@@ -457,7 +544,7 @@ ${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
 Ausgabe als JSON-Array mit dieser Struktur:
 [
   {
-    "halunder_term": "Hauptschreibweise",
+    "halunder_term": "EXAKT wie im Input",
     "german_equivalent": "Deutsche Entsprechung",
     "explanation": "Bereinigte, vollständige Erklärung",
     "feature_type": "primary|secondary|general",
@@ -465,7 +552,9 @@ Ausgabe als JSON-Array mit dieser Struktur:
   }
 ]
 
-WICHTIG: Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!`;
+WICHTIG: 
+- Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!
+- Behalte die EXAKTE Schreibweise des halunder_term bei!`;
 
     try {
         const result = await model.generateContent(prompt);
@@ -523,7 +612,7 @@ WICHTIG: Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!`;
     }
 }
 
-// Save cleaned entry to database - FIXED VERSION
+// Save cleaned entry to database - FIXED VERSION V2
 async function saveCleanedEntry(entry) {
     try {
         // Get original data using the key
@@ -533,10 +622,16 @@ async function saveCleanedEntry(entry) {
             originalData = currentMergedMap.get(entry.original_term_key);
         }
         
-        // If not found by key, try to find by term
-        if (!originalData && currentMergedMap) {
-            const searchTerm = entry.halunder_term?.toLowerCase().trim();
+        // If not found by key, try to find by term (case-insensitive)
+        if (!originalData && currentMergedMap && entry.halunder_term) {
+            const searchTerm = entry.halunder_term.toLowerCase().trim();
             originalData = currentMergedMap.get(searchTerm);
+            
+            // Debug log
+            if (!originalData) {
+                console.log(`Failed to find data for term: "${entry.halunder_term}" (key: "${entry.original_term_key}")`);
+                console.log('Available keys sample:', Array.from(currentMergedMap.keys()).slice(0, 5));
+            }
         }
         
         if (!originalData) {
