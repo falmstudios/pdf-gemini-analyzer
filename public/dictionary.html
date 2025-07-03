@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dictionary Builder</title>
+    <link rel="stylesheet" href="dictionary-styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Helgolandic Dictionary Builder</h1>
+            <a href="/" class="back-link">← Back to Home</a>
+        </div>
+        
+        <div class="main-content">
+            <div class="info-panel">
+                <h2>About This Tool</h2>
+                <p>This tool merges dictionary data from multiple sources to create a comprehensive Helgolandic-German dictionary. The process follows an "Ahrhammar-First" strategy, using Ahrhammar as the authoritative base and enriching it with data from other sources.</p>
+            </div>
+            
+            <div class="stats-panel">
+                <h2>Data Source Statistics</h2>
+                <div id="stats-loading" class="loading">Loading statistics...</div>
+                <div id="stats-content" style="display: none;">
+                    <div class="stat-item">
+                        <span class="stat-label">Ahrhammar Entries (PDF Analyses):</span>
+                        <span id="ahrhammar-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Krogmann Entries:</span>
+                        <span id="krogmann-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">CSV Vocabulary Entries:</span>
+                        <span id="csv-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Concepts Created:</span>
+                        <span id="concepts-count" class="stat-value">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Terms Created:</span>
+                        <span id="terms-count" class="stat-value">-</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="upload-panel">
+                <h2>Upload Krogmann JSONs</h2>
+                <p>Select Krogmann JSON files to upload to the database:</p>
+                <input type="file" id="krogmannFiles" multiple accept=".json">
+                <button onclick="uploadKrogmannFiles()" class="secondary-btn">Upload Krogmann Files</button>
+                <div id="upload-status"></div>
+            </div>
+            
+            <div class="control-panel">
+                <h2>Dictionary Building Process</h2>
+                <div class="process-steps">
+                    <div class="step">
+                        <h3>Step 1: Process Ahrhammar Data</h3>
+                        <p>Clean and import entries from PDF analyses table</p>
+                        <button id="process-ahrhammar-btn" onclick="processAhrhammar()" class="primary-btn">
+                            Process Ahrhammar Data
+                        </button>
+                    </div>
+                    
+                    <div class="step">
+                        <h3>Step 2: Process Krogmann Data</h3>
+                        <p>Enrich concepts with Krogmann pronunciation and examples</p>
+                        <button id="process-krogmann-btn" onclick="processKrogmann()" class="primary-btn" disabled>
+                            Process Krogmann Data
+                        </button>
+                    </div>
+                    
+                    <div class="step">
+                        <h3>Step 3: Process CSV Vocabulary</h3>
+                        <p>Add missing basic vocabulary from CSV</p>
+                        <button id="process-csv-btn" onclick="processCSV()" class="primary-btn" disabled>
+                            Process CSV Data
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="control-buttons">
+                    <button onclick="refreshStats()" class="secondary-btn">
+                        Refresh Statistics
+                    </button>
+                    <button onclick="clearLogs()" class="secondary-btn">
+                        Clear Logs
+                    </button>
+                </div>
+            </div>
+            
+            <div class="progress-panel" id="progress-panel" style="display: none;">
+                <h2>Processing Progress</h2>
+                <div class="progress-bar">
+                    <div id="progress-fill" class="progress-fill"></div>
+                </div>
+                <p id="progress-text" class="progress-text">Initializing...</p>
+                <p id="progress-details" class="progress-details"></p>
+            </div>
+            
+            <div class="results-panel" id="results-panel" style="display: none;">
+                <h2>Processing Results</h2>
+                <div id="results-content"></div>
+            </div>
+            
+            <div class="console-panel">
+                <h2>Processing Log</h2>
+                <div id="console" class="console-output"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="dictionary-script.js"></script>
+</body>
+</html>
