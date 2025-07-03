@@ -950,7 +950,14 @@ router.get('/search', async (req, res) => {
                 query = query.ilike('concept_to_term.term.term_text', `%${term}%`);
             } else {
                 // Search both languages
-                query = query.or(`primary_german_label.ilike.%${term}%,concept_to_term.term.term_text.ilike.%${term}%`);
+                // --- FIX START ---
+                // The original code `query.or('primary_german_label.ilike...` was syntactically incorrect for a joined table.
+                // This corrected version uses valid PostgREST syntax for an OR filter on a to-many relationship.
+                query = query.or(
+                    `primary_german_label.ilike.%${term}%,` + 
+                    `concept_to_term.term.term_text.ilike.%${term}%`
+                );
+                // --- FIX END ---
             }
         } else if (letter) {
             query = query.ilike('primary_german_label', `${letter}%`);
