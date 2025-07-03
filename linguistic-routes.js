@@ -525,10 +525,19 @@ async function processWithGeminiV4(batch) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
         
-        const prompt = `Analysiere diese Halunder Wörterbucheinträge. Für jeden Eintrag:
-1. Bereinige die Erklärung
-2. Bewerte die Relevanz (0-10): Kulturelle Bedeutung, unerwartete Bedeutungen, reichhaltige Informationen = hoch (8-10). Einfache Pluralformen oder direkte Übersetzungen = niedrig (1-3)
+        const prompt = `Analysiere diese Helgoländischen Wörter, Satzteile oder Phrasen. Sie sollen als Hilfsstellung für einen Übersetzer dienen, sodass der Benutzer bei bestimmten Wörtern oder fixen konstruktionen ein Highlight sieht mit einer kleinen interessanten Erklärung. Für jeden Eintrag:
+1. Bereinige die Erklärung, insbesondere bei Duplikaten, Redundanzen, etc. Behalte immer das interessanteste. Denk nach was jemand lesen wollen würde und was für lernen und Verständnis besonders hilfreich wäre.
+2. Bewerte die Relevanz (0-10): Kulturelle Bedeutung, unerwartete Bedeutungen, reichhaltige Informationen = hoch. Einfache Erklärungen wie "der Plural von X" oder direkte Übersetzungen = niedrig
 3. Vergib passende Tags aus: cultural, idiom, grammar, false_friend, misspelling, etymology, person, place, building, date, maritime, food, tradition, archaic
+
+Du sollst bereinigen und die optimale und vielfältigste Erklärung (bis zu mehreren Sätzen) erstellen.
+
+In a sense that these translation aids / linguistic explanations help the user of a translator / dictionary to understand why a certain word is used.
+
+Easy example:
+Heligolands main sight/attraction is the "Lange Anna" in german. When translating to Halunder, that becomes "Nathurnstak" or "Nathurn Stak". Therefore that word (or both words) should receive a full explanation in a few sentences. No generic bullshit, just straight up facts. For example: Nathurnstak (term) would have the following explanation: Das Wahrzeichen Helgolands ist die Lange Anna, welche auf Halunder "Nathurnstak" oder älter "Nathurn Stak" heißt. Die Bezeichnung Lange Anna ist auf eine Bedienung in einem Café an der Nordspitze zurückzuführen, auf Helgoländisch wurde diese aber nicht übernommen. Das Nathurnstak entstand, als das vorgelagerte Nathurn Gatt" im Jahr XXXX ins Meer abgebrochen ist. Die Lange Anna wurde XXXX mit einem Betonfuß verstärkt.
+
+So you should generate two clean entries for either Nathurnstak (primary, the correct form) and all other "correct" spellings or synonyms as "secondary" tag with the same explanation.
 
 Eingabe: ${batch.length} Einträge
 ${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
@@ -538,7 +547,7 @@ Ausgabe als JSON-Array:
   "halunder_term": "EXAKT wie im Input",
   "german_equivalent": "deutsche Übersetzung",
   "explanation": "bereinigte Erklärung",
-  "feature_type": "general/primary/secondary",
+  "feature_type": "primary/secondary",
   "relevance_score": 5,
   "tags": ["cultural", "place"]
 }]
