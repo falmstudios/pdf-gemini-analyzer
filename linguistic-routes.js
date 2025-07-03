@@ -518,47 +518,27 @@ async function processDataV3(processLinguistic, processTranslation, batchSize) {
     }
 }
 
-// Process batch with Gemini
+// Process batch with Gemini - FIXED VERSION
 async function processWithGemini(batch) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
-    
-    const prompt = `Du bist ein Experte für die Halunder Sprache (Helgoländisch) und sollst linguistische Erklärungen für ein Wörterbuch aufbereiten.
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+        
+        // Simpler prompt with clearer instructions
+        const prompt = `Bereinige diese Halunder Wörterbucheinträge. Erstelle für jeden Eintrag eine präzise Erklärung.
 
-Aufgabe:
-1. Bereinige die zusammengeführten Erklärungen
-2. Erstelle präzise, faktische Erklärungen die Übersetzern helfen
-3. Identifiziere Hauptschreibweisen und Varianten
-4. Füge kulturellen/historischen Kontext hinzu wo relevant
-
-Wichtig:
-- KEINE generischen Phrasen wie "traditionell auf Helgoland verwendet"
-- NUR konkrete, nachprüfbare Fakten
-- Bei Varianten: Markiere die Hauptform als "primary", Nebenformen als "secondary"
-- Behalte alle wichtigen Informationen aus den Originaltexten
-- WICHTIG: Escape alle Anführungszeichen in den Texten mit Backslash
-- Behalte EXAKT die Schreibweise des halunder_term bei, ändere keine Groß-/Kleinschreibung
-
-Eingabe (${batch.length} Einträge):
+Eingabe: ${batch.length} Einträge
 ${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
 
-Ausgabe als JSON-Array mit dieser Struktur:
-[
-  {
-    "halunder_term": "EXAKT wie im Input",
-    "german_equivalent": "Deutsche Entsprechung",
-    "explanation": "Bereinigte, vollständige Erklärung",
-    "feature_type": "primary|secondary|general",
-    "related_to": "Hauptterm bei secondary entries"
-  }
-]
+Gib NUR ein JSON-Array zurück im Format:
+[{"halunder_term":"term","german_equivalent":"übersetzung","explanation":"erklärung","feature_type":"general"}]
 
-WICHTIG: 
-- Gib NUR das JSON-Array zurück, keine zusätzlichen Erklärungen!
-- Behalte die EXAKTE Schreibweise des halunder_term bei!`;
+WICHTIG: NUR das JSON-Array, keine anderen Texte!`;
 
-    try {
         const result = await model.generateContent(prompt);
         let response = result.response.text();
+        
+        // Log first 500 chars of response for debugging
+        console.log('Gemini response start:', response.substring(0, 500));
         
         // Clean up the response
         response = response.trim();
@@ -567,47 +547,78 @@ WICHTIG:
         response = response.replace(/```json\s*/gi, '');
         response = response.replace(/```\s*/gi, '');
         
-        // Try to extract JSON array
-        const jsonMatch = response.match(/\[[\s\S]*\]/);
-        if (!jsonMatch) {
+        // Try to find JSON array in the response
+        // Look for array start and end
+        const arrayStart = response.indexOf('[');
+        const arrayEnd = response.lastIndexOf(']');
+        
+        if (arrayStart === -1 || arrayEnd === -1 || arrayStart >= arrayEnd) {
+            console.error('No valid array found in response');
             throw new Error('No JSON array found in response');
         }
         
-        let jsonString = jsonMatch[0];
+        // Extract just the array part
+        let jsonString = response.substring(arrayStart, arrayEnd + 1);
         
-        // Try to parse
         try {
-            return JSON.parse(jsonString);
+            const parsed = JSON.parse(jsonString);
+            if (Array.isArray(parsed)) {
+                addLog(`Successfully parsed ${parsed.length} entries from Gemini`, 'success');
+                return parsed;
+            } else {
+                throw new Error('Parsed result is not an array');
+            }
         } catch (parseError) {
-            // If parsing fails, try to fix common issues
-            addLog(`Initial JSON parse failed, attempting to fix...`, 'warning');
+            console.error('JSON parse error:', parseError.message);
+            console.error('Attempted to parse:', jsonString.substring(0, 200) + '...');
             
-            // Log the error position
-            const errorPos = parseError.message.match(/position (\d+)/)?.[1];
-            if (errorPos) {
-                const start = Math.max(0, parseInt(errorPos) - 100);
-                const end = Math.min(jsonString.length, parseInt(errorPos) + 100);
-                console.error('JSON error near:', jsonString.substring(start, end));
-            }
-            
-            // Try one more time with a more lenient approach
+            // Try to fix common JSON issues
             try {
-                // Remove any control characters
-                jsonString = jsonString.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
-                return JSON.parse(jsonString);
+                // Remove control characters and fix quotes
+                jsonString = jsonString
+                    .replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+                    .replace(/"\s*:\s*"/g, '":"')
+                    .replace(/,\s*}/g, '}')
+                    .replace(/,\s*]/g, ']');
+                
+                const parsed = JSON.parse(jsonString);
+                if (Array.isArray(parsed)) {
+                    addLog(`Successfully parsed ${parsed.length} entries after cleanup`, 'success');
+                    return parsed;
+                }
             } catch (secondError) {
-                // If it still fails, return empty array for this batch
-                addLog(`Failed to parse batch, skipping: ${secondError.message}`, 'error');
-                return [];
+                console.error('Second parse attempt failed:', secondError.message);
             }
+            
+            // If all parsing fails, try to extract individual objects
+            const objectMatches = jsonString.match(/\{[^{}]*\}/g);
+            if (objectMatches && objectMatches.length > 0) {
+                const parsedObjects = [];
+                for (const objStr of objectMatches) {
+                    try {
+                        const obj = JSON.parse(objStr);
+                        if (obj.halunder_term) {
+                            parsedObjects.push(obj);
+                        }
+                    } catch (e) {
+                        // Skip unparseable objects
+                    }
+                }
+                if (parsedObjects.length > 0) {
+                    addLog(`Recovered ${parsedObjects.length} entries from partial parsing`, 'warning');
+                    return parsedObjects;
+                }
+            }
+            
+            throw new Error(`Failed to parse response: ${parseError.message}`);
         }
         
     } catch (error) {
         if (error.message?.includes('quota')) {
             throw new Error('Gemini API quota exceeded. Please wait before retrying.');
         }
+        console.error('Gemini processing error:', error);
         addLog(`Gemini API error: ${error.message}`, 'error');
-        // Return empty array to continue processing other batches
         return [];
     }
 }
