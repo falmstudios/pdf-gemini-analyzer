@@ -24,6 +24,11 @@ const axiosInstance = axios.create({
   maxBodyLength: Infinity
 });
 
+// Add route for dictionary viewer
+app.get('/dictionary-viewer', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dictionary-viewer.html'));
+});
+
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
