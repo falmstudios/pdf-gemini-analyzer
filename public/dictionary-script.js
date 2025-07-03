@@ -239,28 +239,33 @@ function showResults(results) {
     const html = `
         <div class="result-item">
             <span class="result-label">Total Records Processed:</span>
-            <span class="result-value">${results.totalProcessed}</span>
+            <span class="result-value">${results.totalProcessed || 0}</span>
         </div>
         <div class="result-item">
-            <span class="result-label">Concepts Created:</span>
-            <span class="result-value">${results.conceptsCreated}</span>
+            <span class="result-label">Concepts Created/Updated:</span>
+            <span class="result-value">${results.conceptsCreated || 0}</span>
         </div>
         <div class="result-item">
-            <span class="result-label">Terms Created:</span>
-            <span class="result-value">${results.termsCreated}</span>
+            <span class="result-label">Terms Created/Updated:</span>
+            <span class="result-value">${results.termsCreated || 0}</span>
         </div>
         <div class="result-item">
             <span class="result-label">Examples Added:</span>
-            <span class="result-value">${results.examplesCreated}</span>
+            <span class="result-value">${results.examplesCreated || 0}</span>
+        </div>
+        <div class="result-item">
+            <span class="result-label">Relations Created:</span>
+            <span class="result-value">${results.relationsCreated || 0}</span>
         </div>
         <div class="result-item">
             <span class="result-label">Processing Time:</span>
-            <span class="result-value">${results.processingTime}</span>
+            <span class="result-value">${results.processingTime || 'N/A'}</span>
         </div>
     `;
     
     document.getElementById('results-content').innerHTML = html;
 }
+
 
 // Add log entry
 function addLog(message, type = 'info') {
@@ -290,4 +295,34 @@ function clearLogs() {
     currentLogs = [];
     document.getElementById('console').innerHTML = '';
     addLog('Logs cleared', 'info');
+}
+
+// Clear dictionary data
+async function clearDictionary() {
+    if (!confirm('Are you sure you want to delete ALL dictionary data? This cannot be undone!')) {
+        return;
+    }
+    
+    if (!confirm('This will delete all concepts, terms, translations, examples, and relations. Are you REALLY sure?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch('/dictionary/clear-all', {
+            method: 'POST'
+        });
+        
+        if (response.ok) {
+            alert('All dictionary data has been cleared.');
+            addLog('All dictionary data has been cleared successfully via UI.', 'success');
+            await refreshStats();
+        } else {
+            const errorData = await response.json();
+            alert('Error clearing dictionary data: ' + (errorData.error || 'Unknown error'));
+            addLog('Failed to clear dictionary data. Server responded with an error.', 'error');
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+        addLog('A network or client-side error occurred while trying to clear the dictionary: ' + error.message, 'error');
+    }
 }
