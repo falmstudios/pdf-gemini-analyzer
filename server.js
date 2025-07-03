@@ -12,6 +12,9 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Add this near the top with other requires
+const dictionaryRoutes = require('./dictionary-routes');
+
+// Add this near the top with other requires
 const linguisticRoutes = require('./linguistic-routes');
 
 // Create axios instance with no timeout
@@ -40,6 +43,24 @@ app.use(express.static('public'));
 
 // Add this after your existing routes
 app.use('/linguistic', linguisticRoutes);
+
+// Add this after your existing routes
+app.use('/dictionary', dictionaryRoutes);
+
+// Add route for homepage
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index-home.html'));
+});
+
+// Add route for PDF analyzer (update existing route)
+app.get('/pdf-analyzer', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Add route for dictionary builder
+app.get('/dictionary-builder', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dictionary.html'));
+});
 
 // Add this route to serve the linguistic cleaner page
 app.get('/linguistic-cleaner', (req, res) => {
