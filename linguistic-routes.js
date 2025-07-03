@@ -7,7 +7,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 router.use(express.json());
 
 // Initialize connections with error checking
-console.log('Initializing linguistic routes v4 with relevance and tags...');
+console.log('Initializing linguistic routes v5 with batch saving...');
 console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
 console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
 console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
@@ -184,29 +184,6 @@ router.get('/test-save', async (req, res) => {
     }
 });
 
-// Test what columns exist in the table
-router.get('/test-table', async (req, res) => {
-    try {
-        // Get table schema
-        const { data, error } = await supabase
-            .from('cleaned_linguistic_examples')
-            .select('*')
-            .limit(1);
-            
-        if (error) {
-            return res.json({ error });
-        }
-        
-        res.json({ 
-            sampleData: data,
-            message: 'Check if columns match what we are trying to insert'
-        });
-        
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
 // Check which terms are already processed
 async function getProcessedTerms() {
     try {
@@ -263,7 +240,7 @@ router.post('/start-cleaning', async (req, res) => {
         currentMergedMap = null;
         
         // Start processing in background
-        processDataV4(processLinguistic, processTranslation, batchSize || 100) // Smaller batches for more complex processing
+        processDataV5(processLinguistic, processTranslation, batchSize || 100)
             .catch(error => {
                 console.error('Background processing error:', error);
                 addLog(`Critical error: ${error.message}`, 'error');
@@ -295,10 +272,10 @@ router.get('/progress', (req, res) => {
     });
 });
 
-// Main processing function V4 - With relevance and tags
-async function processDataV4(processLinguistic, processTranslation, batchSize) {
+// Main processing function V5 - With batch saving
+async function processDataV5(processLinguistic, processTranslation, batchSize) {
     try {
-        addLog('Starting data cleaning process V4 with relevance scoring and tags', 'info');
+        addLog('Starting data cleaning process V5 with batch saving', 'info');
         
         // Get already processed terms
         processingState.status = 'Checking already processed terms...';
@@ -418,12 +395,21 @@ async function processDataV4(processLinguistic, processTranslation, batchSize) {
         
         processingState.progress = 0.5;
         
-        // Step 4: Process with LLM in batches
+        // Step 4: Process with LLM in batches - SAVE AFTER EACH BATCH
         processingState.status = 'Processing with Gemini 2.5 Pro...';
-        const processedEntries = [];
         const totalBatches = Math.ceil(mergedEntries.length / batchSize);
-        let successfulBatches = 0;
-        let failedBatches = 0;
+        
+        // Initialize results tracking
+        const results = {
+            totalProcessed: allRecords.length,
+            skippedAlreadyProcessed: skippedCount,
+            uniqueTerms: mergedMap.size,
+            duplicatesFound: totalDuplicates,
+            entriesCreated: 0,
+            errors: 0,
+            batchesSaved: 0,
+            batchesFailed: 0
+        };
         
         for (let i = 0; i < mergedEntries.length; i += batchSize) {
             const batch = mergedEntries.slice(i, Math.min(i + batchSize, mergedEntries.length));
@@ -436,7 +422,9 @@ async function processDataV4(processLinguistic, processTranslation, batchSize) {
             addLog(`Processing batch ${batchNum}/${totalBatches} (${batch.length} entries)`, 'info');
             
             try {
-                const cleanedBatch = await processWithGeminiV4(batch);
+                // Process batch with Gemini
+                const cleanedBatch = await processWithGeminiV5(batch);
+                
                 if (cleanedBatch && cleanedBatch.length > 0) {
                     // Add original term keys to the cleaned entries
                     for (const cleanedEntry of cleanedBatch) {
@@ -457,44 +445,39 @@ async function processDataV4(processLinguistic, processTranslation, batchSize) {
                             }
                         }
                     }
-                    processedEntries.push(...cleanedBatch);
-                    successfulBatches++;
+                    
+                    // Save this batch immediately
+                    addLog(`Saving batch ${batchNum} to database...`, 'info');
+                    let batchSaved = 0;
+                    let batchErrors = 0;
+                    
+                    for (const entry of cleanedBatch) {
+                        try {
+                            await saveCleanedEntryV5(entry);
+                            batchSaved++;
+                            results.entriesCreated++;
+                        } catch (error) {
+                            addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
+                            batchErrors++;
+                            results.errors++;
+                        }
+                    }
+                    
+                    addLog(`Batch ${batchNum} saved: ${batchSaved} entries saved, ${batchErrors} errors`, 
+                           batchErrors > 0 ? 'warning' : 'success');
+                    results.batchesSaved++;
+                    
                 } else {
-                    failedBatches++;
+                    results.batchesFailed++;
                     addLog(`Batch ${batchNum} returned no results`, 'warning');
                 }
                 
                 // Add delay to respect rate limits
-                await new Promise(resolve => setTimeout(resolve, 8000)); // Slightly longer delay for more complex processing
+                await new Promise(resolve => setTimeout(resolve, 8000));
                 
             } catch (error) {
-                failedBatches++;
+                results.batchesFailed++;
                 addLog(`Error processing batch ${batchNum}: ${error.message}`, 'error');
-            }
-        }
-        
-        addLog(`Batch processing complete: ${successfulBatches} successful, ${failedBatches} failed`, 'info');
-        processingState.progress = 0.9;
-        
-        // Step 5: Save to database
-        processingState.status = 'Saving to database...';
-        const results = {
-            totalProcessed: allRecords.length,
-            skippedAlreadyProcessed: skippedCount,
-            uniqueTerms: mergedMap.size,
-            duplicatesFound: totalDuplicates,
-            entriesCreated: 0,
-            errors: 0
-        };
-        
-        // Save all processed entries
-        for (const entry of processedEntries) {
-            try {
-                await saveCleanedEntryV4(entry);
-                results.entriesCreated++;
-            } catch (error) {
-                addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
-                results.errors++;
             }
         }
         
@@ -507,7 +490,7 @@ async function processDataV4(processLinguistic, processTranslation, batchSize) {
         processingState.details = `Created ${results.entriesCreated} entries from ${results.uniqueTerms} unique unprocessed terms`;
         processingState.progress = 1;
         
-        addLog('Processing completed successfully', 'success');
+        addLog(`Processing completed: ${results.batchesSaved} batches saved, ${results.batchesFailed} batches failed`, 'success');
         
     } catch (error) {
         addLog(`Critical error: ${error.message}`, 'error');
@@ -520,8 +503,8 @@ async function processDataV4(processLinguistic, processTranslation, batchSize) {
     }
 }
 
-// Process batch with Gemini V4 - With relevance and tags
-async function processWithGeminiV4(batch) {
+// Process batch with Gemini V5 - With your improved prompt
+async function processWithGeminiV5(batch) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
         
@@ -634,8 +617,8 @@ NUR das JSON-Array zurückgeben!`;
     }
 }
 
-// Save cleaned entry to database V4 - With relevance and tags
-async function saveCleanedEntryV4(entry) {
+// Save cleaned entry to database V5
+async function saveCleanedEntryV5(entry) {
     try {
         // Get original data using the key
         let originalData = null;
@@ -671,8 +654,6 @@ async function saveCleanedEntryV4(entry) {
             relevance_score: entry.relevance_score || 5,
             tags: entry.tags || []
         };
-        
-        console.log('Inserting:', JSON.stringify(insertData, null, 2));
         
         const { data, error } = await supabase
             .from('cleaned_linguistic_examples')
