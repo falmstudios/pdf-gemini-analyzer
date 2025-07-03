@@ -110,11 +110,12 @@ router.post('/upload-krogmann', async (req, res) => {
     try {
         const { filename, data } = req.body;
         
+        // Store the data exactly as received, without parsing/re-stringifying
         const { error } = await supabase
             .from('krogmann_uploads')
             .insert([{
                 filename: filename,
-                data: data,
+                data: data, // This will store the JSON in its original structure
                 processed: false
             }]);
             
