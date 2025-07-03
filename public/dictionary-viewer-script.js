@@ -100,12 +100,95 @@ function createEntryHTML(entry, index) {
         html += `<span class="part-of-speech">${entry.partOfSpeech}</span>`;
     }
     
+    // Show usage notes in header if present
+    if (entry.notes) {
+        html += `<span class="usage-note">${entry.notes}</span>`;
+    }
+    
     if (quickTranslation) {
         html += `<span class="quick-translation">${quickTranslation}</span>`;
         if (entry.translations[0].gender) {
             html += `<span class="gender">${entry.translations[0].gender}</span>`;
         }
     }
+    
+    html += '<span class="expand-icon">▼</span>';
+    html += '</div>';
+    
+    // Details (hidden by default)
+    html += '<div class="entry-details">';
+    
+    // All translations
+    if (entry.translations && entry.translations.length > 0) {
+        html += '<div class="translations-section">';
+        html += '<h4>Translations:</h4>';
+        entry.translations.forEach(trans => {
+            html += '<div class="translation-item">';
+            html += `<span class="hal-term">${trans.term}</span>`;
+            
+            let details = [];
+            if (trans.pronunciation) details.push(`[${trans.pronunciation}]`);
+            if (trans.gender) details.push(trans.gender);
+            if (trans.plural) details.push(`pl. ${trans.plural}`);
+            
+            if (details.length > 0) {
+                html += `<span class="translation-details">${details.join(', ')}</span>`;
+            }
+            
+            // Show translation-specific note
+            if (trans.note) {
+                html += `<span class="translation-note"> — ${trans.note}</span>`;
+            }
+            
+            if (trans.etymology) {
+                html += `<div class="etymology">${trans.etymology}</div>`;
+            }
+            html += '</div>';
+        });
+        html += '</div>';
+    }
+    
+    // Examples
+    if (entry.examples && entry.examples.length > 0) {
+        html += '<div class="examples-section">';
+        html += '<h4>Examples:</h4>';
+        entry.examples.forEach(ex => {
+            html += '<div class="example-item">';
+            if (ex.halunder) {
+                html += `<div class="example-hal">${ex.halunder}</div>`;
+            }
+            if (ex.german) {
+                html += `<div class="example-de">"${ex.german}"</div>`;
+            }
+            if (ex.note) {
+                html += `<div class="example-note">(${ex.note})</div>`;
+            }
+            html += '</div>';
+        });
+        html += '</div>';
+    }
+    
+    // Relations
+    if (entry.relations && entry.relations.length > 0) {
+        html += '<div class="relations-section">';
+        html += '<h4>See also:</h4>';
+        entry.relations.forEach(rel => {
+            html += '<div class="relation-item">';
+            html += `<span class="relation-type">${formatRelationType(rel.type)}:</span> `;
+            html += `<a class="relation-link" onclick="searchForTerm('${rel.targetTerm}', event)">${rel.targetTerm}</a>`;
+            if (rel.note) {
+                html += `<span class="relation-note"> (${rel.note})</span>`;
+            }
+            html += '</div>';
+        });
+        html += '</div>';
+    }
+    
+    html += '</div>'; // entry-details
+    html += '</div>'; // entry
+    
+    return html;
+}
     
     html += '<span class="expand-icon">▼</span>';
     html += '</div>';
