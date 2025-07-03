@@ -457,6 +457,7 @@ async function createConceptAndTerms(entry, results) {
                         gender: translation.gender,
                         plural_form: translation.plural,
                         etymology: translation.etymology,
+                        note: translation.note,
                         source_name: 'ahrhammar'
                     });
             }
