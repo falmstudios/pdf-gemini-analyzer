@@ -33,30 +33,75 @@ function addLog(processType, message, type = 'info') {
     console.log(`[${processType.toUpperCase()}] [${type.toUpperCase()}] ${message}`);
 }
 
-// Helper function to find concept IDs with fallback logic
+// --- NEW HELPER: Simple German noun singularization (Improved) ---
+function attemptSingularization(term) {
+    if (term.endsWith('en') && term.length > 3) return term.slice(0, -1); // Marken -> Marke
+    if (term.endsWith('er') && term.length > 3) return term.slice(0, -2); // Männer -> Mann (imperfect)
+    if (term.endsWith('e') && term.length > 2) return term.slice(0, -1);  // Risse -> Riss
+    if (term.endsWith('n') && term.length > 2) return term.slice(0, -1);  // Frauen -> Frau
+    if (term.endsWith('s') && term.length > 2) return term.slice(0, -1);  // Autos -> Auto
+    return null;
+}
+
+// --- FINAL ENHANCED HELPER: Finds concept IDs with multi-stage fallback logic ---
 async function findTargetConceptId(dirtyTerm) {
     if (!dirtyTerm) return null;
-    const cleanGermanTerm = (term) => term.replace(/\s*\(.*\)\s*$/, '').replace(/\s*,\s*sich\s*$/, '').replace(/\*$/, '').trim();
 
-    let { data: targetConcept } = await supabase.from('concepts').select('id').eq('primary_german_label', dirtyTerm).single();
-    if (targetConcept) return targetConcept.id;
+    const cleanGermanTerm = (term) => {
+        return term
+            .replace(/\d+$/, '')             // nieder2 -> nieder
+            .replace(/-$/, '')               // dran- -> dran
+            .replace(/!$/, '')               // klack! -> klack
+            .replace(/\s*\(.*\)\s*$/, '')    // (festlich) angezogen -> festlich angezogen
+            .replace(/\s*,\s*sich\s*$/, '')   // trennen, sich -> trennen
+            .replace(/\*$/, '')              // fliten* -> fliten
+            .trim();
+    };
 
+    const attemptMatch = async (term) => {
+        if (!term) return null;
+        const { data } = await supabase.from('concepts').select('id').eq('primary_german_label', term).single();
+        return data ? data.id : null;
+    };
+
+    // Attempt 1: Exact match
+    let conceptId = await attemptMatch(dirtyTerm);
+    if (conceptId) return conceptId;
+
+    // Attempt 2: Cleaned match
     const cleanedTerm = cleanGermanTerm(dirtyTerm);
-    if (cleanedTerm && cleanedTerm !== dirtyTerm) {
-        let { data: cleanedTarget } = await supabase.from('concepts').select('id').eq('primary_german_label', cleanedTerm).single();
-        if (cleanedTarget) return cleanedTarget.id;
+    conceptId = await attemptMatch(cleanedTerm);
+    if (conceptId) return conceptId;
+    
+    // Attempt 3: Handle slash-separated alternatives (e.g., Fels/en)
+    if (cleanedTerm.includes('/')) {
+        const parts = cleanedTerm.split('/');
+        const firstPart = parts[0].trim();
+        const secondPart = (parts[0].endsWith('-') ? parts[0].slice(0,-1) : '') + parts[1].trim();
+        
+        conceptId = await attemptMatch(firstPart) || await attemptMatch(secondPart);
+        if (conceptId) return conceptId;
     }
 
-    const firstWord = dirtyTerm.split(' ')[0].replace(/,$/, '');
-    if (firstWord && firstWord !== dirtyTerm) {
-        let { data: firstWordTarget } = await supabase.from('concepts').select('id').eq('primary_german_label', firstWord).single();
-        if (firstWordTarget) return firstWordTarget.id;
+    // Attempt 4: Singularization attempt
+    const singularAttempt = attemptSingularization(cleanedTerm);
+    if (singularAttempt) {
+        conceptId = await attemptMatch(singularAttempt);
+        if (conceptId) return conceptId;
+    }
+    
+    // Attempt 5: First word of a phrase
+    const firstWord = cleanedTerm.split(/[\s,]+/)[0];
+    if (firstWord && firstWord.length > 2 && firstWord !== cleanedTerm) {
+        conceptId = await attemptMatch(firstWord);
+        if (conceptId) return conceptId;
     }
 
+    // Attempt 6: Halunder term match
     const { data: halunderMatch } = await supabase.from('terms').select('concept_to_term!inner(concept_id)').eq('term_text', dirtyTerm).eq('language', 'hal').maybeSingle();
     if (halunderMatch && halunderMatch.concept_to_term) return halunderMatch.concept_to_term.concept_id;
     
-    return null;
+    return null; // All attempts failed
 }
 
 // --- API ROUTES ---
@@ -136,7 +181,7 @@ async function processAhrhammarData() {
         if (error) throw error;
         addLog('ahrhammar', `Found ${pdfAnalyses.length} PDF analyses to process`, 'info');
         state.progress = 0.05;
-        const results = { totalProcessed: 0, conceptsCreated: 0, termsCreated: 0, examplesCreated: 0, relationsCreated: 0, errors: 0 };
+        const globalResults = { totalProcessed: 0, conceptsCreated: 0, termsCreated: 0, examplesCreated: 0, relationsCreated: 0, errors: 0 };
 
         // Pass 1: Concepts & Terms
         addLog('ahrhammar', 'First pass: Creating concepts and terms', 'info');
@@ -145,15 +190,19 @@ async function processAhrhammarData() {
             state.status = `Pass 1/2: ${analysis.filename}`;
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.05 + (0.45 * ((i + 1) / pdfAnalyses.length));
+            
+            const perFileResults = { entries: 0, terms: 0, examples: 0 };
             try {
                 let jsonData = analysis.result.replace(/^```json\s*|```$/g, '');
                 const entries = JSON.parse(jsonData);
+                perFileResults.entries = entries.length;
                 for (const entry of entries) {
-                    await processAhrhammarEntryFirstPass(entry, results);
+                    await processAhrhammarEntryFirstPass(entry, globalResults, perFileResults);
                 }
+                addLog('ahrhammar', `File ${analysis.filename} (Pass 1): Processed ${perFileResults.entries} entries. Added ${perFileResults.terms} terms, ${perFileResults.examples} examples.`, 'info');
             } catch (e) {
                 addLog('ahrhammar', `Error processing ${analysis.filename} in Pass 1: ${e.message}`, 'error');
-                results.errors++;
+                globalResults.errors++;
             }
         }
 
@@ -164,21 +213,24 @@ async function processAhrhammarData() {
             state.status = `Pass 2/2: ${analysis.filename}`;
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.5 + (0.45 * ((i + 1) / pdfAnalyses.length));
+
+            const perFileResults = { relations: 0, skipped: 0 };
             try {
                 let jsonData = analysis.result.replace(/^```json\s*|```$/g, '');
                 const entries = JSON.parse(jsonData);
                 for (const entry of entries) {
-                    await processAhrhammarRelations(entry, results);
+                    await processAhrhammarRelations(entry, globalResults, perFileResults);
                 }
+                addLog('ahrhammar', `File ${analysis.filename} (Pass 2): Created ${perFileResults.relations} relations, skipped ${perFileResults.skipped}.`, 'info');
             } catch (e) {
                 addLog('ahrhammar', `Error processing ${analysis.filename} in Pass 2: ${e.message}`, 'error');
-                results.errors++;
+                globalResults.errors++;
             }
         }
 
         const processingTime = Math.round((Date.now() - state.startTime) / 1000);
-        results.processingTime = `${Math.floor(processingTime / 60)}m ${processingTime % 60}s`;
-        state.results = results;
+        globalResults.processingTime = `${Math.floor(processingTime / 60)}m ${processingTime % 60}s`;
+        state.results = globalResults;
         state.status = 'Completed';
         state.progress = 1;
         addLog('ahrhammar', `Processing completed`, 'success');
@@ -191,28 +243,32 @@ async function processAhrhammarData() {
     }
 }
 
-async function processAhrhammarEntryFirstPass(entry, results) {
-    results.totalProcessed++;
+async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResults) {
+    globalResults.totalProcessed++;
     const { data: concept } = await supabase.from('concepts').upsert({ primary_german_label: entry.headword, part_of_speech: entry.partOfSpeech, notes: entry.usageNotes ? entry.usageNotes.join('; ') : null }, { onConflict: 'primary_german_label' }).select('id').single();
     if (!concept) throw new Error(`Could not upsert concept for ${entry.headword}`);
-    results.conceptsCreated++;
+    globalResults.conceptsCreated++;
+    
     await supabase.from('terms').upsert({ term_text: entry.headword, language: 'de' }, { onConflict: 'term_text,language' });
-    results.termsCreated++;
+    globalResults.termsCreated++;
+    perFileResults.terms++;
 
     if (entry.translations) for (const translation of entry.translations) {
         const { data: halunderTerm } = await supabase.from('terms').upsert({ term_text: translation.term, language: 'hal' }, { onConflict: 'term_text,language' }).select('id').single();
         if (halunderTerm) {
-            results.termsCreated++;
+            globalResults.termsCreated++;
+            perFileResults.terms++;
             await supabase.from('concept_to_term').upsert({ concept_id: concept.id, term_id: halunderTerm.id, pronunciation: translation.pronunciation, gender: translation.gender, plural_form: translation.plural, etymology: translation.etymology, note: translation.note, homonym_number: entry.homonymNumber, source_name: 'ahrhammar' }, { onConflict: 'concept_id,term_id,source_name' });
         }
     }
     if (entry.examples) for (const example of entry.examples) {
         await supabase.from('examples').insert({ concept_id: concept.id, halunder_sentence: example.halunder, german_sentence: example.german, note: example.note, source_name: 'ahrhammar' });
-        results.examplesCreated++;
+        globalResults.examplesCreated++;
+        perFileResults.examples++;
     }
 }
 
-async function processAhrhammarRelations(entry, results) {
+async function processAhrhammarRelations(entry, results, perFileResults) {
     if (!entry.relations || entry.relations.length === 0) return;
     const { data: sourceConcept } = await supabase.from('concepts').select('id').eq('primary_german_label', entry.headword).single();
     if (!sourceConcept) return;
@@ -220,8 +276,12 @@ async function processAhrhammarRelations(entry, results) {
         const targetConceptId = await findTargetConceptId(relation.targetTerm);
         if (targetConceptId) {
             const { error } = await supabase.from('relations').insert({ source_concept_id: sourceConcept.id, target_concept_id: targetConceptId, relation_type: relation.type, note: relation.note });
-            if (!error) results.relationsCreated++;
+            if (!error) {
+                results.relationsCreated++;
+                perFileResults.relations++;
+            }
         } else {
+            perFileResults.skipped++;
             addLog('ahrhammar', `Target concept not found for relation: ${entry.headword} -> ${relation.targetTerm}`, 'warning');
         }
     }
@@ -239,29 +299,31 @@ async function processKrogmannData() {
         if (error) throw error;
         addLog('krogmann', `Found ${krogmannData.length} Krogmann files to process`, 'info');
         state.progress = 0.1;
-        const results = { totalProcessed: 0, conceptsCreated: 0, conceptsEnriched: 0, termsCreated: 0, examplesCreated: 0, relationsCreated: 0, errors: 0 };
+        const globalResults = { totalProcessed: 0, conceptsCreated: 0, conceptsEnriched: 0, termsCreated: 0, examplesCreated: 0, relationsCreated: 0, errors: 0 };
 
         for (let i = 0; i < krogmannData.length; i++) {
             const file = krogmannData[i];
             state.status = `Processing ${file.filename}`;
             state.details = `File ${i + 1} of ${krogmannData.length}`;
             state.progress = 0.1 + (0.8 * ((i + 1) / krogmannData.length));
+            const perFileResults = { entries: 0, enriched: 0, created: 0, examples: 0, relations: 0, errors: 0 };
             try {
                 const entries = file.data;
+                perFileResults.entries = entries.length;
                 for (const entry of entries) {
-                    await processKrogmannEntry(entry, results);
+                    await processKrogmannEntry(entry, globalResults, perFileResults);
                 }
                 await supabase.from('krogmann_uploads').update({ processed: true }).eq('id', file.id);
-                addLog('krogmann', `Completed ${file.filename}: ${entries.length} entries`, 'success');
+                addLog('krogmann', `File ${file.filename}: Processed ${perFileResults.entries} entries. Enriched ${perFileResults.enriched}, created ${perFileResults.created}, added ${perFileResults.examples} examples & ${perFileResults.relations} relations.`, 'info');
             } catch (e) {
                 addLog('krogmann', `Error processing file ${file.filename}: ${e.message}`, 'error');
-                results.errors++;
+                globalResults.errors++;
             }
         }
 
         const processingTime = Math.round((Date.now() - state.startTime) / 1000);
-        results.processingTime = `${Math.floor(processingTime / 60)}m ${processingTime % 60}s`;
-        state.results = results;
+        globalResults.processingTime = `${Math.floor(processingTime / 60)}m ${processingTime % 60}s`;
+        state.results = globalResults;
         state.status = 'Completed';
         state.progress = 1;
         addLog('krogmann', `Processing completed`, 'success');
@@ -274,15 +336,17 @@ async function processKrogmannData() {
     }
 }
 
-async function processKrogmannEntry(entry, results) {
-    results.totalProcessed++;
+async function processKrogmannEntry(entry, globalResults, perFileResults) {
+    globalResults.totalProcessed++;
     let { data: concept } = await supabase.from('concepts').select('*').eq('primary_german_label', entry.germanMeaning).single();
     
     if (concept) {
         // Concept exists, enrich it
-        await enrichConceptWithKrogmann(concept, entry, results, 'krogmann');
+        perFileResults.enriched++;
+        await enrichConceptWithKrogmann(concept, entry, globalResults, perFileResults, 'krogmann');
     } else {
         // Concept does not exist, create it from Krogmann data
+        perFileResults.created++;
         let initialNotes = [];
         if (entry.additionalInfo) initialNotes.push(`[Krogmann Info] ${entry.additionalInfo}`);
         if (entry.idioms) initialNotes.push(`[Krogmann Idiom] ${entry.idioms}`);
@@ -295,15 +359,13 @@ async function processKrogmannEntry(entry, results) {
         }).select().single();
 
         if (error) throw error;
-        results.conceptsCreated++;
-        // "Enrich" the new concept with the rest of its own data (terms, examples, etc.)
-        await enrichConceptWithKrogmann(newConcept, entry, results, 'krogmann');
+        globalResults.conceptsCreated++;
+        await enrichConceptWithKrogmann(newConcept, entry, globalResults, perFileResults, 'krogmann');
     }
 }
 
-async function enrichConceptWithKrogmann(concept, entry, results, sourceName) {
-    // 1. Enrich the concept's main notes (if it's an existing concept from another source)
-    if (concept.notes && !concept.notes.includes('[Krogmann Info]')) { // Prevent double-appending
+async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileResults, sourceName) {
+    if (concept.notes && !concept.notes.includes('[Krogmann Info]')) {
         let newNoteParts = [];
         if (entry.additionalInfo) newNoteParts.push(`[Krogmann Info] ${entry.additionalInfo}`);
         if (entry.idioms) newNoteParts.push(`[Krogmann Idiom] ${entry.idioms}`);
@@ -314,14 +376,13 @@ async function enrichConceptWithKrogmann(concept, entry, results, sourceName) {
             const combinedNotes = `${concept.notes}\n\n---\n\n${enrichmentText}`;
             const { error } = await supabase.from('concepts').update({ notes: combinedNotes }).eq('id', concept.id);
             if (error) addLog('krogmann', `Failed to enrich notes for ${concept.primary_german_label}: ${error.message}`, 'error');
-            else results.conceptsEnriched++;
+            else globalResults.conceptsEnriched++;
         }
     }
 
-    // 2. Add or update the Halunder term and its link
     const { data: halunderTerm } = await supabase.from('terms').upsert({ term_text: entry.halunderWord, language: 'hal' }, { onConflict: 'term_text,language' }).select('id').single();
     if (halunderTerm) {
-        results.termsCreated++;
+        globalResults.termsCreated++;
         await supabase.from('concept_to_term').upsert({
             concept_id: concept.id,
             term_id: halunderTerm.id,
@@ -333,18 +394,20 @@ async function enrichConceptWithKrogmann(concept, entry, results, sourceName) {
         }, { onConflict: 'concept_id,term_id,source_name' });
     }
 
-    // 3. Add examples
     if (entry.examples) for (const example of entry.examples) {
         await supabase.from('examples').insert({ concept_id: concept.id, halunder_sentence: example.halunder, german_sentence: example.german, note: example.note, source_name: sourceName });
-        results.examplesCreated++;
+        globalResults.examplesCreated++;
+        perFileResults.examples++;
     }
     
-    // 4. Add relations from Krogmann's relatedWords
     if(entry.relatedWords) for (const related of entry.relatedWords) {
         const targetConceptId = await findTargetConceptId(related);
         if(targetConceptId) {
             const { error } = await supabase.from('relations').insert({ source_concept_id: concept.id, target_concept_id: targetConceptId, relation_type: 'see_also', note: `From ${sourceName}` });
-            if (!error) results.relationsCreated++;
+            if (!error) {
+                globalResults.relationsCreated++;
+                perFileResults.relations++;
+            }
         } else {
             addLog('krogmann', `Target concept not found for Krogmann relation: ${concept.primary_german_label} -> ${related}`, 'warning');
         }
