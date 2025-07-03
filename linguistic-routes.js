@@ -7,7 +7,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 router.use(express.json());
 
 // Initialize connections with error checking
-console.log('Initializing linguistic routes v5 with batch saving...');
+console.log('Initializing linguistic routes v7 with proper duplicate handling...');
 console.log('SOURCE_SUPABASE_URL exists:', !!process.env.SOURCE_SUPABASE_URL);
 console.log('SOURCE_SUPABASE_ANON_KEY exists:', !!process.env.SOURCE_SUPABASE_ANON_KEY);
 console.log('GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
@@ -40,6 +40,8 @@ let processingState = {
 
 // Store the merged data globally for the processing session
 let currentMergedMap = null;
+// Track terms saved in this session to prevent duplicates
+let sessionSavedTerms = null;
 
 // Helper function to add logs
 function addLog(message, type = 'info') {
@@ -137,53 +139,6 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// Test route for debugging
-router.get('/test-save', async (req, res) => {
-    try {
-        // Test with a simple entry including new fields
-        const testEntry = {
-            halunder_term: 'test_term_' + Date.now(),
-            german_equivalent: 'test_german',
-            explanation: 'test explanation',
-            feature_type: 'general',
-            source_table: 'linguistic_features',
-            source_ids: ['123e4567-e89b-12d3-a456-426614174000'],
-            relevance_score: 5,
-            tags: ['test', 'debug']
-        };
-        
-        console.log('Attempting to insert:', testEntry);
-        
-        const { data, error } = await supabase
-            .from('cleaned_linguistic_examples')
-            .insert([testEntry])
-            .select()
-            .single();
-            
-        if (error) {
-            console.error('Detailed error:', error);
-            return res.json({ 
-                success: false, 
-                error: error,
-                errorMessage: error.message,
-                errorDetails: error.details,
-                errorHint: error.hint,
-                errorCode: error.code
-            });
-        }
-        
-        res.json({ success: true, data });
-        
-    } catch (error) {
-        console.error('Catch error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message,
-            stack: error.stack 
-        });
-    }
-});
-
 // Check which terms are already processed
 async function getProcessedTerms() {
     try {
@@ -238,9 +193,10 @@ router.post('/start-cleaning', async (req, res) => {
         
         // Clear previous session data
         currentMergedMap = null;
+        sessionSavedTerms = new Map(); // Use Map to track which cleaned_id each term maps to
         
         // Start processing in background
-        processDataV5(processLinguistic, processTranslation, batchSize || 100)
+        processDataV7(processLinguistic, processTranslation, batchSize || 50) // Smaller batches for better control
             .catch(error => {
                 console.error('Background processing error:', error);
                 addLog(`Critical error: ${error.message}`, 'error');
@@ -272,10 +228,10 @@ router.get('/progress', (req, res) => {
     });
 });
 
-// Main processing function V5 - With batch saving
-async function processDataV5(processLinguistic, processTranslation, batchSize) {
+// Main processing function V7 - Proper duplicate handling
+async function processDataV7(processLinguistic, processTranslation, batchSize) {
     try {
-        addLog('Starting data cleaning process V5 with batch saving', 'info');
+        addLog('Starting data cleaning process V7 with proper duplicate handling', 'info');
         
         // Get already processed terms
         processingState.status = 'Checking already processed terms...';
@@ -335,6 +291,7 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
                 existing.explanations.push(record.explanation);
                 existing.source_ids.push(record.id);
                 existing.source_tables.push(record.source_table);
+                existing.original_terms.push(record.halunder_term); // Track original term variations
             } else {
                 // Create new entry
                 mergedMap.set(record.term, {
@@ -344,6 +301,7 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
                     feature_type: record.feature_type || 'general',
                     source_ids: [record.id],
                     source_tables: [record.source_table],
+                    original_terms: [record.halunder_term], // Track original term variations
                     original_count: 1
                 });
             }
@@ -395,7 +353,7 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
         
         processingState.progress = 0.5;
         
-        // Step 4: Process with LLM in batches - SAVE AFTER EACH BATCH
+        // Step 4: Process with LLM in batches
         processingState.status = 'Processing with Gemini 2.5 Pro...';
         const totalBatches = Math.ceil(mergedEntries.length / batchSize);
         
@@ -406,9 +364,11 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
             uniqueTerms: mergedMap.size,
             duplicatesFound: totalDuplicates,
             entriesCreated: 0,
+            entriesUpdated: 0,
             errors: 0,
             batchesSaved: 0,
-            batchesFailed: 0
+            batchesFailed: 0,
+            variantsCreated: 0
         };
         
         for (let i = 0; i < mergedEntries.length; i += batchSize) {
@@ -423,12 +383,14 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
             
             try {
                 // Process batch with Gemini
-                const cleanedBatch = await processWithGeminiV5(batch);
+                const cleanedBatch = await processWithGeminiV7(batch);
                 
                 if (cleanedBatch && cleanedBatch.length > 0) {
-                    // Add original term keys to the cleaned entries
+                    // Group entries by original term to handle variants properly
+                    const entriesByOriginalTerm = new Map();
+                    
                     for (const cleanedEntry of cleanedBatch) {
-                        // Find the original entry in the batch by matching halunder_term
+                        // Find the original entry
                         const originalEntry = batch.find(b => {
                             const bTerm = b.halunder_term?.toLowerCase().trim();
                             const cTerm = cleanedEntry.halunder_term?.toLowerCase().trim();
@@ -436,34 +398,95 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
                         });
                         
                         if (originalEntry) {
-                            cleanedEntry.original_term_key = originalEntry.original_term_key;
+                            const key = originalEntry.original_term_key;
+                            if (!entriesByOriginalTerm.has(key)) {
+                                entriesByOriginalTerm.set(key, []);
+                            }
+                            entriesByOriginalTerm.get(key).push({
+                                ...cleanedEntry,
+                                original_term_key: key
+                            });
+                        }
+                    }
+                    
+                    // Save entries and track relationships
+                    addLog(`Saving batch ${batchNum} to database...`, 'info');
+                    let batchSaved = 0;
+                    let batchErrors = 0;
+                    let batchVariants = 0;
+                    
+                    for (const [originalTermKey, variants] of entriesByOriginalTerm) {
+                        // Find the primary entry (feature_type === 'primary' or first one)
+                        const primaryEntry = variants.find(v => v.feature_type === 'primary') || variants[0];
+                        
+                        // Save or update the primary entry
+                        let primaryCleanedId = null;
+                        const primaryTermKey = primaryEntry.halunder_term.toLowerCase().trim();
+                        
+                        // Check if already saved in session
+                        if (sessionSavedTerms.has(primaryTermKey)) {
+                            primaryCleanedId = sessionSavedTerms.get(primaryTermKey);
+                            addLog(`Using existing entry for ${primaryEntry.halunder_term}`, 'info');
                         } else {
-                            // If exact match fails, try to find by the key directly
-                            const termKey = cleanedEntry.halunder_term?.toLowerCase().trim();
-                            if (currentMergedMap.has(termKey)) {
-                                cleanedEntry.original_term_key = termKey;
+                            try {
+                                const savedEntry = await saveCleanedEntryV7(primaryEntry, originalTermKey);
+                                if (savedEntry) {
+                                    primaryCleanedId = savedEntry.id;
+                                    sessionSavedTerms.set(primaryTermKey, primaryCleanedId);
+                                    batchSaved++;
+                                    results.entriesCreated++;
+                                }
+                            } catch (error) {
+                                if (error.message?.includes('duplicate key value')) {
+                                    // Entry already exists, try to get its ID
+                                    const existing = await getExistingEntry(primaryEntry.halunder_term);
+                                    if (existing) {
+                                        primaryCleanedId = existing.id;
+                                        sessionSavedTerms.set(primaryTermKey, primaryCleanedId);
+                                        results.entriesUpdated++;
+                                        addLog(`Found existing entry for ${primaryEntry.halunder_term}`, 'info');
+                                    }
+                                } else {
+                                    addLog(`Error saving primary entry ${primaryEntry.halunder_term}: ${error.message}`, 'error');
+                                    batchErrors++;
+                                    results.errors++;
+                                }
+                            }
+                        }
+                        
+                        // Save secondary variants
+                        for (const variant of variants) {
+                            if (variant === primaryEntry) continue;
+                            
+                            const variantTermKey = variant.halunder_term.toLowerCase().trim();
+                            
+                            // Skip if already saved
+                            if (sessionSavedTerms.has(variantTermKey)) {
+                                addLog(`Skipping duplicate variant ${variant.halunder_term}`, 'info');
+                                continue;
+                            }
+                            
+                            try {
+                                // For secondary entries, we want to store them but link to the primary
+                                const savedVariant = await saveCleanedEntryV7(variant, originalTermKey, primaryCleanedId);
+                                if (savedVariant) {
+                                    sessionSavedTerms.set(variantTermKey, savedVariant.id);
+                                    batchVariants++;
+                                    results.variantsCreated++;
+                                }
+                            } catch (error) {
+                                if (error.message?.includes('duplicate key value')) {
+                                    sessionSavedTerms.set(variantTermKey, 'exists');
+                                    addLog(`Variant ${variant.halunder_term} already exists`, 'info');
+                                } else {
+                                    addLog(`Error saving variant ${variant.halunder_term}: ${error.message}`, 'error');
+                                    batchErrors++;
+                                }
                             }
                         }
                     }
                     
-                    // Save this batch immediately
-                    addLog(`Saving batch ${batchNum} to database...`, 'info');
-                    let batchSaved = 0;
-                    let batchErrors = 0;
-                    
-                    for (const entry of cleanedBatch) {
-                        try {
-                            await saveCleanedEntryV5(entry);
-                            batchSaved++;
-                            results.entriesCreated++;
-                        } catch (error) {
-                            addLog(`Error saving entry ${entry.halunder_term}: ${error.message}`, 'error');
-                            batchErrors++;
-                            results.errors++;
-                        }
-                    }
-                    
-                    addLog(`Batch ${batchNum} saved: ${batchSaved} entries saved, ${batchErrors} errors`, 
+                    addLog(`Batch ${batchNum}: ${batchSaved} primary saved, ${batchVariants} variants saved, ${batchErrors} errors`, 
                            batchErrors > 0 ? 'warning' : 'success');
                     results.batchesSaved++;
                     
@@ -487,7 +510,7 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
         
         processingState.results = results;
         processingState.status = 'Completed';
-        processingState.details = `Created ${results.entriesCreated} entries from ${results.uniqueTerms} unique unprocessed terms`;
+        processingState.details = `Created ${results.entriesCreated} primary entries and ${results.variantsCreated} variants`;
         processingState.progress = 1;
         
         addLog(`Processing completed: ${results.batchesSaved} batches saved, ${results.batchesFailed} batches failed`, 'success');
@@ -499,12 +522,29 @@ async function processDataV5(processLinguistic, processTranslation, batchSize) {
         throw error;
     } finally {
         processingState.isProcessing = false;
-        currentMergedMap = null; // Clear the session data
+        currentMergedMap = null;
+        sessionSavedTerms = null;
     }
 }
 
-// Process batch with Gemini V5 - With your improved prompt
-async function processWithGeminiV5(batch) {
+// Get existing entry by term
+async function getExistingEntry(halunderTerm) {
+    try {
+        const { data, error } = await supabase
+            .from('cleaned_linguistic_examples')
+            .select('id')
+            .ilike('halunder_term', halunderTerm)
+            .single();
+            
+        if (error) return null;
+        return data;
+    } catch (error) {
+        return null;
+    }
+}
+
+// Process batch with Gemini V7
+async function processWithGeminiV7(batch) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
         
@@ -512,29 +552,34 @@ async function processWithGeminiV5(batch) {
 1. Bereinige die Erklärung, insbesondere bei Duplikaten, Redundanzen, etc. Behalte immer das interessanteste. Denk nach was jemand lesen wollen würde und was für lernen und Verständnis besonders hilfreich wäre.
 2. Bewerte die Relevanz (0-10): Kulturelle Bedeutung, unerwartete Bedeutungen, reichhaltige Informationen = hoch. Einfache Erklärungen wie "der Plural von X" oder direkte Übersetzungen = niedrig
 3. Vergib passende Tags aus: cultural, idiom, grammar, false_friend, misspelling, etymology, person, place, building, date, maritime, food, tradition, archaic
+4. WICHTIG: Erstelle separate Einträge für verschiedene Schreibweisen und verwandte Begriffe die im Text erwähnt werden
 
 Du sollst bereinigen und die optimale und vielfältigste Erklärung (bis zu mehreren Sätzen) erstellen.
-
-In a sense that these translation aids / linguistic explanations help the user of a translator / dictionary to understand why a certain word is used.
 
 Easy example:
 Heligolands main sight/attraction is the "Lange Anna" in german. When translating to Halunder, that becomes "Nathurnstak" or "Nathurn Stak". Therefore that word (or both words) should receive a full explanation in a few sentences. No generic bullshit, just straight up facts. For example: Nathurnstak (term) would have the following explanation: Das Wahrzeichen Helgolands ist die Lange Anna, welche auf Halunder "Nathurnstak" oder älter "Nathurn Stak" heißt. Die Bezeichnung Lange Anna ist auf eine Bedienung in einem Café an der Nordspitze zurückzuführen, auf Helgoländisch wurde diese aber nicht übernommen. Das Nathurnstak entstand, als das vorgelagerte Nathurn Gatt" im Jahr XXXX ins Meer abgebrochen ist. Die Lange Anna wurde XXXX mit einem Betonfuß verstärkt.
 
-So you should generate two clean entries for either Nathurnstak (primary, the correct form) and all other "correct" spellings or synonyms as "secondary" tag with the same explanation.
+So you should generate two clean entries: Nathurnstak (primary, the correct form) and "Nathurn Stak" as secondary with the same explanation.
+
+Another example:
+If the text mentions "Aaremhüs - Armenhaus - Das helgoländische Armenhaus trug den Beinamen 'De lung Jammer'", you should create TWO entries:
+1. Aaremhüs (primary) with full explanation
+2. De lung Jammer (secondary) with explanation that it's the nickname for Aaremhüs
 
 Eingabe: ${batch.length} Einträge
 ${JSON.stringify(batch.map(({ original_term_key, ...rest }) => rest), null, 2)}
 
 Ausgabe als JSON-Array:
 [{
-  "halunder_term": "EXAKT wie im Input",
+  "halunder_term": "EXAKT wie im Input oder neu extrahierter Begriff",
   "german_equivalent": "deutsche Übersetzung",
   "explanation": "bereinigte Erklärung",
-  "feature_type": "primary/secondary",
+  "feature_type": "primary/secondary/extracted",
   "relevance_score": 5,
   "tags": ["cultural", "place"]
 }]
 
+WICHTIG: Für jeden Input-Eintrag können MEHRERE Output-Einträge entstehen! 
 NUR das JSON-Array zurückgeben!`;
 
         const result = await model.generateContent(prompt);
@@ -574,6 +619,10 @@ NUR das JSON-Array zurückgeben!`;
                     // Ensure tags is an array
                     if (!Array.isArray(entry.tags)) {
                         entry.tags = [];
+                    }
+                    // Default feature_type
+                    if (!entry.feature_type) {
+                        entry.feature_type = 'general';
                     }
                     return entry;
                 });
@@ -617,30 +666,23 @@ NUR das JSON-Array zurückgeben!`;
     }
 }
 
-// Save cleaned entry to database V5
-async function saveCleanedEntryV5(entry) {
+// Save cleaned entry to database V7 - With proper mapping
+async function saveCleanedEntryV7(entry, originalTermKey, relatedPrimaryId = null) {
     try {
-        // Get original data using the key
+        // Get original data
         let originalData = null;
         
-        if (entry.original_term_key && currentMergedMap) {
-            originalData = currentMergedMap.get(entry.original_term_key);
-        }
-        
-        // If not found by key, try to find by term (case-insensitive)
-        if (!originalData && currentMergedMap && entry.halunder_term) {
-            const searchTerm = entry.halunder_term.toLowerCase().trim();
-            originalData = currentMergedMap.get(searchTerm);
+        if (originalTermKey && currentMergedMap) {
+            originalData = currentMergedMap.get(originalTermKey);
         }
         
         if (!originalData) {
             addLog(`No original data found for ${entry.halunder_term}`, 'warning');
-            return;
+            return null;
         }
         
         // Ensure source_ids are valid UUIDs
         const validSourceIds = originalData.source_ids.filter(id => {
-            // Basic UUID validation
             return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
         });
         
@@ -662,37 +704,87 @@ async function saveCleanedEntryV5(entry) {
             .single();
             
         if (error) {
-            console.error('Supabase detailed error:', {
-                message: error.message,
-                details: error.details,
-                hint: error.hint,
-                code: error.code
-            });
-            throw new Error(error.message || 'Insert failed');
+            throw error;
         }
         
-        // Only insert mappings if we have valid IDs
-        if (validSourceIds.length > 0) {
-            const mappings = validSourceIds.map((sourceId, index) => ({
-                original_id: sourceId,
-                source_table: originalData.source_tables?.[index] || originalData.source_tables?.[0] || 'unknown',
-                cleaned_id: data.id,
-                similarity_score: 1.0
-            }));
+        // Insert mapping records for all original source IDs
+        if (validSourceIds.length > 0 && data) {
+            const mappings = [];
             
-            const { error: mappingError } = await supabase
-                .from('linguistic_duplicates_map')
-                .insert(mappings);
+            // Create mapping for each original duplicate
+            for (let i = 0; i < originalData.source_ids.length; i++) {
+                if (!validSourceIds.includes(originalData.source_ids[i])) continue;
                 
-            if (mappingError) {
-                console.error('Mapping insert error:', mappingError);
-                // Don't throw here, main record was saved
+                mappings.push({
+                    original_id: originalData.source_ids[i],
+                    source_table: originalData.source_tables[i],
+                    cleaned_id: data.id,
+                    similarity_score: 1.0
+                });
+            }
+            
+            if (mappings.length > 0) {
+                const { error: mappingError } = await supabase
+                    .from('linguistic_duplicates_map')
+                    .insert(mappings);
+                    
+                if (mappingError) {
+                    console.error('Mapping insert error:', mappingError);
+                }
             }
         }
+        
+        return data;
+        
     } catch (error) {
         console.error('Save error details:', error);
         throw error;
     }
 }
+
+// Check duplicates endpoint
+router.get('/check-duplicates', async (req, res) => {
+    try {
+        if (!supabase) {
+            return res.json({ error: 'Database not configured' });
+        }
+        
+        const { data: allData, error } = await supabase
+            .from('cleaned_linguistic_examples')
+            .select('halunder_term, id, created_at, relevance_score')
+            .order('halunder_term');
+            
+        if (error) {
+            return res.status(500).json({ error: error.message });
+        }
+        
+        // Find duplicates manually
+        const termGroups = {};
+        allData.forEach(item => {
+            const termKey = item.halunder_term.toLowerCase().trim();
+            if (!termGroups[termKey]) {
+                termGroups[termKey] = [];
+            }
+            termGroups[termKey].push(item);
+        });
+        
+        const duplicates = Object.entries(termGroups)
+            .filter(([term, items]) => items.length > 1)
+            .map(([term, items]) => ({
+                term,
+                count: items.length,
+                items: items
+            }));
+            
+        res.json({ 
+            duplicates,
+            totalDuplicateGroups: duplicates.length,
+            totalDuplicateEntries: duplicates.reduce((sum, d) => sum + d.count, 0)
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 module.exports = router;
