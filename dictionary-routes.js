@@ -36,7 +36,18 @@ let processingStates = {
         details: '',
         logs: [],
         results: null
+    },
+    // --- FIX START ---
+    // Add a state for 'admin' actions to prevent crashes when logging.
+    admin: {
+        isProcessing: false,
+        progress: 0,
+        status: 'idle',
+        details: '',
+        logs: [],
+        results: null
     }
+    // --- FIX END ---
 };
 
 // Helper function to add logs
