@@ -16,23 +16,44 @@
         <div class="search-section">
             <div class="search-box">
                 <input type="text" id="searchInput" placeholder="Search in German or Halunder..." autocomplete="off">
+                <select id="searchType">
+                    <option value="both">Both languages</option>
+                    <option value="de">German only</option>
+                    <option value="hal">Halunder only</option>
+                </select>
                 <button onclick="searchDictionary()" class="search-btn">Search</button>
                 <button onclick="clearSearch()" class="clear-btn">Clear</button>
             </div>
-            <div class="search-options">
-                <label>
-                    <input type="radio" name="searchLang" value="both" checked>
-                    Both languages
-                </label>
-                <label>
-                    <input type="radio" name="searchLang" value="de">
-                    German only
-                </label>
-                <label>
-                    <input type="radio" name="searchLang" value="hal">
-                    Halunder only
-                </label>
-            </div>
+        </div>
+        
+        <div class="alphabet-bar">
+            <span class="alphabet-label">Browse:</span>
+            <button onclick="browseByLetter('A')">A</button>
+            <button onclick="browseByLetter('B')">B</button>
+            <button onclick="browseByLetter('C')">C</button>
+            <button onclick="browseByLetter('D')">D</button>
+            <button onclick="browseByLetter('E')">E</button>
+            <button onclick="browseByLetter('F')">F</button>
+            <button onclick="browseByLetter('G')">G</button>
+            <button onclick="browseByLetter('H')">H</button>
+            <button onclick="browseByLetter('I')">I</button>
+            <button onclick="browseByLetter('J')">J</button>
+            <button onclick="browseByLetter('K')">K</button>
+            <button onclick="browseByLetter('L')">L</button>
+            <button onclick="browseByLetter('M')">M</button>
+            <button onclick="browseByLetter('N')">N</button>
+            <button onclick="browseByLetter('O')">O</button>
+            <button onclick="browseByLetter('P')">P</button>
+            <button onclick="browseByLetter('Q')">Q</button>
+            <button onclick="browseByLetter('R')">R</button>
+            <button onclick="browseByLetter('S')">S</button>
+            <button onclick="browseByLetter('T')">T</button>
+            <button onclick="browseByLetter('U')">U</button>
+            <button onclick="browseByLetter('V')">V</button>
+            <button onclick="browseByLetter('W')">W</button>
+            <button onclick="browseByLetter('X')">X</button>
+            <button onclick="browseByLetter('Y')">Y</button>
+            <button onclick="browseByLetter('Z')">Z</button>
         </div>
         
         <div class="results-info" id="resultsInfo"></div>
@@ -40,40 +61,7 @@
         <div class="dictionary-entries" id="dictionaryEntries">
             <div class="welcome-message">
                 <h2>Welcome to the Helgolandic Dictionary</h2>
-                <p>Start typing to search for words in German or Halunder.</p>
-                <p>You can also browse recent entries below.</p>
-            </div>
-        </div>
-        
-        <div class="browse-section">
-            <h2>Browse Dictionary</h2>
-            <div class="alphabet-nav">
-                <button onclick="browseByLetter('A')">A</button>
-                <button onclick="browseByLetter('B')">B</button>
-                <button onclick="browseByLetter('C')">C</button>
-                <button onclick="browseByLetter('D')">D</button>
-                <button onclick="browseByLetter('E')">E</button>
-                <button onclick="browseByLetter('F')">F</button>
-                <button onclick="browseByLetter('G')">G</button>
-                <button onclick="browseByLetter('H')">H</button>
-                <button onclick="browseByLetter('I')">I</button>
-                <button onclick="browseByLetter('J')">J</button>
-                <button onclick="browseByLetter('K')">K</button>
-                <button onclick="browseByLetter('L')">L</button>
-                <button onclick="browseByLetter('M')">M</button>
-                <button onclick="browseByLetter('N')">N</button>
-                <button onclick="browseByLetter('O')">O</button>
-                <button onclick="browseByLetter('P')">P</button>
-                <button onclick="browseByLetter('Q')">Q</button>
-                <button onclick="browseByLetter('R')">R</button>
-                <button onclick="browseByLetter('S')">S</button>
-                <button onclick="browseByLetter('T')">T</button>
-                <button onclick="browseByLetter('U')">U</button>
-                <button onclick="browseByLetter('V')">V</button>
-                <button onclick="browseByLetter('W')">W</button>
-                <button onclick="browseByLetter('X')">X</button>
-                <button onclick="browseByLetter('Y')">Y</button>
-                <button onclick="browseByLetter('Z')">Z</button>
+                <p>Search for words or browse alphabetically.</p>
             </div>
         </div>
         
