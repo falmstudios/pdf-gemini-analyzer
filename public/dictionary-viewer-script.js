@@ -2,11 +2,12 @@ let currentPage = 1;
 let currentSearchTerm = '';
 let currentLetter = '';
 let totalPages = 1;
+let allEntries = [];
 
 // Search functionality
 async function searchDictionary() {
     const searchTerm = document.getElementById('searchInput').value.trim();
-    const searchLang = document.querySelector('input[name="searchLang"]:checked').value;
+    const searchType = document.getElementById('searchType').value;
     
     if (!searchTerm) {
         loadRecentEntries();
@@ -48,8 +49,8 @@ async function loadEntries() {
         let url = '/dictionary/search?page=' + currentPage;
         
         if (currentSearchTerm) {
-            const searchLang = document.querySelector('input[name="searchLang"]:checked').value;
-            url += '&term=' + encodeURIComponent(currentSearchTerm) + '&lang=' + searchLang;
+            const searchType = document.getElementById('searchType').value;
+            url += '&term=' + encodeURIComponent(currentSearchTerm) + '&lang=' + searchType;
         } else if (currentLetter) {
             url += '&letter=' + currentLetter;
         }
@@ -57,6 +58,7 @@ async function loadEntries() {
         const response = await fetch(url);
         const data = await response.json();
         
+        allEntries = data.entries;
         displayEntries(data.entries);
         updatePagination(data.totalPages, data.currentPage);
         updateResultsInfo(data.totalEntries);
@@ -75,41 +77,59 @@ function displayEntries(entries) {
         return;
     }
     
-    entriesDiv.innerHTML = entries.map(entry => createEntryHTML(entry)).join('');
+    entriesDiv.innerHTML = entries.map((entry, index) => createEntryHTML(entry, index)).join('');
 }
 
 // Create HTML for a single entry
-function createEntryHTML(entry) {
-    let html = '<div class="entry">';
+function createEntryHTML(entry, index) {
+    const quickTranslation = entry.translations && entry.translations.length > 0 
+        ? entry.translations[0].term 
+        : '';
     
-    // Header
+    let html = `<div class="entry" onclick="toggleEntry(${index})">`;
+    
+    // Header (always visible)
     html += '<div class="entry-header">';
-    html += `<div class="headword">${entry.headword}`;
+    html += `<span class="headword">${entry.headword}`;
     if (entry.homonymNumber) {
-        html += `<sup>${entry.homonymNumber}</sup>`;
+        html += `<span class="homonym-number">${entry.homonymNumber}</span>`;
     }
-    html += '</div>';
+    html += '</span>';
+    
     if (entry.partOfSpeech) {
         html += `<span class="part-of-speech">${entry.partOfSpeech}</span>`;
     }
+    
+    if (quickTranslation) {
+        html += `<span class="quick-translation">${quickTranslation}</span>`;
+        if (entry.translations[0].gender) {
+            html += `<span class="gender">${entry.translations[0].gender}</span>`;
+        }
+    }
+    
+    html += '<span class="expand-icon">▼</span>';
     html += '</div>';
     
-    // Translations
+    // Details (hidden by default)
+    html += '<div class="entry-details">';
+    
+    // All translations
     if (entry.translations && entry.translations.length > 0) {
-        html += '<div class="translations">';
+        html += '<div class="translations-section">';
         html += '<h4>Translations:</h4>';
         entry.translations.forEach(trans => {
             html += '<div class="translation-item">';
             html += `<span class="hal-term">${trans.term}</span>`;
-            if (trans.pronunciation) {
-                html += `<span class="pronunciation">[${trans.pronunciation}]</span>`;
+            
+            let details = [];
+            if (trans.pronunciation) details.push(`[${trans.pronunciation}]`);
+            if (trans.gender) details.push(trans.gender);
+            if (trans.plural) details.push(`pl. ${trans.plural}`);
+            
+            if (details.length > 0) {
+                html += `<span class="translation-details">${details.join(', ')}</span>`;
             }
-            if (trans.gender) {
-                html += `<span class="gender">${trans.gender}</span>`;
-            }
-            if (trans.plural) {
-                html += `<span class="plural">pl. ${trans.plural}</span>`;
-            }
+            
             if (trans.etymology) {
                 html += `<div class="etymology">${trans.etymology}</div>`;
             }
@@ -120,7 +140,7 @@ function createEntryHTML(entry) {
     
     // Examples
     if (entry.examples && entry.examples.length > 0) {
-        html += '<div class="examples">';
+        html += '<div class="examples-section">';
         html += '<h4>Examples:</h4>';
         entry.examples.forEach(ex => {
             html += '<div class="example-item">';
@@ -128,10 +148,10 @@ function createEntryHTML(entry) {
                 html += `<div class="example-hal">${ex.halunder}</div>`;
             }
             if (ex.german) {
-                html += `<div class="example-de">${ex.german}</div>`;
+                html += `<div class="example-de">"${ex.german}"</div>`;
             }
             if (ex.note) {
-                html += `<div class="example-note">${ex.note}</div>`;
+                html += `<div class="example-note">(${ex.note})</div>`;
             }
             html += '</div>';
         });
@@ -140,19 +160,53 @@ function createEntryHTML(entry) {
     
     // Relations
     if (entry.relations && entry.relations.length > 0) {
-        html += '<div class="relations">';
-        html += '<h4>Related:</h4>';
+        html += '<div class="relations-section">';
+        html += '<h4>See also:</h4>';
         entry.relations.forEach(rel => {
-            html += '<span class="relation-item">';
-            html += `<span class="relation-type">${rel.type}:</span>`;
-            html += rel.targetTerm;
-            html += '</span>';
+            html += '<div class="relation-item">';
+            html += `<span class="relation-type">${formatRelationType(rel.type)}:</span> `;
+            html += `<a class="relation-link" onclick="searchForTerm('${rel.targetTerm}', event)">${rel.targetTerm}</a>`;
+            html += '</div>';
         });
         html += '</div>';
     }
     
-    html += '</div>';
+    html += '</div>'; // entry-details
+    html += '</div>'; // entry
+    
     return html;
+}
+
+// Format relation type
+function formatRelationType(type) {
+    const typeMap = {
+        'see_also': 'See also',
+        'synonym': 'Synonym',
+        'antonym': 'Antonym',
+        'component_of': 'Part of',
+        'etymological_origin': 'Etymology'
+    };
+    return typeMap[type] || type.replace(/_/g, ' ');
+}
+
+// Toggle entry expansion
+function toggleEntry(index) {
+    const entries = document.querySelectorAll('.entry');
+    if (entries[index]) {
+        entries[index].classList.toggle('expanded');
+        const icon = entries[index].querySelector('.expand-icon');
+        if (icon) {
+            icon.textContent = entries[index].classList.contains('expanded') ? '▲' : '▼';
+        }
+    }
+}
+
+// Search for a specific term (from relations)
+async function searchForTerm(term, event) {
+    event.stopPropagation();
+    document.getElementById('searchInput').value = term;
+    document.getElementById('searchType').value = 'de';
+    await searchDictionary();
 }
 
 // Update pagination
@@ -203,7 +257,7 @@ function updateResultsInfo(total) {
     } else if (currentLetter) {
         infoDiv.textContent = `Showing ${total} entries starting with "${currentLetter}"`;
     } else {
-        infoDiv.textContent = '';
+        infoDiv.textContent = `Showing ${total} entries`;
     }
 }
 
