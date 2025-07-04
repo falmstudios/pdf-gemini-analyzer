@@ -60,30 +60,29 @@ async function runCorpusBuilder(textLimit) {
     addLog(`Starting corpus build process...`, 'info');
 
     try {
-        // --- NEW: TWO-STAGE RECOVERY & PROCESSING LOGIC ---
+        // --- TWO-STAGE RECOVERY & PROCESSING LOGIC ---
         addLog("Checking for any existing pending or stale jobs...", 'info');
         
-        // Reset any 'processing' jobs to 'pending' first.
         await sourceDbClient.from('source_sentences').update({ processing_status: 'pending' }).eq('processing_status', 'processing');
 
-        // Now, check if there are ANY pending sentences in the entire table.
-        const { data: existingPending, error: checkError } = await sourceDbClient
+        // --- FIX IS HERE: Get `count` directly from the response ---
+        const { count: existingPendingCount, error: checkError } = await sourceDbClient
             .from('source_sentences')
-            .select('id', { count: 'exact', head: true })
+            .select('*', { count: 'exact', head: true }) // Changed select to '*' for safety, though it's not strictly needed
             .eq('processing_status', 'pending');
 
         if (checkError) throw new Error(`Failed to check for pending jobs: ${checkError.message}`);
         
         let pendingSentences;
 
-        if (existingPending.count > 0) {
+        if (existingPendingCount > 0) {
             // --- RECOVERY MODE ---
-            addLog(`Found ${existingPending.count} existing pending sentences. Entering RECOVERY MODE. The text limit will be ignored.`, 'warning');
+            addLog(`Found ${existingPendingCount} existing pending sentences. Entering RECOVERY MODE. The text limit will be ignored.`, 'warning');
             const { data, error } = await sourceDbClient
                 .from('source_sentences')
                 .select('*')
                 .eq('processing_status', 'pending')
-                .order('text_id') // Order by text_id to preserve context
+                .order('text_id')
                 .order('sentence_number');
             if (error) throw new Error(`Failed to fetch pending sentences for recovery: ${error.message}`);
             pendingSentences = data;
@@ -92,7 +91,6 @@ async function runCorpusBuilder(textLimit) {
             // --- NORMAL MODE ---
             addLog("No existing pending jobs found. Starting new text extraction.", 'info');
             
-            // Pre-fetch all linguistic examples
             addLog('Pre-fetching all linguistic examples...', 'info');
             let allLinguisticExamples = [];
             let lingPage = 0;
@@ -108,7 +106,6 @@ async function runCorpusBuilder(textLimit) {
             }
             addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
 
-            // Extract from new texts
             addLog(`Fetching up to ${textLimit} new texts...`, 'info');
             const { data: texts, error: fetchError } = await sourceDbClient.from('texts').select('id, complete_helgolandic_text').or('review_status.eq.pending,review_status.eq.halunder_only').limit(textLimit);
             if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
@@ -155,7 +152,6 @@ async function runCorpusBuilder(textLimit) {
                 }
                 addLog('All new sentence pairs saved successfully.', 'success');
             }
-            // Fetch the newly inserted sentences to process them
             const { data: newPending, error: newPendingError } = await sourceDbClient.from('source_sentences').select('*').in('text_id', texts.map(t => t.id)).eq('processing_status', 'pending');
             if (newPendingError) throw new Error(`Could not fetch newly inserted sentences: ${newPendingError.message}`);
             pendingSentences = newPending;
@@ -172,7 +168,7 @@ async function runCorpusBuilder(textLimit) {
 
         // Re-fetch linguistic examples here if we were in recovery mode
         const allLinguisticExamples = await (async () => {
-            if (existingPending.count > 0) {
+            if (existingPendingCount > 0) {
                 addLog('Pre-fetching all linguistic examples for recovery run...', 'info');
                 let examples = [];
                 let page = 0;
@@ -190,9 +186,8 @@ async function runCorpusBuilder(textLimit) {
                 return examples;
             }
             // If not in recovery, this was already fetched. This line is just for variable scope.
-            // A more elegant solution might restructure this, but this is safe and clear.
             const { data } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term').limit(1);
-            return data ? allLinguisticExamples : []; // Return the already fetched list
+            return data ? (await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4)).data : [];
         })();
 
 
