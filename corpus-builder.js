@@ -1,16 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
-const axios = require('axios'); // Add axios for direct API calls
+const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 const dictionaryDbClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
-// Create an axios instance for API calls, similar to server.js
-const axiosInstance = axios.create({
-    timeout: 0 // No timeout
-});
+const axiosInstance = axios.create({ timeout: 0 });
 
 // === STATE MANAGEMENT ===
 let processingState = {
@@ -29,39 +26,30 @@ function addLog(message, type = 'info') {
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === NEW HELPER FUNCTION FOR GEMINI 2.5 PRO API CALL ===
+// === HELPER FUNCTION TO COUNT WORDS ===
+function countWords(str) {
+    if (!str) return 0;
+    return str.trim().split(/\s+/).length;
+}
+
 async function callGemini_2_5_Pro(prompt) {
     const apiKey = process.env.GEMINI_API_KEY;
     const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
-
     try {
         const response = await axiosInstance.post(
             apiUrl,
             {
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: {
-                    temperature: 0.9,
-                    maxOutputTokens: 20000,
-                    // Note: The direct REST API does not support the 'responseMimeType' parameter.
-                    // We rely on the prompt to ensure JSON output and clean it manually.
-                }
+                generationConfig: { temperature: 0.9, maxOutputTokens: 20000 }
             },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': apiKey
-                }
-            }
+            { headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey } }
         );
-
         if (response.data && response.data.candidates && response.data.candidates[0]) {
             const responseText = response.data.candidates[0].content.parts[0].text;
-            // Clean the response to ensure it's valid JSON before parsing
             const cleanedText = responseText.replace(/^```json\s*|```$/g, '').trim();
             return JSON.parse(cleanedText);
         }
         throw new Error('Invalid response format from Gemini 2.5 Pro API');
-
     } catch (error) {
         if (error.response) {
             console.error("Gemini API Error Response:", error.response.data);
@@ -70,7 +58,6 @@ async function callGemini_2_5_Pro(prompt) {
         throw error;
     }
 }
-
 
 // === THE MAIN PROCESSING FUNCTION ===
 async function runCorpusBuilder(textLimit) {
@@ -97,28 +84,52 @@ async function runCorpusBuilder(textLimit) {
         addLog(`Found ${texts.length} texts to process.`, 'success');
         processingState.status = 'Extracting and segmenting sentences...';
         
-        const allSentences = [];
+        const allSentencesToInsert = [];
         for (const text of texts) {
-            const sentences = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+|[^.?!]+$/g) || [];
-            sentences.forEach((s, index) => {
-                const trimmedSentence = s.trim();
-                if (trimmedSentence) {
-                    allSentences.push({
-                        text_id: text.id,
-                        sentence_number: index + 1,
-                        halunder_sentence: trimmedSentence
-                    });
+            const initialSegments = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+/g) || [];
+            const finalSentences = [];
+            let sentenceBuffer = [];
+
+            for (const segment of initialSegments) {
+                sentenceBuffer.push(segment.trim());
+                const currentBufferString = sentenceBuffer.join(' ');
+                
+                if (countWords(currentBufferString) >= 5) {
+                    finalSentences.push(currentBufferString);
+                    sentenceBuffer = [];
                 }
+            }
+
+            if (sentenceBuffer.length > 0) {
+                const leftoverString = sentenceBuffer.join(' ');
+                if (finalSentences.length > 0) {
+                    finalSentences[finalSentences.length - 1] += ' ' + leftoverString;
+                } else {
+                    finalSentences.push(leftoverString);
+                }
+            }
+
+            finalSentences.forEach((s, index) => {
+                allSentencesToInsert.push({
+                    text_id: text.id,
+                    sentence_number: index + 1,
+                    halunder_sentence: s
+                });
             });
+
             await sourceDbClient.from('texts').update({ review_status: 'processing_halunder_only' }).eq('id', text.id);
         }
 
-        addLog(`Extracted a total of ${allSentences.length} sentences. Inserting into source database...`, 'info');
-        const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentences);
-        if (insertError) throw new Error(`Failed to insert sentences: ${insertError.message}`);
-        addLog('All sentences saved successfully.', 'success');
+        if (allSentencesToInsert.length === 0) {
+             addLog('No valid sentences (>= 5 words) found in the fetched texts.', 'warning');
+        } else {
+            addLog(`Extracted a total of ${allSentencesToInsert.length} valid sentences. Inserting into source database...`, 'info');
+            const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentencesToInsert);
+            if (insertError) throw new Error(`Failed to insert sentences: ${insertError.message}`);
+            addLog('All sentences saved successfully.', 'success');
+        }
         
-        // --- STAGE 2: PROCESS SENTENCES WITH AI (IN PARALLEL BATCHES) ---
+        // --- STAGE 2: PROCESS SENTENCES WITH AI ---
         processingState.status = 'Processing sentences with AI...';
         let processedCount = 0;
         
@@ -131,6 +142,9 @@ async function runCorpusBuilder(textLimit) {
         if (pendingError) throw new Error(`Could not fetch pending sentences: ${pendingError.message}`);
         
         const totalToProcess = pendingSentences.length;
+        if (totalToProcess === 0) {
+             addLog('No new sentences to process with AI.', 'info');
+        }
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
@@ -147,7 +161,7 @@ async function runCorpusBuilder(textLimit) {
 
             processedCount += chunk.length;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentences.`;
-            processingState.progress = processedCount / totalToProcess;
+            processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
@@ -198,7 +212,7 @@ async function processSingleSentence(sentence) {
         .order('sentence_number')
         .range(fromIndex, toIndex);
 
-    // 4. Construct and Call Gemini using the new helper function
+    // 4. Construct and Call Gemini
     const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData);
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
@@ -229,7 +243,10 @@ async function processSingleSentence(sentence) {
     if (corpusInsertError) throw new Error(`Failed to save to corpus: ${corpusInsertError.message}`);
 
     await sourceDbClient.from('source_sentences').update({ processing_status: 'completed' }).eq('id', sentence.id);
-    addLog(`Successfully processed sentence ID: ${sentence.id}`, 'success');
+    
+    // --- IMPROVED LOGGING IS HERE ---
+    const logMessage = `[HAL] ${sentence.halunder_sentence} -> [DE] ${geminiResult.best_translation}`;
+    addLog(logMessage, 'success');
 }
 
 // === HELPER TO BUILD THE PROMPT ===
