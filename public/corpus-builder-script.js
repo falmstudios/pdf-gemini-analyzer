@@ -13,6 +13,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (startBtn.disabled) return;
 
         const limit = textLimitInput.value;
+        // --- NEW: Get the selected model's value ---
+        const selectedModel = document.querySelector('input[name="gemini-model"]:checked').value;
+        
         startBtn.disabled = true;
         startBtn.textContent = 'Processing...';
 
@@ -20,12 +23,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/corpus/start-processing', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ limit })
+                // --- NEW: Send the selected model to the backend ---
+                body: JSON.stringify({ limit, model: selectedModel })
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error);
             
-            progressInterval = setInterval(updateProgress, 1000); // Poll every second
+            progressInterval = setInterval(updateProgress, 1000);
         } catch (error) {
             alert(`Error starting process: ${error.message}`);
             resetUI();
@@ -64,7 +68,7 @@ document.addEventListener('DOMContentLoaded', () => {
         logContainer.innerHTML = logs.map(log => 
             `<div class="log-entry ${log.type}">${new Date(log.timestamp).toLocaleTimeString()} - ${log.message}</div>`
         ).join('');
-        logContainer.scrollTop = logContainer.scrollHeight; // Auto-scroll to bottom
+        logContainer.scrollTop = logContainer.scrollHeight;
     }
 
     function resetUI() {
@@ -72,6 +76,5 @@ document.addEventListener('DOMContentLoaded', () => {
         startBtn.textContent = 'Start Batch';
     }
     
-    // Initial check in case a process was already running
     updateProgress();
 });
