@@ -2,11 +2,10 @@ const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 
-// --- FIX IS HERE ---
-// Use the SAME environment variables as the rest of your app.
+// Use the correct, unified environment variables
 const supabase = createClient(
-    process.env.SUPABASE_URL, // Changed from SOURCE_SUPABASE_URL
-    process.env.SUPABASE_ANON_KEY  // Changed from SOURCE_SUPABASE_ANON_KEY
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
 );
 
 // The main route that does all the work
@@ -19,12 +18,18 @@ router.post('/analyze-and-translate', async (req, res) => {
 
     try {
         // --- 1. WORD-BY-WORD ANALYSIS ---
-        const words = [...new Set(sentence.toLowerCase().match(/\b(\w+)\b/g) || [])];
+
+        // --- FIX IS HERE ---
+        // The old regex was: .match(/\b(\w+)\b/g)
+        // The new regex uses \p{L} to match any Unicode letter. The 'u' flag is required.
+        const words = [...new Set(sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
+        // --- END OF FIX ---
+
         let wordAnalysis = [];
 
         if (words.length > 0) {
             
-            // This query is correct and will now work because it's pointed at the right database.
+            // This query is correct and will now work with the correctly parsed words.
             const dictionaryPromise = supabase
                 .from('terms')
                 .select(`
