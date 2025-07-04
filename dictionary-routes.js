@@ -60,7 +60,7 @@ async function findTargetConceptId(dirtyTerm) {
 
     const attemptMatch = async (term) => {
         if (!term) return null;
-        const { data } = await supabase.from('concepts').select('id').eq('primary_german_label', term).single();
+        const { data } = await supabase.from('concepts').select('id').eq('primary_german_label', term).limit(1).single();
         return data ? data.id : null;
     };
 
@@ -179,6 +179,7 @@ async function processAhrhammarData() {
         state.progress = 0.05;
         const globalResults = { totalProcessed: 0, conceptsCreated: 0, termsCreated: 0, examplesCreated: 0, relationsCreated: 0, citationsCreated: 0, errors: 0 };
 
+        // Pass 1: Concepts & Terms
         addLog('ahrhammar', 'First pass: Creating concepts and terms', 'info');
         for (let i = 0; i < pdfAnalyses.length; i++) {
             const analysis = pdfAnalyses[i];
@@ -201,6 +202,7 @@ async function processAhrhammarData() {
             }
         }
 
+        // Pass 2: Relations
         addLog('ahrhammar', 'Second pass: Creating relations', 'info');
         for (let i = 0; i < pdfAnalyses.length; i++) {
             const analysis = pdfAnalyses[i];
@@ -239,6 +241,9 @@ async function processAhrhammarData() {
 
 async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResults) {
     globalResults.totalProcessed++;
+    if (!entry.senseId) {
+        throw new Error(`Entry for "${entry.headword}" is missing required 'senseId'.`);
+    }
     const conceptPayload = {
         primary_german_label: entry.headword,
         part_of_speech: entry.partOfSpeech,
@@ -247,8 +252,10 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
         sense_id: entry.senseId,
         sense_number: entry.senseNumber
     };
-    const { data: concept } = await supabase.from('concepts').upsert(conceptPayload, { onConflict: 'primary_german_label,sense_id' }).select('id').single();
-    if (!concept) throw new Error(`Could not upsert concept for ${entry.headword}`);
+    const { data: concept, error } = await supabase.from('concepts').upsert(conceptPayload, { onConflict: 'sense_id' }).select('id').single();
+    if (error || !concept) {
+        throw new Error(`Could not upsert concept for ${entry.headword} (sense: ${entry.senseId}). DB Error: ${error?.message}`);
+    }
     globalResults.conceptsCreated++;
     
     await supabase.from('terms').upsert({ term_text: entry.headword, language: 'de' }, { onConflict: 'term_text,language' });
@@ -269,7 +276,7 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
         perFileResults.examples++;
     }
     if (entry.sourceCitations) for (const citation of entry.sourceCitations) {
-        await supabase.from('source_citations').insert({ concept_id: concept.id, citation_text: citation });
+        await supabase.from('source_citations').upsert({ concept_id: concept.id, citation_text: citation }, { onConflict: 'concept_id,citation_text' });
         globalResults.citationsCreated++;
         perFileResults.citations++;
     }
@@ -277,7 +284,7 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
 
 async function processAhrhammarRelations(entry, results, perFileResults) {
     if (!entry.relations || entry.relations.length === 0) return;
-    const { data: sourceConcept } = await supabase.from('concepts').select('id').eq('primary_german_label', entry.headword).single();
+    const { data: sourceConcept } = await supabase.from('concepts').select('id').eq('sense_id', entry.senseId).single();
     if (!sourceConcept) return;
     for (const relation of entry.relations) {
         const targetConceptId = await findTargetConceptId(relation.targetTerm);
@@ -404,9 +411,7 @@ async function processKrogmannEntryPass1(entry, globalResults, perFileResults) {
     return relationsForLater;
 }
 
-
 async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileResults, sourceName) {
-    // 1. Enrich the concept's main notes (if it's an existing concept from another source)
     if (!concept.krogmann_info && !concept.krogmann_idioms) { 
         const updatePayload = {};
         if (entry.additionalInfo) updatePayload.krogmann_info = entry.additionalInfo;
@@ -420,7 +425,6 @@ async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileR
         }
     }
 
-    // 2. Add or update the Halunder term and its link
     const { data: halunderTerm } = await supabase.from('terms').upsert({ term_text: entry.halunderWord, language: 'hal' }, { onConflict: 'term_text,language' }).select('id').single();
     if (halunderTerm) {
         globalResults.termsCreated++;
@@ -436,14 +440,13 @@ async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileR
         }, { onConflict: 'concept_id,term_id,source_name' });
     }
 
-    // 3. Add examples
     if (entry.examples) for (const example of entry.examples) {
         await supabase.from('examples').insert({ concept_id: concept.id, halunder_sentence: example.halunder, german_sentence: example.german, note: example.note, source_name: sourceName });
         globalResults.examplesCreated++;
         perFileResults.examples++;
     }
     
-    // 4. Defer relation processing
+    // Defer relation processing
     const relationsForLater = [];
     if (entry.relatedWords) {
         for (const relatedWord of entry.relatedWords) {
