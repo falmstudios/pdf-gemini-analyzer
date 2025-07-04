@@ -7,10 +7,8 @@ let expandedEntryId = null;
 // Search functionality
 async function searchDictionary() {
     const searchTerm = document.getElementById('searchInput').value.trim();
-    const searchLang = document.querySelector('input[name="searchLang"]:checked').value;
-    
     if (!searchTerm) {
-        loadRecentEntries();
+        clearSearch();
         return;
     }
     
@@ -29,7 +27,8 @@ function clearSearch() {
     currentLetter = '';
     currentPage = 1;
     expandedEntryId = null;
-    loadRecentEntries();
+    document.querySelectorAll('.alphabet-bar button.active').forEach(b => b.classList.remove('active'));
+    loadEntries();
 }
 
 // Browse by letter
@@ -40,33 +39,33 @@ async function browseByLetter(letter) {
     expandedEntryId = null;
     document.getElementById('searchInput').value = '';
     
-    // Update active letter button
-    document.querySelectorAll('.alphabet-nav button').forEach(btn => {
-        btn.classList.remove('active');
-        if (btn.textContent === letter) {
-            btn.classList.add('active');
-        }
+    document.querySelectorAll('.alphabet-bar button').forEach(btn => {
+        btn.classList.toggle('active', btn.textContent === letter);
     });
     
     await loadEntries();
 }
 
-// Load entries
+// Load entries from the server
 async function loadEntries() {
     const entriesDiv = document.getElementById('dictionaryEntries');
     entriesDiv.innerHTML = '<div class="loading">Loading...</div>';
     
     try {
-        let url = '/dictionary/search?page=' + currentPage;
+        let url = `/dictionary/search?page=${currentPage}`;
         
         if (currentSearchTerm) {
-            const searchLang = document.querySelector('input[name="searchLang"]:checked').value;
-            url += '&term=' + encodeURIComponent(currentSearchTerm) + '&lang=' + searchLang;
+            const searchLang = document.getElementById('searchType').value;
+            url += `&term=${encodeURIComponent(currentSearchTerm)}&lang=${searchLang}`;
         } else if (currentLetter) {
-            url += '&letter=' + currentLetter;
+            url += `&letter=${currentLetter}`;
         }
         
         const response = await fetch(url);
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.error || 'Server error');
+        }
         const data = await response.json();
         
         displayEntries(data.entries);
@@ -74,125 +73,116 @@ async function loadEntries() {
         updateResultsInfo(data.totalEntries);
         
     } catch (error) {
-        entriesDiv.innerHTML = '<div class="no-results">Error loading entries: ' + error.message + '</div>';
+        entriesDiv.innerHTML = `<div class="no-results">Error loading entries: ${error.message}</div>`;
     }
 }
 
-// Display entries
+// Render the entries on the page
 function displayEntries(entries) {
     const entriesDiv = document.getElementById('dictionaryEntries');
-    
     if (!entries || entries.length === 0) {
         entriesDiv.innerHTML = '<div class="no-results">No entries found.</div>';
         return;
     }
-    
     entriesDiv.innerHTML = entries.map(entry => createEntryHTML(entry)).join('');
 }
 
-// Create HTML for a single entry
+// Create HTML for a single dictionary entry
 function createEntryHTML(entry) {
     const isExpanded = expandedEntryId === entry.id;
-    const translationPreview = entry.translations
-        .slice(0, 3)
-        .map(t => t.term)
-        .join(', ') + (entry.translations.length > 3 ? '...' : '');
-    
-    let html = `<div class="entry ${isExpanded ? 'expanded' : ''}" onclick="toggleEntry('${entry.id}')" data-entry-id="${entry.id}">`;
-    
-    // Header (always visible)
-    html += '<div class="entry-header">';
-    html += `<span class="headword">${entry.headword}`;
-    if (entry.homonymNumber) {
-        html += `<sup>${entry.homonymNumber}</sup>`;
-    }
-    html += '</span>';
-    if (entry.partOfSpeech) {
-        html += `<span class="part-of-speech">${entry.partOfSpeech}</span>`;
-    }
-    if (entry.usageNotes) {
-        html += `<span class="usage-notes">(${entry.usageNotes})</span>`;
-    }
-    html += '</div>';
-    
-    // Translation preview (only when collapsed)
-    if (!isExpanded && translationPreview) {
-        html += `<div class="translation-preview">${translationPreview}</div>`;
-    }
-    
-    // Detailed content (only when expanded)
-    html += '<div class="entry-details">';
-    
-    // Translations with all details
-    if (entry.translations && entry.translations.length > 0) {
-        html += '<div class="translations">';
-        html += '<h4>Halunder translations:</h4>';
-        entry.translations.forEach(trans => {
-            html += '<div class="translation-item">';
-            html += `<span class="hal-term">${trans.term}</span>`;
-            if (trans.pronunciation) {
-                html += `<span class="pronunciation">[${trans.pronunciation}]</span>`;
-            }
-            if (trans.gender) {
-                html += `<span class="gender ${trans.gender}">${trans.gender}</span>`;
-            }
-            if (trans.plural) {
-                html += `<span class="plural">pl. ${trans.plural}</span>`;
-            }
-            if (trans.note) {
-                html += `<span class="translation-note">${trans.note}</span>`;
-            }
-            if (trans.etymology) {
-                html += `<div class="etymology">Etymology: ${trans.etymology}</div>`;
-            }
-            html += '</div>';
-        });
-        html += '</div>';
-    }
-    
-    // Examples
-    if (entry.examples && entry.examples.length > 0) {
-        html += '<div class="examples">';
-        html += '<h4>Examples:</h4>';
-        entry.examples.forEach(ex => {
-            html += '<div class="example-item">';
-            if (ex.halunder) {
-                html += `<div class="example-hal">${ex.halunder}</div>`;
-            }
-            if (ex.german) {
-                html += `<div class="example-de">"${ex.german}"</div>`;
-            }
-            if (ex.note) {
-                html += `<div class="example-note">${ex.note}</div>`;
-            }
-            html += '</div>';
-        });
-        html += '</div>';
-    }
-    
-    // Relations
-    if (entry.relations && entry.relations.length > 0) {
-        html += '<div class="relations">';
-        html += '<h4>See also:</h4>';
-        entry.relations.forEach(rel => {
-            html += '<span class="relation-item">';
-            html += `<span class="relation-type">${rel.type}:</span>`;
-            if (rel.targetId) {
-                html += `<a href="#" class="relation-link" onclick="searchForConcept('${rel.targetId}', '${rel.targetTerm}'); event.stopPropagation();">${rel.targetTerm}</a>`;
-            } else {
-                html += rel.targetTerm;
-            }
-            if (rel.note) {
-                html += ` (${rel.note})`;
-            }
-            html += '</span>';
-        });
-        html += '</div>';
-    }
-    
-    html += '</div>'; // entry-details
-    html += '</div>'; // entry
-    return html;
+    const translationPreview = entry.translations.slice(0, 3).map(t => t.term).join(', ') + (entry.translations.length > 3 ? '...' : '');
+
+    const formatNotes = (notes) => notes ? notes.replace(/\n/g, '<br>').replace(/---/g, '<hr class="note-separator">') : '';
+
+    return `
+        <div class="entry ${isExpanded ? 'expanded' : ''}" data-entry-id="${entry.id}">
+            <div class="entry-header" onclick="toggleEntry('${entry.id}')">
+                <span class="headword">${entry.headword}</span>
+                ${entry.partOfSpeech ? `<span class="part-of-speech">${entry.partOfSpeech}</span>` : ''}
+                ${entry.senseNumber ? `<span class="sense-number">Sense ${entry.senseNumber}</span>` : ''}
+            </div>
+            
+            ${!isExpanded && translationPreview ? `<div class="translation-preview" onclick="toggleEntry('${entry.id}')">${translationPreview}</div>` : ''}
+            
+            <div class="entry-details">
+                ${entry.germanDefinition ? `<div class="detail-section"><h4>Definition</h4><p>${entry.germanDefinition}</p></div>` : ''}
+                ${entry.ahrhammarNotes ? `<div class="detail-section"><h4>Usage Notes (Ahrhammar)</h4><p>${formatNotes(entry.ahrhammarNotes)}</p></div>` : ''}
+                ${entry.krogmannInfo ? `<div class="detail-section"><h4>Additional Info (Krogmann)</h4><p>${formatNotes(entry.krogmannInfo)}</p></div>` : ''}
+                ${entry.krogmannIdioms ? `<div class="detail-section"><h4>Idioms (Krogmann)</h4><p>${formatNotes(entry.krogmannIdioms)}</p></div>` : ''}
+
+                ${createTranslationsHTML(entry.translations)}
+                ${createExamplesHTML(entry.examples)}
+                ${createRelationsHTML(entry.relations)}
+                ${createCitationsHTML(entry.citations)}
+            </div>
+        </div>
+    `;
+}
+
+function createTranslationsHTML(translations) {
+    if (!translations || translations.length === 0) return '';
+    return `
+        <div class="detail-section">
+            <h4>Halunder Translations</h4>
+            ${translations.map(trans => `
+                <div class="translation-item">
+                    <span class="hal-term">${trans.term}</span>
+                    ${trans.pronunciation ? `<span class="pronunciation">[${trans.pronunciation}]</span>` : ''}
+                    ${trans.gender ? `<span class="gender ${trans.gender}">${trans.gender}</span>` : ''}
+                    ${trans.plural ? `<span class="plural">pl. ${trans.plural}</span>` : ''}
+                    ${trans.note ? `<div class="translation-note">${trans.note}</div>` : ''}
+                    ${trans.etymology ? `<div class="etymology">Etymology: ${trans.etymology}</div>` : ''}
+                    ${trans.alternativeForms && trans.alternativeForms.length > 0 ? `<div class="alternative-forms">Alt: ${trans.alternativeForms.join(', ')}</div>` : ''}
+                    ${trans.sources ? `<div class="sources">Sources: ${trans.sources.join(', ')}</div>` : ''}
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function createExamplesHTML(examples) {
+    if (!examples || examples.length === 0) return '';
+    return `
+        <div class="detail-section">
+            <h4>Examples</h4>
+            ${examples.map(ex => `
+                <div class="example-item">
+                    ${ex.type ? `<span class="example-type">${ex.type}</span>` : ''}
+                    ${ex.halunder ? `<div class="example-hal">${ex.halunder}</div>` : ''}
+                    ${ex.german ? `<div class="example-de">"${ex.german}"</div>` : ''}
+                    ${ex.note ? `<div class="example-note">(${ex.note})</div>` : ''}
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function createRelationsHTML(relations) {
+    if (!relations || relations.length === 0) return '';
+    return `
+        <div class="detail-section relations">
+            <h4>See also</h4>
+            ${relations.map(rel => `
+                <span class="relation-item">
+                    <span class="relation-type">${rel.type}:</span>
+                    <a href="#" class="relation-link" onclick="searchForConcept(event, '${rel.targetId}', '${rel.targetTerm}')">${rel.targetTerm}</a>
+                    ${rel.note ? `<span>(${rel.note})</span>` : ''}
+                </span>
+            `).join('')}
+        </div>
+    `;
+}
+
+function createCitationsHTML(citations) {
+    if (!citations || citations.length === 0) return '';
+    return `
+        <div class="detail-section citations">
+            <h4>Source Citations</h4>
+            <ul>
+                ${citations.map(cit => `<li>${cit}</li>`).join('')}
+            </ul>
+        </div>
+    `;
 }
 
 // Toggle entry expansion
@@ -203,37 +193,29 @@ function toggleEntry(entryId) {
         expandedEntryId = entryId;
     }
     
-    // Re-render to show/hide details
-    const entries = document.querySelectorAll('.entry');
-    entries.forEach(entry => {
-        if (entry.dataset.entryId === entryId) {
-            entry.classList.toggle('expanded');
-        } else {
-            entry.classList.remove('expanded');
-        }
+    document.querySelectorAll('.entry').forEach(entryEl => {
+        entryEl.classList.toggle('expanded', entryEl.dataset.entryId === expandedEntryId);
     });
 }
 
 // Search for a specific concept (for relations)
-async function searchForConcept(conceptId, term) {
-    currentSearchTerm = term;
-    currentLetter = '';
-    currentPage = 1;
-    expandedEntryId = conceptId;
+async function searchForConcept(event, conceptId, term) {
+    event.stopPropagation();
     document.getElementById('searchInput').value = term;
-    
     await searchDictionary();
     
-    // Auto-expand the target entry
     setTimeout(() => {
         const targetEntry = document.querySelector(`[data-entry-id="${conceptId}"]`);
-        if (targetEntry && !targetEntry.classList.contains('expanded')) {
-            toggleEntry(conceptId);
+        if (targetEntry) {
+            if (!targetEntry.classList.contains('expanded')) {
+                toggleEntry(conceptId);
+            }
+            targetEntry.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
-    }, 100);
+    }, 200);
 }
 
-// Update pagination
+// Update pagination controls
 function updatePagination(total, current) {
     totalPages = total;
     currentPage = current;
@@ -245,11 +227,8 @@ function updatePagination(total, current) {
     }
     
     let html = '';
-    
-    // Previous button
     html += `<button onclick="goToPage(${current - 1})" ${current === 1 ? 'disabled' : ''}>Previous</button>`;
     
-    // Page numbers
     let startPage = Math.max(1, current - 2);
     let endPage = Math.min(total, current + 2);
     
@@ -267,25 +246,24 @@ function updatePagination(total, current) {
         html += `<button onclick="goToPage(${total})">${total}</button>`;
     }
     
-    // Next button
     html += `<button onclick="goToPage(${current + 1})" ${current === total ? 'disabled' : ''}>Next</button>`;
     
     paginationDiv.innerHTML = html;
 }
 
-// Update results info
+// Update the informational text about search results
 function updateResultsInfo(total) {
     const infoDiv = document.getElementById('resultsInfo');
     if (currentSearchTerm) {
-        infoDiv.textContent = `Found ${total} entries for "${currentSearchTerm}"`;
+        infoDiv.textContent = `Found ${total.toLocaleString()} entries for "${currentSearchTerm}"`;
     } else if (currentLetter) {
-        infoDiv.textContent = `Showing ${total} entries starting with "${currentLetter}"`;
+        infoDiv.textContent = `Showing ${total.toLocaleString()} entries starting with "${currentLetter}"`;
     } else {
-        infoDiv.textContent = `Showing ${total} entries`;
+        infoDiv.textContent = `Showing the most recent entries`;
     }
 }
 
-// Go to page
+// Go to a specific page of results
 async function goToPage(page) {
     if (page < 1 || page > totalPages) return;
     currentPage = page;
@@ -294,16 +272,10 @@ async function goToPage(page) {
     window.scrollTo(0, 0);
 }
 
-// Load recent entries on page load
-async function loadRecentEntries() {
-    await loadEntries();
-}
-
-// Initialize
+// Initialize the page on load
 window.onload = function() {
-    loadRecentEntries();
+    loadEntries();
     
-    // Add enter key handler for search
     document.getElementById('searchInput').addEventListener('keypress', function(e) {
         if (e.key === 'Enter') {
             searchDictionary();
