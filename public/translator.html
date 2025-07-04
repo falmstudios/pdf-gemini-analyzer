@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Halunder Sentence Analyzer</title>
+    <link rel="stylesheet" href="dictionary-styles.css"> <!-- Reusing builder styles -->
+    <style>
+        .analysis-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; margin-top: 20px;}
+        .word-card { background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 5px; padding: 15px; }
+        .word-card .halunder { font-size: 1.2em; font-weight: bold; color: #27ae60; }
+        .word-card .german { color: #2980b9; }
+        .word-card .feature { margin-top: 10px; padding-top: 10px; border-top: 1px dashed #ccc; font-size: 0.9em; color: #666; }
+        .feature .type { font-weight: bold; text-transform: capitalize; }
+        #api-translation-results h3 { margin-bottom: 10px; }
+        #api-translation-results pre { background-color: #eee; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
+        #status { margin-top: 15px; font-style: italic; color: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Halunder Sentence Analyzer</h1>
+            <a href="/" class="back-link">← Back to Home</a>
+        </div>
+
+        <div class="main-content">
+            <div class="info-panel">
+                <h2>Analyze & Translate</h2>
+                <p>Enter a Halunder sentence. The tool will break it down word-by-word using the dictionary and linguistic features, then send the full sentence for a machine translation.</p>
+                <textarea id="halunder-sentence" rows="4" placeholder="Enter Halunder sentence here..." style="width: 100%; font-size: 16px; padding: 10px; margin-top: 10px;"></textarea>
+                <button id="translate-btn" class="primary-btn" style="margin-top: 10px;">Analyze and Translate</button>
+                <div id="status"></div>
+            </div>
+
+            <div id="word-analysis-results" style="display: none;">
+                <h2>Word-by-Word Analysis</h2>
+                <div id="analysis-grid" class="analysis-grid"></div>
+            </div>
+
+            <div id="api-translation-results" style="display: none;">
+                <h2>API Translation</h2>
+                <pre id="translation-output"></pre>
+            </div>
+
+        </div>
+    </div>
+    <script src="translator-script.js"></script>
+</body>
+</html>
