@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch'); // Use node-fetch for server-side fetch
 
 // Use the same Supabase client as your other routes
 const supabase = createClient(
