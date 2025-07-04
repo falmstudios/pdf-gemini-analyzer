@@ -11,14 +11,12 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Add this near the top with other requires
-const dictionaryRoutes = require('./dictionary-routes');
-
-// Add this near the top with other requires
-const linguisticRoutes = require('./linguistic-routes');
-
-// Add this line
-const translatorRoutes = require('./translator-routes');
+// === ROUTE REQUIRES ===
+const dictionaryRoutes = require('./dictionary-routes.js');
+const linguisticRoutes = require('./linguistic-routes.js');
+const translatorRoutes = require('./translator-routes.js');
+// Add this for the new Corpus Builder feature
+const corpusBuilderRoutes = require('./corpus-builder.js');
 
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
@@ -27,15 +25,10 @@ const axiosInstance = axios.create({
   maxBodyLength: Infinity
 });
 
-// Add route for dictionary viewer
-app.get('/dictionary-viewer', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'dictionary-viewer.html'));
-});
-
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Initialize Supabase (only if credentials are provided)
+// Initialize Supabase (for the dictionary database)
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
   supabase = createClient(
@@ -44,54 +37,54 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
   );
 }
 
-// Middleware
+// === MIDDLEWARE ===
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
-// Add this after your existing routes
+// === API ROUTES ===
 app.use('/linguistic', linguisticRoutes);
-
-// Add this after your existing routes
 app.use('/dictionary', dictionaryRoutes);
-
-// Add this line
 app.use('/translator', translatorRoutes);
+// Add this for the new Corpus Builder feature
+app.use('/corpus', corpusBuilderRoutes);
 
-
-// Add route for homepage
+// === PAGE SERVING ROUTES ===
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index-home.html'));
 });
-
-// Add route for PDF analyzer (update existing route)
+app.get('/dictionary-viewer', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dictionary-viewer.html'));
+});
 app.get('/pdf-analyzer', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
-
-// Add route for dictionary builder
 app.get('/dictionary-builder', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'dictionary.html'));
 });
-
-// Add this route to serve the linguistic cleaner page
 app.get('/linguistic-cleaner', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'linguistic.html'));
+});
+// Add this route to serve the Corpus Builder page
+app.get('/corpus-builder', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'corpus-builder.html'));
 });
 
 // Health check route
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     message: 'Server is running',
     port: PORT,
     timestamp: new Date().toISOString()
   });
 });
 
+// === PDF ANALYSIS LOGIC (UNCHANGED) ===
+
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
-const upload = multer({ 
+const upload = multer({
   storage: storage,
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit per file
 });
@@ -212,22 +205,13 @@ AUFGABE:
 Analysiere nun den folgenden Wörterbuchtext penibel genau und extrahiere ALLE Einträge gemäß den oben definierten, detaillierten Regeln und Heuristiken. Achte besonders auf die sense-zentrische Zerlegung, die korrekte Interpretation impliziter Informationen und die vollständige Normalisierung aller Begriffe. Gib deine Ausgabe als eine einzelne JSON-Liste von Objekten aus, ohne irgendwelche zusätzlichen Sätze und Einleitungen wie "Hier ist die JSON", etc.`
 };
 
-// Routes
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Upload PDFs - allow up to 100 files
 app.post('/upload', upload.array('pdfs', 100), async (req, res) => {
   try {
     const files = req.files;
-    
     if (!files || files.length === 0) {
       return res.status(400).json({ error: 'No files uploaded' });
     }
-    
     const uploadedFiles = [];
-    
     for (let file of files) {
       const id = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
       const fileData = {
@@ -240,23 +224,18 @@ app.post('/upload', upload.array('pdfs', 100), async (req, res) => {
         processedAt: null,
         retryCount: 0
       };
-      
       processingQueue.set(id, fileData);
       uploadedFiles.push({ id, filename: file.originalname });
     }
-    
     addLog(`${files.length} files added to queue. Total in queue: ${processingQueue.size}`, 'info');
-    
-    // Start processing if not already running
     if (!currentlyProcessing) {
       processNextInQueue();
     }
-    
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `${files.length} files uploaded and queued`,
       files: uploadedFiles,
-      queueLength: processingQueue.size 
+      queueLength: processingQueue.size
     });
   } catch (error) {
     console.error('Upload error:', error);
@@ -264,7 +243,6 @@ app.post('/upload', upload.array('pdfs', 100), async (req, res) => {
   }
 });
 
-// Get status (queue and logs combined)
 app.get('/status', (req, res) => {
   const queueArray = Array.from(processingQueue.values()).map(item => ({
     id: item.id,
@@ -273,7 +251,6 @@ app.get('/status', (req, res) => {
     error: item.error,
     hasResult: !!item.result
   }));
-  
   res.json({
     queue: queueArray,
     logs: globalLogs,
@@ -285,7 +262,6 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Update LLM settings
 app.post('/settings', (req, res) => {
   try {
     llmSettings = { ...llmSettings, ...req.body };
@@ -295,45 +271,27 @@ app.post('/settings', (req, res) => {
   }
 });
 
-// Get current settings
 app.get('/settings', (req, res) => {
   res.json(llmSettings);
 });
 
-// Download result
 app.get('/download/:id', (req, res) => {
   const item = processingQueue.get(req.params.id);
-  
-  if (!item) {
-    return res.status(404).json({ error: 'File not found' });
-  }
-  
-  if (!item.result) {
-    return res.status(404).json({ error: 'Result not available yet' });
-  }
-  
-  // Clean up the result if it's a JSON string
+  if (!item) return res.status(404).json({ error: 'File not found' });
+  if (!item.result) return res.status(404).json({ error: 'Result not available yet' });
   let cleanedResult = item.result;
-  
-  // If the result starts with ```json and ends with ```, extract the JSON
   if (cleanedResult.startsWith('```json') && cleanedResult.endsWith('```')) {
     cleanedResult = cleanedResult.slice(7, -3).trim();
   }
-  
-  // Try to parse and format JSON
   try {
     const parsedResult = JSON.parse(cleanedResult);
     cleanedResult = JSON.stringify(parsedResult, null, 2);
-  } catch (e) {
-    // If not valid JSON, keep as is
-  }
-  
+  } catch (e) {}
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="${item.filename}_analysis.json"`);
   res.send(cleanedResult);
 });
 
-// Clear completed items
 app.post('/clear-completed', (req, res) => {
   let cleared = 0;
   for (let [id, item] of processingQueue) {
@@ -345,13 +303,11 @@ app.post('/clear-completed', (req, res) => {
   res.json({ success: true, cleared });
 });
 
-// Clear logs
 app.post('/clear-logs', (req, res) => {
   globalLogs = [];
   res.json({ success: true });
 });
 
-// Add log entry
 function addLog(message, type = 'info', filename = null) {
   const logEntry = {
     timestamp: new Date().toISOString(),
@@ -361,20 +317,16 @@ function addLog(message, type = 'info', filename = null) {
     id: Date.now() + Math.random()
   };
   globalLogs.push(logEntry);
-  
-  // Keep only last 1000 logs for memory efficiency
   if (globalLogs.length > 1000) {
     globalLogs = globalLogs.slice(-1000);
   }
-  
   console.log(`[${filename || 'SYSTEM'}] ${message}`);
 }
 
-// Direct API call to Gemini with proper timeout handling
 async function callGeminiAPI(prompt, temperature, maxTokens) {
   const apiKey = process.env.GEMINI_API_KEY;
   const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
-  
+
   try {
     const response = await axiosInstance.post(
       apiUrl,
@@ -397,12 +349,12 @@ async function callGeminiAPI(prompt, temperature, maxTokens) {
         }
       }
     );
-    
+
     if (response.data && response.data.candidates && response.data.candidates[0]) {
       return response.data.candidates[0].content.parts[0].text;
     }
     throw new Error('Invalid response format from Gemini API');
-    
+
   } catch (error) {
     if (error.response) {
       throw new Error(`Gemini API error: ${error.response.status} - ${error.response.data.error?.message || error.response.statusText}`);
@@ -414,11 +366,9 @@ async function callGeminiAPI(prompt, temperature, maxTokens) {
   }
 }
 
-// Process PDFs - each file gets its own fresh connection
 async function processNextInQueue() {
   if (currentlyProcessing) return;
-  
-  // Find next queued item
+
   let nextItem = null;
   for (let [id, item] of processingQueue) {
     if (item.status === 'queued') {
@@ -426,64 +376,57 @@ async function processNextInQueue() {
       break;
     }
   }
-  
+
   if (!nextItem) {
     addLog('All files processed. Queue is empty.', 'success');
     return;
   }
-  
+
   currentlyProcessing = nextItem;
   nextItem.status = 'processing';
-  
+
   try {
     addLog(`Starting processing of ${nextItem.filename} (${getQueuedCount()} more in queue)`, 'info', nextItem.filename);
-    
-    // Extract text from PDF
+
     addLog('Extracting text from PDF...', 'info', nextItem.filename);
     const pdfData = await pdfParse(nextItem.buffer);
-    
+
     if (!pdfData.text || pdfData.text.trim().length === 0) {
       throw new Error('No text content found in PDF');
     }
-    
+
     const textLength = pdfData.text.length;
     addLog(`Extracted ${textLength} characters from PDF`, 'info', nextItem.filename);
-    
-    // Process with Gemini
+
     if (!process.env.GEMINI_API_KEY) {
       throw new Error('Gemini API key not configured');
     }
-    
-    // Increased text length limit
+
     const maxTextLength = 1000000;
-    const truncatedText = pdfData.text.length > maxTextLength 
+    const truncatedText = pdfData.text.length > maxTextLength
       ? pdfData.text.substring(0, maxTextLength) + '...[truncated]'
       : pdfData.text;
-    
+
     if (truncatedText !== pdfData.text) {
       addLog(`Text truncated to ${maxTextLength} characters`, 'warning', nextItem.filename);
     }
-    
+
     const prompt = `${llmSettings.prompt}\n\nDocument content:\n${truncatedText}`;
-    
+
     addLog('Sending to Gemini API for analysis...', 'info', nextItem.filename);
     addLog(`Using temperature: ${llmSettings.temperature}, max tokens: ${llmSettings.maxOutputTokens}`, 'info', nextItem.filename);
-    
+
     const startTime = Date.now();
-    
-    // Make the API call directly with axios - no timeout
     const result = await callGeminiAPI(prompt, llmSettings.temperature, llmSettings.maxOutputTokens);
-    
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
     addLog(`Received response from Gemini API after ${processingTime}s`, 'success', nextItem.filename);
-    
+
     nextItem.result = result;
     nextItem.status = 'completed';
     nextItem.processedAt = new Date();
-    
+
     addLog(`Processing completed successfully for ${nextItem.filename}`, 'success', nextItem.filename);
-    
-    // Save to Supabase if configured
+
     if (supabase) {
       try {
         await saveToSupabase(nextItem);
@@ -492,35 +435,27 @@ async function processNextInQueue() {
         addLog(`Supabase save failed: ${error.message}`, 'warning', nextItem.filename);
       }
     }
-    
+
   } catch (error) {
     console.error(`Error processing ${nextItem.filename}:`, error);
     const errorMessage = error.message || 'Unknown error';
-    
-    // If it's a timeout or network error, retry up to 3 times
+
     if ((errorMessage.includes('timeout') || errorMessage.includes('network') || errorMessage.includes('ECONNRESET')) && nextItem.retryCount < 3) {
       nextItem.retryCount++;
-      nextItem.status = 'queued'; // Re-queue for retry
+      nextItem.status = 'queued';
       addLog(`Error: ${errorMessage}. Will retry (attempt ${nextItem.retryCount + 1}/4)`, 'warning', nextItem.filename);
-      
-      // Wait a bit before retrying
-      await new Promise(resolve => setTimeout(resolve, 30000)); // 30 seconds
+      await new Promise(resolve => setTimeout(resolve, 30000));
     } else {
-      // Max retries reached or non-retryable error
       addLog(`Error: ${errorMessage}`, 'error', nextItem.filename);
       nextItem.status = 'error';
       nextItem.error = errorMessage;
     }
   }
-  
-  // Clear current processing reference
+
   currentlyProcessing = null;
-  
-  // Small delay before processing next item
   setTimeout(() => processNextInQueue(), 3000);
 }
 
-// Helper function to count queued items
 function getQueuedCount() {
   let count = 0;
   for (let [id, item] of processingQueue) {
@@ -529,10 +464,8 @@ function getQueuedCount() {
   return count;
 }
 
-// Save results to Supabase
 async function saveToSupabase(item) {
   if (!supabase) return;
-  
   try {
     const { data, error } = await supabase
       .from('pdf_analyses')
@@ -542,7 +475,6 @@ async function saveToSupabase(item) {
         processed_at: item.processedAt,
         settings: llmSettings
       }]);
-    
     if (error) throw error;
     console.log(`Saved to Supabase: ${item.filename}`);
   } catch (error) {
@@ -551,16 +483,15 @@ async function saveToSupabase(item) {
   }
 }
 
-// Error handling middleware
+// === ERROR HANDLING & SERVER START ===
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Gemini API Key: ${process.env.GEMINI_API_KEY ? 'Configured' : 'Not configured'}`);
-  console.log(`Supabase: ${supabase ? 'Configured' : 'Not configured'}`);
+  console.log(`Supabase (Dictionary): ${supabase ? 'Configured' : 'Not configured'}`);
 });
