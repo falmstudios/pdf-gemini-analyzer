@@ -22,19 +22,25 @@ router.post('/analyze-and-translate', async (req, res) => {
         let wordAnalysis = [];
 
         if (words.length > 0) {
-            // --- NEW, POWERFUL QUERY ---
-            // This query is adapted from your dictionary viewer to get ALL data for the words.
+            
+            // --- THE DEFINITIVE QUERY FIX ---
+            // Start from 'terms', then join forward to 'concept_to_term' and then to 'concepts'
             const dictionaryPromise = supabase
-                .from('concepts')
+                .from('terms')
                 .select(`
-                    id, primary_german_label, part_of_speech, notes, german_definition, krogmann_info, krogmann_idioms, sense_id, sense_number,
-                    concept_to_term!inner(pronunciation, gender, plural_form, etymology, homonym_number, note, source_name, alternative_forms, term:terms!inner(term_text, language)),
-                    examples (halunder_sentence, german_sentence, note, example_type),
-                    source_relations:relations!source_concept_id (relation_type, note, target_concept:concepts!target_concept_id (id, primary_german_label)),
-                    source_citations (citation_text)
+                    term_text,
+                    concept_to_term!inner(
+                        pronunciation, gender, plural_form, etymology, homonym_number, note, source_name, alternative_forms,
+                        concept:concepts!inner(
+                            id, primary_german_label, part_of_speech, notes, german_definition, krogmann_info, krogmann_idioms, sense_id, sense_number,
+                            examples (halunder_sentence, german_sentence, note, example_type),
+                            source_relations:relations!source_concept_id (relation_type, note, target_concept:concepts!target_concept_id (id, primary_german_label)),
+                            source_citations (citation_text)
+                        )
+                    )
                 `)
-                .filter('concept_to_term.terms.term_text', 'in', `(${words.join(',')})`)
-                .eq('concept_to_term.terms.language', 'hal');
+                .in('term_text', words)
+                .eq('language', 'hal');
 
             const featuresPromise = supabase
                 .from('cleaned_linguistic_examples')
@@ -46,48 +52,52 @@ router.post('/analyze-and-translate', async (req, res) => {
             if (dictionaryResults.error) throw new Error(`Dictionary search error: ${dictionaryResults.error.message}`);
             if (featuresResults.error) throw new Error(`Linguistic features search error: ${featuresResults.error.message}`);
             
-            // --- NEW, POWERFUL DATA PROCESSING ---
+            // --- NEW DATA PROCESSING LOGIC FOR THE CORRECTED QUERY STRUCTURE ---
             const dictionaryMap = new Map();
-            // This logic is also adapted from your dictionary viewer to format the data correctly.
             if (dictionaryResults.data) {
-                dictionaryResults.data.forEach(concept => {
-                    // Find which of the input words this concept belongs to
-                    const matchedTerm = concept.concept_to_term.find(ct => words.includes(ct.term.term_text.toLowerCase()));
-                    if (!matchedTerm) return;
-                    
-                    const halunderWord = matchedTerm.term.term_text.toLowerCase();
-
-                    // Format the concept into a clean entry object
-                    const translationMap = new Map();
-                    concept.concept_to_term.filter(ct => ct.term.language === 'hal').forEach(ct => {
-                        const key = ct.term.term_text;
-                        if (!translationMap.has(key)) {
-                            translationMap.set(key, { term: ct.term.term_text, pronunciation: ct.pronunciation, gender: ct.gender, plural: ct.plural_form, etymology: ct.etymology, note: ct.note, alternativeForms: ct.alternative_forms, sources: [] });
-                        }
-                        translationMap.get(key).sources.push(ct.source_name);
-                    });
-
-                    const formattedEntry = {
-                        id: concept.id,
-                        headword: concept.primary_german_label,
-                        partOfSpeech: concept.part_of_speech,
-                        germanDefinition: concept.german_definition,
-                        ahrhammarNotes: concept.notes,
-                        krogmannInfo: concept.krogmann_info,
-                        krogmannIdioms: concept.krogmann_idioms,
-                        senseId: concept.sense_id,
-                        senseNumber: concept.sense_number,
-                        translations: Array.from(translationMap.values()),
-                        examples: concept.examples.map(ex => ({ halunder: ex.halunder_sentence, german: ex.german_sentence, note: ex.note, type: ex.example_type })),
-                        relations: concept.source_relations.map(rel => ({ type: rel.relation_type.replace(/_/g, ' '), targetTerm: rel.target_concept.primary_german_label, targetId: rel.target_concept.id, note: rel.note })),
-                        citations: concept.source_citations.map(c => c.citation_text)
-                    };
-
-                    // Add the formatted entry to our map, grouped by the original Halunder word
+                // The result is a list of terms. Each term contains a list of its concept connections.
+                dictionaryResults.data.forEach(termResult => {
+                    const halunderWord = termResult.term_text.toLowerCase();
                     if (!dictionaryMap.has(halunderWord)) {
                         dictionaryMap.set(halunderWord, []);
                     }
-                    dictionaryMap.get(halunderWord).push(formattedEntry);
+
+                    termResult.concept_to_term.forEach(connection => {
+                        const concept = connection.concept;
+                        if (!concept) return;
+
+                        // Format the concept data into a clean "entry" object. This is the same formatting
+                        // logic as before, but now applied to the correctly fetched data.
+                        const translationMap = new Map();
+                        // This part is a bit redundant since we start from a term, but good for consistency
+                        translationMap.set(termResult.term_text, {
+                            term: termResult.term_text,
+                            pronunciation: connection.pronunciation,
+                            gender: connection.gender,
+                            plural: connection.plural_form,
+                            etymology: connection.etymology,
+                            note: connection.note,
+                            alternativeForms: connection.alternative_forms,
+                            sources: [connection.source_name]
+                        });
+                        
+                        const formattedEntry = {
+                            id: concept.id,
+                            headword: concept.primary_german_label,
+                            partOfSpeech: concept.part_of_speech,
+                            germanDefinition: concept.german_definition,
+                            ahrhammarNotes: concept.notes,
+                            krogmannInfo: concept.krogmann_info,
+                            krogmannIdioms: concept.krogmann_idioms,
+                            senseId: concept.sense_id,
+                            senseNumber: concept.sense_number,
+                            translations: Array.from(translationMap.values()),
+                            examples: concept.examples.map(ex => ({ halunder: ex.halunder_sentence, german: ex.german_sentence, note: ex.note, type: ex.example_type })),
+                            relations: (concept.source_relations || []).map(rel => ({ type: rel.relation_type.replace(/_/g, ' '), targetTerm: rel.target_concept.primary_german_label, targetId: rel.target_concept.id, note: rel.note })),
+                            citations: (concept.source_citations || []).map(c => c.citation_text)
+                        };
+                        dictionaryMap.get(halunderWord).push(formattedEntry);
+                    });
                 });
             }
 
@@ -96,7 +106,7 @@ router.post('/analyze-and-translate', async (req, res) => {
             // Combine the results
             wordAnalysis = words.map(word => ({
                 word: word,
-                dictionaryEntries: dictionaryMap.get(word) || [], // This is now an array of full entries
+                dictionaryEntries: dictionaryMap.get(word) || [],
                 linguisticFeature: featuresMap.get(word) || null
             }));
         }
