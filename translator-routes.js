@@ -17,19 +17,12 @@ router.post('/analyze-and-translate', async (req, res) => {
     }
 
     try {
-        // --- 1. WORD-BY-WORD ANALYSIS ---
-
-        // --- FIX IS HERE ---
-        // The old regex was: .match(/\b(\w+)\b/g)
-        // The new regex uses \p{L} to match any Unicode letter. The 'u' flag is required.
+        // This part is correct - it normalizes the input to lowercase
         const words = [...new Set(sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
-        // --- END OF FIX ---
-
         let wordAnalysis = [];
 
         if (words.length > 0) {
             
-            // This query is correct and will now work with the correctly parsed words.
             const dictionaryPromise = supabase
                 .from('terms')
                 .select(`
@@ -44,7 +37,10 @@ router.post('/analyze-and-translate', async (req, res) => {
                         )
                     )
                 `)
-                .in('term_text', words)
+                // --- FIX IS HERE: Changed .in() to a case-insensitive .filter() ---
+                // Old way (case-sensitive): .in('term_text', words)
+                .filter('term_text', 'ilike.any', `{${words.join(',')}}`)
+                // --- END OF FIX ---
                 .eq('language', 'hal');
 
             const featuresPromise = supabase
@@ -57,6 +53,7 @@ router.post('/analyze-and-translate', async (req, res) => {
             if (dictionaryResults.error) throw new Error(`Dictionary search error: ${dictionaryResults.error.message}`);
             if (featuresResults.error) throw new Error(`Linguistic features search error: ${featuresResults.error.message}`);
             
+            // The rest of the data processing logic is correct and does not need to be changed.
             const dictionaryMap = new Map();
             if (dictionaryResults.data) {
                 dictionaryResults.data.forEach(termResult => {
