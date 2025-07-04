@@ -57,6 +57,7 @@ async function callGemini_2_5_Pro(prompt) {
 async function runCorpusBuilder(textLimit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
+    let allLinguisticExamples = []; // Define at a higher scope
     addLog(`Starting corpus build process...`, 'info');
 
     try {
@@ -65,47 +66,66 @@ async function runCorpusBuilder(textLimit) {
         
         await sourceDbClient.from('source_sentences').update({ processing_status: 'pending' }).eq('processing_status', 'processing');
 
-        // --- FIX IS HERE: Get `count` directly from the response ---
         const { count: existingPendingCount, error: checkError } = await sourceDbClient
             .from('source_sentences')
-            .select('*', { count: 'exact', head: true }) // Changed select to '*' for safety, though it's not strictly needed
+            .select('*', { count: 'exact', head: true })
             .eq('processing_status', 'pending');
 
         if (checkError) throw new Error(`Failed to check for pending jobs: ${checkError.message}`);
         
         let pendingSentences;
 
+        // --- Pre-fetch all linguistic examples ONCE at the start ---
+        addLog('Pre-fetching all linguistic examples...', 'info');
+        let lingPage = 0;
+        const lingPageSize = 1000;
+        while (true) {
+            const from = lingPage * lingPageSize;
+            const to = from + lingPageSize - 1;
+            const { data, error } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4).range(from, to);
+            if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
+            if (data && data.length > 0) allLinguisticExamples.push(...data);
+            if (!data || data.length < lingPageSize) break;
+            lingPage++;
+        }
+        addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
+
         if (existingPendingCount > 0) {
             // --- RECOVERY MODE ---
             addLog(`Found ${existingPendingCount} existing pending sentences. Entering RECOVERY MODE. The text limit will be ignored.`, 'warning');
-            const { data, error } = await sourceDbClient
-                .from('source_sentences')
-                .select('*')
-                .eq('processing_status', 'pending')
-                .order('text_id')
-                .order('sentence_number');
-            if (error) throw new Error(`Failed to fetch pending sentences for recovery: ${error.message}`);
-            pendingSentences = data;
+            
+            // --- FIX IS HERE: Paginate the recovery fetch to get ALL pending sentences ---
+            pendingSentences = [];
+            let recoveryPage = 0;
+            const recoveryPageSize = 1000;
+            while(true) {
+                const from = recoveryPage * recoveryPageSize;
+                const to = from + recoveryPageSize - 1;
+                const { data, error } = await sourceDbClient
+                    .from('source_sentences')
+                    .select('*')
+                    .eq('processing_status', 'pending')
+                    .order('text_id')
+                    .order('sentence_number')
+                    .range(from, to);
+                if (error) throw new Error(`Failed to fetch pending sentences for recovery: ${error.message}`);
+                
+                if (data && data.length > 0) {
+                    pendingSentences.push(...data);
+                }
+
+                if (!data || data.length < recoveryPageSize) {
+                    break; // Last page
+                }
+                recoveryPage++;
+            }
+            addLog(`Successfully loaded all ${pendingSentences.length} sentences for recovery.`, 'success');
+            // --- END OF FIX ---
 
         } else {
             // --- NORMAL MODE ---
             addLog("No existing pending jobs found. Starting new text extraction.", 'info');
             
-            addLog('Pre-fetching all linguistic examples...', 'info');
-            let allLinguisticExamples = [];
-            let lingPage = 0;
-            const lingPageSize = 1000;
-            while (true) {
-                const from = lingPage * lingPageSize;
-                const to = from + lingPageSize - 1;
-                const { data, error } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4).range(from, to);
-                if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
-                if (data && data.length > 0) allLinguisticExamples.push(...data);
-                if (!data || data.length < lingPageSize) break;
-                lingPage++;
-            }
-            addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
-
             addLog(`Fetching up to ${textLimit} new texts...`, 'info');
             const { data: texts, error: fetchError } = await sourceDbClient.from('texts').select('id, complete_helgolandic_text').or('review_status.eq.pending,review_status.eq.halunder_only').limit(textLimit);
             if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
@@ -165,31 +185,6 @@ async function runCorpusBuilder(textLimit) {
         if (totalToProcess === 0) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
-
-        // Re-fetch linguistic examples here if we were in recovery mode
-        const allLinguisticExamples = await (async () => {
-            if (existingPendingCount > 0) {
-                addLog('Pre-fetching all linguistic examples for recovery run...', 'info');
-                let examples = [];
-                let page = 0;
-                const pageSize = 1000;
-                while (true) {
-                    const from = page * pageSize;
-                    const to = from + pageSize - 1;
-                    const { data, error } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4).range(from, to);
-                    if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
-                    if (data && data.length > 0) examples.push(...data);
-                    if (!data || data.length < pageSize) break;
-                    page++;
-                }
-                addLog(`Successfully pre-fetched ${examples.length} linguistic examples.`, 'success');
-                return examples;
-            }
-            // If not in recovery, this was already fetched. This line is just for variable scope.
-            const { data } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term').limit(1);
-            return data ? (await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4)).data : [];
-        })();
-
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
@@ -288,11 +283,11 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 **INSTRUCTIONS:**
 1.  Analyze the **Target Halunder Sentence Pair**.
 2.  Use the **Sentence Context** to understand the surrounding conversation.
-3.  Review the **Machine Translation Proposals** as a starting point. They might be flawed.
+3.  Review the **Machine Translation Proposals** as a starting point. They might be flawed but should offer a good starting point.
 4.  Consult the **Dictionary Entries** for word-for-word meanings.
 5.  Consult the **Relevant Linguistic Phrases** for idioms and special constructions. This is very important.
-6.  Synthesize all this information to create the most natural-sounding and contextually accurate German translation for the entire pair. Prioritize natural German over a literal, word-for-word translation. Halunder is highly idiomatic.
-7.  Provide one "best" translation and, if valid alternatives exist, list them separately.
+6.  Synthesize all this information to create the most natural-sounding and contextually accurate German translation for the entire pair. Prioritize natural German over a literal, word-for-word translation. Halunder is highly idiomatic and the word order might be slightly different.
+7.  Provide one "best" translation and, if valid alternatives exist, list them separately (capped at 5 additional alternatives).
 8.  Provide a confidence score for each translation.
 9.  Output your response in the following JSON format ONLY. Do not include any other text or explanations.
 
@@ -329,9 +324,9 @@ ${JSON.stringify(linguisticExamples, null, 2)}
   "notes": "Explain briefly why you chose this translation, e.g., 'Chose this phrasing because the Halunder is an idiom for...'",
   "alternative_translations": [
     {
-      "translation": "This is a valid, but slightly less common or more literal alternative.",
+      "translation": "This is one additional valid, but slightly different wording or style, or slightly less common or a bit more literal alternative. (You may add more in the same format below)",
       "confidence_score": 0.80,
-      "notes": "This is a more literal translation."
+      "notes": "This is a very similar translation but slightly different wording or style but high quality."
     }
   ]
 }
