@@ -252,6 +252,7 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
         sense_id: entry.senseId,
         sense_number: entry.senseNumber
     };
+    // **FIX**: Use sense_id as the unique key for Ahrhammar concepts
     const { data: concept, error } = await supabase.from('concepts').upsert(conceptPayload, { onConflict: 'sense_id' }).select('id').single();
     if (error || !concept) {
         throw new Error(`Could not upsert concept for ${entry.headword} (sense: ${entry.senseId}). DB Error: ${error?.message}`);
@@ -302,7 +303,7 @@ async function processAhrhammarRelations(entry, results, perFileResults) {
 }
 
 
-// --- KROGMANN PROCESSING LOGIC (REVISED) ---
+// --- KROGMANN PROCESSING LOGIC ---
 
 async function processKrogmannData() {
     const state = processingStates.krogmann;
@@ -410,6 +411,7 @@ async function processKrogmannEntryPass1(entry, globalResults, perFileResults) {
     }
     return relationsForLater;
 }
+
 
 async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileResults, sourceName) {
     if (!concept.krogmann_info && !concept.krogmann_idioms) { 
