@@ -16,6 +16,7 @@ async function searchDictionary() {
     currentLetter = '';
     currentPage = 1;
     expandedEntryId = null;
+    document.querySelectorAll('.alphabet-bar button.active').forEach(b => b.classList.remove('active'));
     
     await loadEntries();
 }
