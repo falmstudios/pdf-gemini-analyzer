@@ -23,6 +23,10 @@ router.post('/analyze-and-translate', async (req, res) => {
 
         if (words.length > 0) {
             
+            // --- THE DEFINITIVE FIX ---
+            // We build a dynamic OR filter for case-insensitive matching.
+            const orFilterConditions = words.map(word => `term_text.ilike.${word}`).join(',');
+            
             const dictionaryPromise = supabase
                 .from('terms')
                 .select(`
@@ -37,27 +41,28 @@ router.post('/analyze-and-translate', async (req, res) => {
                         )
                     )
                 `)
-                // --- FIX IS HERE: Changed .in() to a case-insensitive .filter() ---
-                // Old way (case-sensitive): .in('term_text', words)
-                .filter('term_text', 'ilike.any', `{${words.join(',')}}`)
-                // --- END OF FIX ---
+                // Apply the OR filter for the words AND the language filter
+                .or(orFilterConditions)
                 .eq('language', 'hal');
-
+                
+            // The featuresPromise also needs to be case-insensitive
+            const featuresOrFilter = words.map(word => `halunder_term.ilike.${word}`).join(',');
             const featuresPromise = supabase
                 .from('cleaned_linguistic_examples')
                 .select('halunder_term, explanation, feature_type')
-                .in('halunder_term', words);
+                .or(featuresOrFilter);
                 
             const [dictionaryResults, featuresResults] = await Promise.all([dictionaryPromise, featuresPromise]);
 
             if (dictionaryResults.error) throw new Error(`Dictionary search error: ${dictionaryResults.error.message}`);
             if (featuresResults.error) throw new Error(`Linguistic features search error: ${featuresResults.error.message}`);
             
-            // The rest of the data processing logic is correct and does not need to be changed.
+            // The data processing logic is correct, but we must ensure keys are lowercase
             const dictionaryMap = new Map();
             if (dictionaryResults.data) {
                 dictionaryResults.data.forEach(termResult => {
-                    const halunderWord = termResult.term_text.toLowerCase();
+                    // Use .toLowerCase() on the key to match our input `words` array
+                    const halunderWord = termResult.term_text.toLowerCase(); 
                     if (!dictionaryMap.has(halunderWord)) {
                         dictionaryMap.set(halunderWord, []);
                     }
