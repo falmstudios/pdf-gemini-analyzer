@@ -187,7 +187,7 @@ async function processAhrhammarData() {
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.05 + (0.45 * ((i + 1) / pdfAnalyses.length));
             
-            const perFileResults = { entries: 0, terms: 0, examples: 0, citations: 0 };
+            const perFileResults = { entries: 0, terms: 0, examples: 0, citations: 0, links: 0 };
             try {
                 let jsonData = analysis.result.replace(/^```json\s*|```$/g, '');
                 const entries = JSON.parse(jsonData);
@@ -195,7 +195,7 @@ async function processAhrhammarData() {
                 for (const entry of entries) {
                     await processAhrhammarEntryFirstPass(entry, globalResults, perFileResults);
                 }
-                addLog('ahrhammar', `File ${analysis.filename} (Pass 1): Processed ${perFileResults.entries} entries. Added ${perFileResults.terms} terms, ${perFileResults.examples} examples, ${perFileResults.citations} citations.`, 'info');
+                addLog('ahrhammar', `File ${analysis.filename} (Pass 1): Processed ${perFileResults.entries} entries. Added ${perFileResults.terms} terms, ${perFileResults.links} links, ${perFileResults.examples} examples.`, 'info');
             } catch (e) {
                 addLog('ahrhammar', `Error processing ${analysis.filename} in Pass 1: ${e.message}`, 'error');
                 globalResults.errors++;
@@ -252,11 +252,10 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
         sense_id: entry.senseId,
         sense_number: entry.senseNumber
     };
-    // **FIX**: Use sense_id as the unique key for Ahrhammar concepts
     const { data: concept, error } = await supabase.from('concepts').upsert(conceptPayload, { onConflict: 'sense_id' }).select('id').single();
-    if (error || !concept) {
-        throw new Error(`Could not upsert concept for ${entry.headword} (sense: ${entry.senseId}). DB Error: ${error?.message}`);
-    }
+    if (error) throw new Error(`Could not upsert concept for ${entry.headword} (sense: ${entry.senseId}). DB Error: ${error.message}`);
+    if (!concept) throw new Error(`Upsert returned no data for concept ${entry.headword}`);
+
     globalResults.conceptsCreated++;
     
     await supabase.from('terms').upsert({ term_text: entry.headword, language: 'de' }, { onConflict: 'term_text,language' });
@@ -268,7 +267,9 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
         if (halunderTerm) {
             globalResults.termsCreated++;
             perFileResults.terms++;
-            await supabase.from('concept_to_term').upsert({ concept_id: concept.id, term_id: halunderTerm.id, pronunciation: translation.pronunciation, gender: translation.gender, plural_form: translation.plural, etymology: translation.etymology, note: translation.note, homonym_number: entry.homonymNumber, source_name: 'ahrhammar' }, { onConflict: 'concept_id,term_id,source_name' });
+            // **FIX**: Use insert instead of upsert since the table is cleared each time.
+            const { error: linkError } = await supabase.from('concept_to_term').insert({ concept_id: concept.id, term_id: halunderTerm.id, pronunciation: translation.pronunciation, gender: translation.gender, plural_form: translation.plural, etymology: translation.etymology, note: translation.note, homonym_number: entry.homonymNumber, source_name: 'ahrhammar' });
+            if (!linkError) perFileResults.links++;
         }
     }
     if (entry.examples) for (const example of entry.examples) {
@@ -430,7 +431,8 @@ async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileR
     const { data: halunderTerm } = await supabase.from('terms').upsert({ term_text: entry.halunderWord, language: 'hal' }, { onConflict: 'term_text,language' }).select('id').single();
     if (halunderTerm) {
         globalResults.termsCreated++;
-        await supabase.from('concept_to_term').upsert({
+        // **FIX**: Use insert instead of upsert
+        await supabase.from('concept_to_term').insert({
             concept_id: concept.id,
             term_id: halunderTerm.id,
             pronunciation: entry.pronunciation,
@@ -439,7 +441,7 @@ async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileR
             alternative_forms: entry.alternativeForms,
             homonym_number: entry.homonymNumber,
             source_name: sourceName
-        }, { onConflict: 'concept_id,term_id,source_name' });
+        });
     }
 
     if (entry.examples) for (const example of entry.examples) {
@@ -514,7 +516,7 @@ async function processCSVEntry(entry, results) {
         const { data: halunderTermData } = await supabase.from('terms').upsert({ term_text: halunderTerm, language: 'hal' }, { onConflict: 'term_text,language' }).select('id').single();
         results.termsCreated += 2;
         if (halunderTermData) {
-            await supabase.from('concept_to_term').upsert({ concept_id: concept.id, term_id: halunderTermData.id, source_name: 'miin_iaars_duusend' }, { onConflict: 'concept_id,term_id' });
+            await supabase.from('concept_to_term').insert({ concept_id: concept.id, term_id: halunderTermData.id, source_name: 'miin_iaars_duusend' });
         }
     }
 }
