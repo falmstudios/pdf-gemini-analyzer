@@ -83,17 +83,20 @@ async function runCorpusBuilder(textLimit, modelName) {
     addLog(`Starting corpus build process using ${modelName}...`, 'info');
 
     try {
-        // --- NEW: Startup Recovery now includes 'error' states ---
+        // --- NEW: Corrected and Robust Startup Recovery Logic ---
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
         const { data: resetRows, error: resetError } = await sourceDbClient
             .from('source_sentences')
-            .update({ processing_status: 'pending' })
-            .or('processing_status.eq.processing,processing_status.eq.error') // This now includes 'error'
+            .update({ 
+                processing_status: 'pending',
+                error_message: null // Also clear the old error message
+            })
+            .in('processing_status', ['processing', 'error']) // Use .in() for multiple values
             .select('id');
         
         if (resetError) throw new Error(`Failed to reset stale jobs: ${resetError.message}`);
         if (resetRows && resetRows.length > 0) {
-            addLog(`Reset ${resetRows.length} stale/errored jobs back to 'pending'. They will be included in this run.`, 'warning');
+            addLog(`Reset ${resetRows.length} stale/errored jobs back to 'pending'.`, 'warning');
         }
         // --- END OF RECOVERY FIX ---
 
