@@ -60,8 +60,7 @@ async function runCorpusBuilder(textLimit) {
     addLog(`Starting corpus build process. Text limit: ${textLimit}`, 'info');
 
     try {
-        // --- FIX IMPLEMENTED HERE: Pre-fetch ALL important linguistic examples ---
-        // This is done once because we need the full list to check against every sentence.
+        // --- Pre-fetch ALL important linguistic examples ---
         addLog('Pre-fetching all linguistic examples from source database...', 'info');
         let allLinguisticExamples = [];
         let page = 0;
@@ -142,8 +141,14 @@ async function runCorpusBuilder(textLimit) {
              addLog('No valid sentence pairs found in the fetched texts.', 'warning');
         } else {
             addLog(`Extracted a total of ${allSentencePairsToInsert.length} sentence pairs. Inserting into source database...`, 'info');
-            const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentencePairsToInsert);
-            if (insertError) throw new Error(`Failed to insert sentences: ${insertError.message}`);
+            // --- NEW: Batched Database Inserts ---
+            const insertBatchSize = 500;
+            for (let i = 0; i < allSentencePairsToInsert.length; i += insertBatchSize) {
+                const chunk = allSentencePairsToInsert.slice(i, i + insertBatchSize);
+                const { error: insertError } = await sourceDbClient.from('source_sentences').insert(chunk);
+                if (insertError) throw new Error(`Failed to insert sentence chunk: ${insertError.message}`);
+                addLog(`Inserted chunk ${i / insertBatchSize + 1} of sentences into database.`, 'info');
+            }
             addLog('All sentence pairs saved successfully.', 'success');
         }
         
@@ -170,18 +175,26 @@ async function runCorpusBuilder(textLimit) {
 
             const processingPromises = chunk.map(sentence => 
                 processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples).then(promptWasPrinted => {
-                    if (promptWasPrinted) {
-                        firstPromptPrinted = true;
-                    }
+                    if (promptWasPrinted) firstPromptPrinted = true;
                 }).catch(e => {
                     addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
                     return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
                 })
             );
+
             await Promise.all(processingPromises);
+
             processedCount += chunk.length;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
+
+            // --- NEW: API Call Throttling ---
+            // Pause for a few seconds to avoid hitting API rate limits.
+            // 8 seconds is a safe delay for a batch of 5 requests to stay under 60 RPM.
+            if (i + 5 < totalToProcess) {
+                addLog(`Pausing for 8 seconds to respect API rate limits...`, 'info');
+                await new Promise(resolve => setTimeout(resolve, 8000));
+            }
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
@@ -212,8 +225,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const runpodTranslations = runpodData.output?.translations || [];
     await sourceDbClient.from('source_sentences').update({ runpod_translations: runpodTranslations }).eq('id', sentence.id);
 
-    // 2. Get Dictionary Data (This was already correct)
-    // This is a targeted search for specific words and is done for each sentence.
+    // 2. Get Dictionary Data
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
     const { data: dictData, error: dictError } = await dictionaryDbClient
         .from('terms')
