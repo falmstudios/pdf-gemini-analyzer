@@ -26,12 +26,6 @@ function addLog(message, type = 'info') {
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === HELPER FUNCTION TO COUNT WORDS ===
-function countWords(str) {
-    if (!str) return 0;
-    return str.trim().split(/\s+/).length;
-}
-
 async function callGemini_2_5_Pro(prompt) {
     const apiKey = process.env.GEMINI_API_KEY;
     const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
@@ -62,9 +56,31 @@ async function callGemini_2_5_Pro(prompt) {
 // === THE MAIN PROCESSING FUNCTION ===
 async function runCorpusBuilder(textLimit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
+    let firstPromptPrinted = false;
     addLog(`Starting corpus build process. Text limit: ${textLimit}`, 'info');
 
     try {
+        // --- FIX IMPLEMENTED HERE: Pre-fetch ALL important linguistic examples ---
+        // This is done once because we need the full list to check against every sentence.
+        addLog('Pre-fetching all linguistic examples from source database...', 'info');
+        let allLinguisticExamples = [];
+        let page = 0;
+        const pageSize = 1000;
+        while (true) {
+            const from = page * pageSize;
+            const to = from + pageSize - 1;
+            const { data, error } = await sourceDbClient
+                .from('cleaned_linguistic_examples')
+                .select('halunder_term, german_equivalent, explanation, feature_type')
+                .gte('relevance_score', 4)
+                .range(from, to);
+            if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
+            if (data && data.length > 0) allLinguisticExamples.push(...data);
+            if (!data || data.length < pageSize) break;
+            page++;
+        }
+        addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
+
         // --- STAGE 1: EXTRACT & SEGMENT ---
         addLog('Fetching texts from source database...', 'info');
         const { data: texts, error: fetchError } = await sourceDbClient
@@ -82,9 +98,9 @@ async function runCorpusBuilder(textLimit) {
         }
         
         addLog(`Found ${texts.length} texts to process.`, 'success');
-        processingState.status = 'Extracting and segmenting sentences...';
+        processingState.status = 'Extracting and pairing sentences...';
         
-        const allSentencesToInsert = [];
+        const allSentencePairsToInsert = [];
         for (const text of texts) {
             const initialSegments = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+/g) || [];
             const finalSentences = [];
@@ -93,8 +109,7 @@ async function runCorpusBuilder(textLimit) {
             for (const segment of initialSegments) {
                 sentenceBuffer.push(segment.trim());
                 const currentBufferString = sentenceBuffer.join(' ');
-                
-                if (countWords(currentBufferString) >= 5) {
+                if (currentBufferString.trim().split(/\s+/).length >= 5) {
                     finalSentences.push(currentBufferString);
                     sentenceBuffer = [];
                 }
@@ -109,28 +124,31 @@ async function runCorpusBuilder(textLimit) {
                 }
             }
 
-            finalSentences.forEach((s, index) => {
-                allSentencesToInsert.push({
+            for (let i = 0; i < finalSentences.length; i += 2) {
+                let sentencePair = finalSentences[i];
+                if (finalSentences[i + 1]) {
+                    sentencePair += ' ' + finalSentences[i + 1];
+                }
+                allSentencePairsToInsert.push({
                     text_id: text.id,
-                    sentence_number: index + 1,
-                    halunder_sentence: s
+                    sentence_number: i + 1,
+                    halunder_sentence: sentencePair.trim()
                 });
-            });
-
+            }
             await sourceDbClient.from('texts').update({ review_status: 'processing_halunder_only' }).eq('id', text.id);
         }
 
-        if (allSentencesToInsert.length === 0) {
-             addLog('No valid sentences (>= 5 words) found in the fetched texts.', 'warning');
+        if (allSentencePairsToInsert.length === 0) {
+             addLog('No valid sentence pairs found in the fetched texts.', 'warning');
         } else {
-            addLog(`Extracted a total of ${allSentencesToInsert.length} valid sentences. Inserting into source database...`, 'info');
-            const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentencesToInsert);
+            addLog(`Extracted a total of ${allSentencePairsToInsert.length} sentence pairs. Inserting into source database...`, 'info');
+            const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentencePairsToInsert);
             if (insertError) throw new Error(`Failed to insert sentences: ${insertError.message}`);
-            addLog('All sentences saved successfully.', 'success');
+            addLog('All sentence pairs saved successfully.', 'success');
         }
         
         // --- STAGE 2: PROCESS SENTENCES WITH AI ---
-        processingState.status = 'Processing sentences with AI...';
+        processingState.status = 'Processing sentence pairs with AI...';
         let processedCount = 0;
         
         const { data: pendingSentences, error: pendingError } = await sourceDbClient
@@ -143,24 +161,26 @@ async function runCorpusBuilder(textLimit) {
         
         const totalToProcess = pendingSentences.length;
         if (totalToProcess === 0) {
-             addLog('No new sentences to process with AI.', 'info');
+             addLog('No new sentence pairs to process with AI.', 'info');
         }
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
-            addLog(`Processing batch of ${chunk.length} sentences (starting with sentence ${i + 1})...`, 'info');
+            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1})...`, 'info');
 
             const processingPromises = chunk.map(sentence => 
-                processSingleSentence(sentence).catch(e => {
-                    addLog(`Failed to process sentence ID ${sentence.id}: ${e.message}`, 'error');
+                processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples).then(promptWasPrinted => {
+                    if (promptWasPrinted) {
+                        firstPromptPrinted = true;
+                    }
+                }).catch(e => {
+                    addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
                     return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
                 })
             );
-
             await Promise.all(processingPromises);
-
             processedCount += chunk.length;
-            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentences.`;
+            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
         }
         
@@ -177,8 +197,8 @@ async function runCorpusBuilder(textLimit) {
     }
 }
 
-// === THE AI PIPELINE FOR A SINGLE SENTENCE ===
-async function processSingleSentence(sentence) {
+// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR ===
+async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
     // 1. Get RunPod Translations
@@ -192,7 +212,8 @@ async function processSingleSentence(sentence) {
     const runpodTranslations = runpodData.output?.translations || [];
     await sourceDbClient.from('source_sentences').update({ runpod_translations: runpodTranslations }).eq('id', sentence.id);
 
-    // 2. Get Dictionary Data
+    // 2. Get Dictionary Data (This was already correct)
+    // This is a targeted search for specific words and is done for each sentence.
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
     const { data: dictData, error: dictError } = await dictionaryDbClient
         .from('terms')
@@ -200,9 +221,12 @@ async function processSingleSentence(sentence) {
         .filter('term_text', 'ilike.any', `{${words.join(',')}}`)
         .eq('language', 'hal');
     if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
+    
+    // 3. Find Linguistic Examples from the pre-fetched list
+    const foundLinguisticExamples = allLinguisticExamples?.filter(ex => sentence.halunder_sentence.toLowerCase().includes(ex.halunder_term.toLowerCase())) || [];
 
-    // 3. Get Context Sentences
-    const windowSize = 2;
+    // 4. Get Context Sentences
+    const windowSize = 1;
     const fromIndex = Math.max(0, sentence.sentence_number - 1 - windowSize);
     const toIndex = sentence.sentence_number - 1 + windowSize;
     const { data: contextSentences } = await sourceDbClient
@@ -212,11 +236,19 @@ async function processSingleSentence(sentence) {
         .order('sentence_number')
         .range(fromIndex, toIndex);
 
-    // 4. Construct and Call Gemini
-    const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData);
+    // 5. Construct and Call Gemini
+    const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
+    
+    if (shouldPrintPrompt) {
+        console.log('----------- GEMINI PROMPT FOR FIRST SENTENCE PAIR -----------');
+        console.log(prompt);
+        console.log('-----------------------------------------------------------');
+        addLog('Printed full Gemini prompt to server console for verification.', 'info');
+    }
+
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
-    // 5. Save Results to Corpus
+    // 6. Save Results to Corpus
     const corpusEntries = [];
     corpusEntries.push({
         source_sentence_id: sentence.id,
@@ -244,26 +276,27 @@ async function processSingleSentence(sentence) {
 
     await sourceDbClient.from('source_sentences').update({ processing_status: 'completed' }).eq('id', sentence.id);
     
-    // --- IMPROVED LOGGING IS HERE ---
     const logMessage = `[HAL] ${sentence.halunder_sentence} -> [DE] ${geminiResult.best_translation}`;
     addLog(logMessage, 'success');
+    
+    return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT ===
-function buildGeminiPrompt(targetSentence, context, proposals, dictionary) {
-    // This function is unchanged
+// === HELPER TO BUILD THE PROMPT (UPDATED) ===
+function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
-You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence, creating a high-quality parallel corpus for machine learning.
+You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence pair, creating a high-quality parallel corpus for machine learning.
 
 **INSTRUCTIONS:**
-1.  Analyze the **Target Halunder Sentence**.
+1.  Analyze the **Target Halunder Sentence Pair**.
 2.  Use the **Sentence Context** to understand the surrounding conversation.
 3.  Review the **Machine Translation Proposals** as a starting point. They might be flawed.
-4.  Consult the **Dictionary Entries** to understand the literal meaning of each word.
-5.  Synthesize all this information to create the most natural-sounding and contextually accurate German translation. Prioritize natural German over a literal, word-for-word translation. Halunder is highly idiomatic.
-6.  Provide one "best" translation and, if valid alternatives exist, list them separately.
-7.  Provide a confidence score for each translation.
-8.  Output your response in the following JSON format ONLY. Do not include any other text or explanations.
+4.  Consult the **Dictionary Entries** for word-for-word meanings.
+5.  Consult the **Relevant Linguistic Phrases** for idioms and special constructions. This is very important.
+6.  Synthesize all this information to create the most natural-sounding and contextually accurate German translation for the entire pair. Prioritize natural German over a literal, word-for-word translation. Halunder is highly idiomatic.
+7.  Provide one "best" translation and, if valid alternatives exist, list them separately.
+8.  Provide a confidence score for each translation.
+9.  Output your response in the following JSON format ONLY. Do not include any other text or explanations.
 
 **INPUT DATA:**
 
@@ -272,7 +305,7 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 ${JSON.stringify(context, null, 2)}
 \`\`\`
 
-**2. Target Halunder Sentence:**
+**2. Target Halunder Sentence Pair:**
 "${targetSentence}"
 
 **3. Machine Translation Proposals (from RunPod):**
@@ -285,10 +318,15 @@ ${JSON.stringify(proposals, null, 2)}
 ${JSON.stringify(dictionary, null, 2)}
 \`\`\`
 
+**5. Relevant Linguistic Phrases found in the target sentence:**
+\`\`\`json
+${JSON.stringify(linguisticExamples, null, 2)}
+\`\`\`
+
 **YOUR JSON OUTPUT:**
 \`\`\`json
 {
-  "best_translation": "This is your single best and most natural German translation.",
+  "best_translation": "This is your single best and most natural German translation for the entire sentence pair.",
   "confidence_score": 0.95,
   "notes": "Explain briefly why you chose this translation, e.g., 'Chose this phrasing because the Halunder is an idiom for...'",
   "alternative_translations": [
