@@ -17,6 +17,9 @@ const dictionaryRoutes = require('./dictionary-routes');
 // Add this near the top with other requires
 const linguisticRoutes = require('./linguistic-routes');
 
+// Add this line
+const translatorRoutes = require('./translator-routes');
+
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
   timeout: 0, // No timeout
@@ -51,6 +54,10 @@ app.use('/linguistic', linguisticRoutes);
 
 // Add this after your existing routes
 app.use('/dictionary', dictionaryRoutes);
+
+// Add this line
+app.use('/translator', translatorRoutes);
+
 
 // Add route for homepage
 app.get('/', (req, res) => {
