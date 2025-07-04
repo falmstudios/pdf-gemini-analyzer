@@ -2,10 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 
-// Use the same Supabase client as your other routes
+// --- FIX IS HERE ---
+// Use the SAME environment variables as the rest of your app.
 const supabase = createClient(
-    process.env.SOURCE_SUPABASE_URL,
-    process.env.SOURCE_SUPABASE_ANON_KEY
+    process.env.SUPABASE_URL, // Changed from SOURCE_SUPABASE_URL
+    process.env.SUPABASE_ANON_KEY  // Changed from SOURCE_SUPABASE_ANON_KEY
 );
 
 // The main route that does all the work
@@ -23,8 +24,7 @@ router.post('/analyze-and-translate', async (req, res) => {
 
         if (words.length > 0) {
             
-            // --- THE DEFINITIVE QUERY FIX ---
-            // Start from 'terms', then join forward to 'concept_to_term' and then to 'concepts'
+            // This query is correct and will now work because it's pointed at the right database.
             const dictionaryPromise = supabase
                 .from('terms')
                 .select(`
@@ -52,10 +52,8 @@ router.post('/analyze-and-translate', async (req, res) => {
             if (dictionaryResults.error) throw new Error(`Dictionary search error: ${dictionaryResults.error.message}`);
             if (featuresResults.error) throw new Error(`Linguistic features search error: ${featuresResults.error.message}`);
             
-            // --- NEW DATA PROCESSING LOGIC FOR THE CORRECTED QUERY STRUCTURE ---
             const dictionaryMap = new Map();
             if (dictionaryResults.data) {
-                // The result is a list of terms. Each term contains a list of its concept connections.
                 dictionaryResults.data.forEach(termResult => {
                     const halunderWord = termResult.term_text.toLowerCase();
                     if (!dictionaryMap.has(halunderWord)) {
@@ -66,10 +64,7 @@ router.post('/analyze-and-translate', async (req, res) => {
                         const concept = connection.concept;
                         if (!concept) return;
 
-                        // Format the concept data into a clean "entry" object. This is the same formatting
-                        // logic as before, but now applied to the correctly fetched data.
                         const translationMap = new Map();
-                        // This part is a bit redundant since we start from a term, but good for consistency
                         translationMap.set(termResult.term_text, {
                             term: termResult.term_text,
                             pronunciation: connection.pronunciation,
@@ -103,7 +98,6 @@ router.post('/analyze-and-translate', async (req, res) => {
 
             const featuresMap = new Map((featuresResults.data || []).map(item => [item.halunder_term.toLowerCase(), item]));
 
-            // Combine the results
             wordAnalysis = words.map(word => ({
                 word: word,
                 dictionaryEntries: dictionaryMap.get(word) || [],
