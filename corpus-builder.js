@@ -26,56 +26,82 @@ function addLog(message, type = 'info') {
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
 
-async function callGemini_2_5_Pro(prompt) {
+async function callGeminiApi(prompt, modelName) {
     const apiKey = process.env.GEMINI_API_KEY;
-    const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
-    try {
-        const response = await axiosInstance.post(
-            apiUrl,
-            {
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.9, maxOutputTokens: 20000 }
-            },
-            { headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey } }
-        );
-        if (response.data && response.data.candidates && response.data.candidates[0]) {
-            const responseText = response.data.candidates[0].content.parts[0].text;
-            const cleanedText = responseText.replace(/^```json\s*|```$/g, '').trim();
-            return JSON.parse(cleanedText);
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
+    
+    let attempts = 0;
+    const maxAttempts = 4;
+    let delay = 5000;
+
+    while (attempts < maxAttempts) {
+        try {
+            const response = await axiosInstance.post(
+                apiUrl,
+                {
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0.9, maxOutputTokens: 20000 }
+                },
+                { headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey } }
+            );
+
+            if (response.data && response.data.candidates && response.data.candidates[0]) {
+                const responseText = response.data.candidates[0].content.parts[0].text;
+                const cleanedText = responseText.replace(/^```json\s*|```$/g, '').trim();
+                return JSON.parse(cleanedText);
+            }
+            throw new Error(`Invalid response format from ${modelName} API`);
+        
+        } catch (error) {
+            if (error.response && error.response.status === 429) {
+                attempts++;
+                if (attempts >= maxAttempts) {
+                    addLog(`Max retry attempts reached for Gemini API. Giving up.`, 'error');
+                    throw new Error('Gemini API rate limit exceeded after multiple retries.');
+                }
+                const jitter = Math.random() * 1000;
+                const waitTime = delay + jitter;
+                addLog(`Gemini API rate limit hit. Retrying in ${Math.round(waitTime / 1000)}s... (Attempt ${attempts}/${maxAttempts})`, 'warning');
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                delay *= 2;
+            } else {
+                if (error.response) {
+                    console.error("Gemini API Error Response:", error.response.data);
+                    throw new Error(`Gemini API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+                }
+                throw error;
+            }
         }
-        throw new Error('Invalid response format from Gemini 2.5 Pro API');
-    } catch (error) {
-        if (error.response) {
-            console.error("Gemini API Error Response:", error.response.data);
-            throw new Error(`Gemini API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
-        }
-        throw error;
     }
 }
 
 // === THE MAIN PROCESSING FUNCTION ===
-async function runCorpusBuilder(textLimit) {
+async function runCorpusBuilder(textLimit, modelName) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
-    let allLinguisticExamples = []; // Define at a higher scope
-    addLog(`Starting corpus build process...`, 'info');
+    let allLinguisticExamples = [];
+    addLog(`Starting corpus build process using ${modelName}...`, 'info');
 
     try {
-        // --- TWO-STAGE RECOVERY & PROCESSING LOGIC ---
-        addLog("Checking for any existing pending or stale jobs...", 'info');
-        
-        await sourceDbClient.from('source_sentences').update({ processing_status: 'pending' }).eq('processing_status', 'processing');
-
-        const { count: existingPendingCount, error: checkError } = await sourceDbClient
+        // --- NEW: Startup Recovery now includes 'error' states ---
+        addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
+        const { data: resetRows, error: resetError } = await sourceDbClient
             .from('source_sentences')
-            .select('*', { count: 'exact', head: true })
-            .eq('processing_status', 'pending');
+            .update({ processing_status: 'pending' })
+            .or('processing_status.eq.processing,processing_status.eq.error') // This now includes 'error'
+            .select('id');
+        
+        if (resetError) throw new Error(`Failed to reset stale jobs: ${resetError.message}`);
+        if (resetRows && resetRows.length > 0) {
+            addLog(`Reset ${resetRows.length} stale/errored jobs back to 'pending'. They will be included in this run.`, 'warning');
+        }
+        // --- END OF RECOVERY FIX ---
 
+        const { count: existingPendingCount, error: checkError } = await sourceDbClient.from('source_sentences').select('*', { count: 'exact', head: true }).eq('processing_status', 'pending');
         if (checkError) throw new Error(`Failed to check for pending jobs: ${checkError.message}`);
         
         let pendingSentences;
 
-        // --- Pre-fetch all linguistic examples ONCE at the start ---
         addLog('Pre-fetching all linguistic examples...', 'info');
         let lingPage = 0;
         const lingPageSize = 1000;
@@ -91,41 +117,23 @@ async function runCorpusBuilder(textLimit) {
         addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
 
         if (existingPendingCount > 0) {
-            // --- RECOVERY MODE ---
-            addLog(`Found ${existingPendingCount} existing pending sentences. Entering RECOVERY MODE. The text limit will be ignored.`, 'warning');
-            
-            // --- FIX IS HERE: Paginate the recovery fetch to get ALL pending sentences ---
+            addLog(`Found ${existingPendingCount} existing pending sentences. Entering RECOVERY MODE.`, 'warning');
             pendingSentences = [];
             let recoveryPage = 0;
             const recoveryPageSize = 1000;
             while(true) {
                 const from = recoveryPage * recoveryPageSize;
                 const to = from + recoveryPageSize - 1;
-                const { data, error } = await sourceDbClient
-                    .from('source_sentences')
-                    .select('*')
-                    .eq('processing_status', 'pending')
-                    .order('text_id')
-                    .order('sentence_number')
-                    .range(from, to);
+                const { data, error } = await sourceDbClient.from('source_sentences').select('*').eq('processing_status', 'pending').order('text_id').order('sentence_number').range(from, to);
                 if (error) throw new Error(`Failed to fetch pending sentences for recovery: ${error.message}`);
-                
-                if (data && data.length > 0) {
-                    pendingSentences.push(...data);
-                }
-
-                if (!data || data.length < recoveryPageSize) {
-                    break; // Last page
-                }
+                if (data && data.length > 0) pendingSentences.push(...data);
+                if (!data || data.length < recoveryPageSize) break;
                 recoveryPage++;
             }
             addLog(`Successfully loaded all ${pendingSentences.length} sentences for recovery.`, 'success');
-            // --- END OF FIX ---
 
         } else {
-            // --- NORMAL MODE ---
             addLog("No existing pending jobs found. Starting new text extraction.", 'info');
-            
             addLog(`Fetching up to ${textLimit} new texts...`, 'info');
             const { data: texts, error: fetchError } = await sourceDbClient.from('texts').select('id, complete_helgolandic_text').or('review_status.eq.pending,review_status.eq.halunder_only').limit(textLimit);
             if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
@@ -177,7 +185,7 @@ async function runCorpusBuilder(textLimit) {
             pendingSentences = newPending;
         }
 
-        // --- AI PROCESSING STAGE (Common to both modes) ---
+        // --- AI PROCESSING STAGE ---
         processingState.status = 'Processing sentence pairs with AI...';
         let processedCount = 0;
         
@@ -186,33 +194,35 @@ async function runCorpusBuilder(textLimit) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
 
-        for (let i = 0; i < totalToProcess; i += 5) {
-            const chunk = pendingSentences.slice(i, i + 5);
-            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
+        const DAILY_API_LIMIT = modelName === 'gemini-2.5-flash' ? 9500 : 950;
+        addLog(`Using daily API budget of ${DAILY_API_LIMIT} for ${modelName}.`, 'info');
+        let requestsMadeThisRun = 0;
 
-            const processingPromises = chunk.map(sentence => 
-                processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples).then(promptWasPrinted => {
-                    if (promptWasPrinted) firstPromptPrinted = true;
-                }).catch(e => {
-                    addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
-                    return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
-                })
-            );
-
-            await Promise.all(processingPromises);
-
-            processedCount += chunk.length;
-            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
-            processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
-
-            if (i + 5 < totalToProcess) {
-                addLog(`Pausing for 8 seconds to respect API rate limits...`, 'info');
-                await new Promise(resolve => setTimeout(resolve, 8000));
+        for (const sentence of pendingSentences) {
+            if (requestsMadeThisRun >= DAILY_API_LIMIT) {
+                addLog(`Daily API limit of ${DAILY_API_LIMIT} reached. Stopping gracefully.`, 'warning');
+                break;
             }
+
+            addLog(`Processing pair ${processedCount + 1} of ${totalToProcess}...`, 'info');
+            try {
+                await processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples, modelName);
+                if (!firstPromptPrinted) firstPromptPrinted = true;
+                requestsMadeThisRun++;
+            } catch (e) {
+                addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
+                await sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
+            }
+            
+            processedCount++;
+            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs. API calls today: ${requestsMadeThisRun}/${DAILY_API_LIMIT}.`;
+            processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
+            
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
-        addLog(`Processing complete in ${processingTime}s.`, 'success');
+        addLog(`Processing complete for this run in ${processingTime}s.`, 'success');
         processingState.status = 'Completed';
 
     } catch (error) {
@@ -225,7 +235,7 @@ async function runCorpusBuilder(textLimit) {
 }
 
 // === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR ===
-async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
+async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples, modelName) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
     const runpodResponse = await fetch('https://api.runpod.ai/v2/wyg1vwde9yva0y/runsync', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RUNPOD_API_KEY}` }, body: JSON.stringify({ input: { text: sentence.halunder_sentence, num_alternatives: 3 } }) });
@@ -254,7 +264,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
         addLog('Printed full Gemini prompt to server console for verification.', 'info');
     }
 
-    const geminiResult = await callGemini_2_5_Pro(prompt);
+    const geminiResult = await callGeminiApi(prompt, modelName);
 
     const corpusEntries = [];
     corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: sentence.halunder_sentence, german_translation: geminiResult.best_translation, source: 'gemini_best', confidence_score: geminiResult.confidence_score, notes: geminiResult.notes });
@@ -283,11 +293,11 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 **INSTRUCTIONS:**
 1.  Analyze the **Target Halunder Sentence Pair**.
 2.  Use the **Sentence Context** to understand the surrounding conversation.
-3.  Review the **Machine Translation Proposals** as a starting point. They might be flawed but should offer a good starting point.
+3.  Review the **Machine Translation Proposals** as a starting point. They might be flawed.
 4.  Consult the **Dictionary Entries** for word-for-word meanings.
 5.  Consult the **Relevant Linguistic Phrases** for idioms and special constructions. This is very important.
-6.  Synthesize all this information to create the most natural-sounding and contextually accurate German translation for the entire pair. Prioritize natural German over a literal, word-for-word translation. Halunder is highly idiomatic and the word order might be slightly different.
-7.  Provide one "best" translation and, if valid alternatives exist, list them separately (capped at 5 additional alternatives).
+6.  Synthesize all this information to create the most natural-sounding and contextually accurate German translation for the entire pair. Prioritize natural German over a literal, word-for-word translation. Halunder is highly idiomatic.
+7.  Provide one "best" translation and, if valid alternatives exist, list them separately.
 8.  Provide a confidence score for each translation.
 9.  Output your response in the following JSON format ONLY. Do not include any other text or explanations.
 
@@ -324,9 +334,9 @@ ${JSON.stringify(linguisticExamples, null, 2)}
   "notes": "Explain briefly why you chose this translation, e.g., 'Chose this phrasing because the Halunder is an idiom for...'",
   "alternative_translations": [
     {
-      "translation": "This is one additional valid, but slightly different wording or style, or slightly less common or a bit more literal alternative. (You may add more in the same format below)",
+      "translation": "This is a valid, but slightly less common or more literal alternative.",
       "confidence_score": 0.80,
-      "notes": "This is a very similar translation but slightly different wording or style but high quality."
+      "notes": "This is a more literal translation."
     }
   ]
 }
@@ -340,10 +350,12 @@ router.post('/start-processing', (req, res) => {
         return res.status(400).json({ error: 'Processing is already in progress.' });
     }
     const limit = parseInt(req.body.limit, 10) || 10;
-    runCorpusBuilder(limit).catch(err => {
+    const model = req.body.model || 'gemini-2.5-pro';
+
+    runCorpusBuilder(limit, model).catch(err => {
         console.error("Caught unhandled error in corpus builder:", err);
     });
-    res.json({ success: true, message: `Processing started for up to ${limit} texts.` });
+    res.json({ success: true, message: `Processing started for up to ${limit} texts using ${model}.` });
 });
 
 router.get('/progress', (req, res) => {
