@@ -33,31 +33,30 @@ function addLog(processType, message, type = 'info') {
     console.log(`[${processType.toUpperCase()}] [${type.toUpperCase()}] ${message}`);
 }
 
-// --- NEW HELPER: Simple German noun singularization (Improved) ---
-function attemptSingularization(term) {
-    if (term.endsWith('en') && term.length > 3) return term.slice(0, -1); // Marken -> Marke
-    if (term.endsWith('er') && term.length > 3) return term.slice(0, -2); // Männer -> Mann (imperfect)
-    if (term.endsWith('e') && term.length > 2) return term.slice(0, -1);  // Risse -> Riss
-    if (term.endsWith('n') && term.length > 2) return term.slice(0, -1);  // Frauen -> Frau
-    if (term.endsWith('s') && term.length > 2) return term.slice(0, -1);  // Autos -> Auto
-    return null;
-}
-
 // --- FINAL ENHANCED HELPER: Finds concept IDs with multi-stage fallback logic ---
 async function findTargetConceptId(dirtyTerm) {
     if (!dirtyTerm) return null;
 
     const cleanGermanTerm = (term) => {
         return term
-            .replace(/\d+$/, '')             // nieder2 -> nieder
-            .replace(/²$/, '')               // Bean² -> Bean
-            .replace(/-$/, '')               // dran- -> dran
-            .replace(/!$/, '')               // klack! -> klack
-            .replace(/\s*\(.*\)\s*$/, '')    // (festlich) angezogen -> festlich angezogen
-            .replace(/\s*,\s*sich\s*$/, '')   // trennen, sich -> trennen
-            .replace(/\*$/, '')              // fliten* -> fliten
+            .replace(/\d+$/, '')
+            .replace(/[¹²³]$/, '')
+            .replace(/-$/, '')
+            .replace(/!$/, '')
+            .replace(/\s*\(.*\)\s*$/, '')
+            .replace(/\s*,\s*sich\s*$/, '')
+            .replace(/\*$/, '')
             .trim();
     };
+
+    const attemptSingularization = (term) => {
+        if (term.endsWith('en') && term.length > 3) return term.slice(0, -1);
+        if (term.endsWith('er') && term.length > 3) return term.slice(0, -2);
+        if (term.endsWith('e') && term.length > 2) return term.slice(0, -1);
+        if (term.endsWith('n') && term.length > 2) return term.slice(0, -1);
+        if (term.endsWith('s') && term.length > 2) return term.slice(0, -1);
+        return null;
+    }
 
     const attemptMatch = async (term) => {
         if (!term) return null;
@@ -65,52 +64,40 @@ async function findTargetConceptId(dirtyTerm) {
         return data ? data.id : null;
     };
 
-    // Attempt 1: Exact match
-    let conceptId = await attemptMatch(dirtyTerm);
-    if (conceptId) return conceptId;
-
-    // Attempt 2: Cleaned match
-    const cleanedTerm = cleanGermanTerm(dirtyTerm);
-    conceptId = await attemptMatch(cleanedTerm);
-    if (conceptId) return conceptId;
-    
-    // Attempt 3: Handle slash-separated alternatives (e.g., Fels/en)
-    if (cleanedTerm.includes('/')) {
-        const parts = cleanedTerm.split('/');
-        const firstPart = parts[0].trim();
-        const secondPart = (parts[0].endsWith('-') ? parts[0].slice(0, -1) : '') + parts[1].trim();
-        
-        conceptId = await attemptMatch(firstPart) || await attemptMatch(secondPart);
-        if (conceptId) return conceptId;
-    }
-
-    // Attempt 4: Singularization attempt
-    const singularAttempt = attemptSingularization(cleanedTerm);
-    if (singularAttempt) {
-        conceptId = await attemptMatch(singularAttempt);
-        if (conceptId) return conceptId;
-    }
-    
-    // Attempt 5: First word of a phrase
-    const firstWord = cleanedTerm.split(/[\s,]+/)[0];
-    if (firstWord && firstWord.length > 2 && firstWord !== cleanedTerm) {
-        conceptId = await attemptMatch(firstWord);
-        if (conceptId) return conceptId;
-    }
-
-    // Attempt 6: Halunder term match (CORRECTED LOGIC)
-    const { data: halunderMatch } = await supabase.from('terms').select('concept_to_term!inner(concept_id)').eq('term_text', dirtyTerm).eq('language', 'hal').limit(1).single();
-    if (halunderMatch && halunderMatch.concept_to_term) {
-        // The relationship is one-to-many, so concept_to_term is an array.
-        // We must check if it's not empty and get the id from the first result.
-        if (Array.isArray(halunderMatch.concept_to_term) && halunderMatch.concept_to_term.length > 0) {
-            return halunderMatch.concept_to_term[0].concept_id;
-        } else if (halunderMatch.concept_to_term.concept_id) { // Handle case if Supabase returns a single object
-             return halunderMatch.concept_to_term.concept_id;
+    const strategies = [
+        () => attemptMatch(dirtyTerm),
+        () => attemptMatch(cleanGermanTerm(dirtyTerm)),
+        () => {
+            const cleaned = cleanGermanTerm(dirtyTerm);
+            if (cleaned.includes('/')) {
+                const parts = cleaned.split('/');
+                const firstPart = parts[0].trim();
+                const secondPart = (parts[0].endsWith('-') ? parts[0].slice(0, -1) : '') + parts[1].trim();
+                return attemptMatch(firstPart).then(id => id || attemptMatch(secondPart));
+            }
+            return Promise.resolve(null);
+        },
+        () => attemptMatch(attemptSingularization(cleanGermanTerm(dirtyTerm))),
+        () => {
+            const cleaned = cleanGermanTerm(dirtyTerm);
+            const firstWord = cleaned.split(/[\s,]+/)[0];
+            return (firstWord && firstWord.length > 2 && firstWord !== cleaned) ? attemptMatch(firstWord) : Promise.resolve(null);
+        },
+        async () => {
+            const { data: halunderMatch } = await supabase.from('terms').select('concept_to_term!inner(concept_id)').eq('term_text', dirtyTerm).eq('language', 'hal').limit(1).single();
+            if (halunderMatch && halunderMatch.concept_to_term) {
+                return Array.isArray(halunderMatch.concept_to_term) ? halunderMatch.concept_to_term[0]?.concept_id : halunderMatch.concept_to_term.concept_id;
+            }
+            return null;
         }
+    ];
+
+    for (const strategy of strategies) {
+        const conceptId = await strategy();
+        if (conceptId) return conceptId;
     }
     
-    return null; // All attempts failed
+    return null;
 }
 
 // --- API ROUTES ---
@@ -192,7 +179,6 @@ async function processAhrhammarData() {
         state.progress = 0.05;
         const globalResults = { totalProcessed: 0, conceptsCreated: 0, termsCreated: 0, examplesCreated: 0, relationsCreated: 0, citationsCreated: 0, errors: 0 };
 
-        // Pass 1: Concepts & Terms
         addLog('ahrhammar', 'First pass: Creating concepts and terms', 'info');
         for (let i = 0; i < pdfAnalyses.length; i++) {
             const analysis = pdfAnalyses[i];
@@ -215,7 +201,6 @@ async function processAhrhammarData() {
             }
         }
 
-        // Pass 2: Relations
         addLog('ahrhammar', 'Second pass: Creating relations', 'info');
         for (let i = 0; i < pdfAnalyses.length; i++) {
             const analysis = pdfAnalyses[i];
@@ -262,7 +247,7 @@ async function processAhrhammarEntryFirstPass(entry, globalResults, perFileResul
         sense_id: entry.senseId,
         sense_number: entry.senseNumber
     };
-    const { data: concept } = await supabase.from('concepts').upsert(conceptPayload, { onConflict: 'primary_german_label' }).select('id').single();
+    const { data: concept } = await supabase.from('concepts').upsert(conceptPayload, { onConflict: 'primary_german_label,sense_id' }).select('id').single();
     if (!concept) throw new Error(`Could not upsert concept for ${entry.headword}`);
     globalResults.conceptsCreated++;
     
@@ -398,16 +383,12 @@ async function processKrogmannEntryPass1(entry, globalResults, perFileResults) {
         } else {
             if (meaning === germanMeanings[0] && germanMeanings[0].length < 100) {
                 perFileResults.created++;
-                let krogmannNotes = [];
-                if (entry.usage) krogmannNotes.push(`[Usage] ${entry.usage}`);
-                if (entry.additionalInfo) krogmannNotes.push(`[Info] ${entry.additionalInfo}`);
-                if (entry.idioms) krogmannNotes.push(`[Idiom] ${entry.idioms}`);
-                if (entry.references) krogmannNotes.push(`[Reference] ${entry.references}`);
-
                 const { data: newConcept, error } = await supabase.from('concepts').insert({ 
                     primary_german_label: meaning, 
                     part_of_speech: entry.wordType,
-                    krogmann_notes: krogmannNotes.join('\n\n---\n\n')
+                    krogmann_info: entry.additionalInfo,
+                    krogmann_idioms: entry.idioms,
+                    notes: entry.references ? `[Reference] ${entry.references}` : null,
                 }).select().single();
 
                 if (error) {
@@ -425,20 +406,21 @@ async function processKrogmannEntryPass1(entry, globalResults, perFileResults) {
 
 
 async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileResults, sourceName) {
-    if (!concept.krogmann_notes) {
-        let krogmannNotes = [];
-        if (entry.usage) krogmannNotes.push(`[Usage] ${entry.usage}`);
-        if (entry.additionalInfo) krogmannNotes.push(`[Info] ${entry.additionalInfo}`);
-        if (entry.idioms) krogmannNotes.push(`[Idiom] ${entry.idioms}`);
-        if (entry.references) krogmannNotes.push(`[Reference] ${entry.references}`);
-        
-        if (krogmannNotes.length > 0) {
-            const { error } = await supabase.from('concepts').update({ krogmann_notes: krogmannNotes.join('\n\n---\n\n') }).eq('id', concept.id);
+    // 1. Enrich the concept's main notes (if it's an existing concept from another source)
+    if (!concept.krogmann_info && !concept.krogmann_idioms) { 
+        const updatePayload = {};
+        if (entry.additionalInfo) updatePayload.krogmann_info = entry.additionalInfo;
+        if (entry.idioms) updatePayload.krogmann_idioms = entry.idioms;
+        if (entry.references) updatePayload.notes = concept.notes ? `${concept.notes}\n[Krogmann Reference] ${entry.references}` : `[Krogmann Reference] ${entry.references}`;
+
+        if (Object.keys(updatePayload).length > 0) {
+            const { error } = await supabase.from('concepts').update(updatePayload).eq('id', concept.id);
             if (error) addLog('krogmann', `Failed to add Krogmann notes for ${concept.primary_german_label}: ${error.message}`, 'error');
             else globalResults.conceptsEnriched++;
         }
     }
 
+    // 2. Add or update the Halunder term and its link
     const { data: halunderTerm } = await supabase.from('terms').upsert({ term_text: entry.halunderWord, language: 'hal' }, { onConflict: 'term_text,language' }).select('id').single();
     if (halunderTerm) {
         globalResults.termsCreated++;
@@ -454,13 +436,14 @@ async function enrichConceptWithKrogmann(concept, entry, globalResults, perFileR
         }, { onConflict: 'concept_id,term_id,source_name' });
     }
 
+    // 3. Add examples
     if (entry.examples) for (const example of entry.examples) {
         await supabase.from('examples').insert({ concept_id: concept.id, halunder_sentence: example.halunder, german_sentence: example.german, note: example.note, source_name: sourceName });
         globalResults.examplesCreated++;
         perFileResults.examples++;
     }
     
-    // Defer relation processing
+    // 4. Defer relation processing
     const relationsForLater = [];
     if (entry.relatedWords) {
         for (const relatedWord of entry.relatedWords) {
@@ -540,7 +523,7 @@ router.get('/search', async (req, res) => {
         let query = supabase
             .from('concepts')
             .select(`
-                id, primary_german_label, part_of_speech, notes, german_definition, krogmann_notes, sense_id, sense_number,
+                id, primary_german_label, part_of_speech, notes, german_definition, krogmann_info, krogmann_idioms, sense_id, sense_number,
                 concept_to_term!inner (pronunciation, gender, plural_form, etymology, homonym_number, note, source_name, alternative_forms, term:terms!inner(term_text, language)),
                 examples (halunder_sentence, german_sentence, note, example_type),
                 source_relations:relations!source_concept_id (relation_type, note, target_concept:concepts!target_concept_id (id, primary_german_label)),
@@ -574,7 +557,8 @@ router.get('/search', async (req, res) => {
                 partOfSpeech: concept.part_of_speech,
                 germanDefinition: concept.german_definition,
                 ahrhammarNotes: concept.notes,
-                krogmannNotes: concept.krogmann_notes,
+                krogmannInfo: concept.krogmann_info,
+                krogmannIdioms: concept.krogmann_idioms,
                 senseId: concept.sense_id,
                 senseNumber: concept.sense_number,
                 homonymNumber: concept.concept_to_term[0]?.homonym_number,
