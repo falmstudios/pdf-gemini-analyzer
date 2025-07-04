@@ -57,121 +57,148 @@ async function callGemini_2_5_Pro(prompt) {
 async function runCorpusBuilder(textLimit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
-    addLog(`Starting corpus build process. Text limit: ${textLimit}`, 'info');
+    addLog(`Starting corpus build process...`, 'info');
 
     try {
-        // --- Pre-fetch ALL important linguistic examples ---
-        addLog('Pre-fetching all linguistic examples from source database...', 'info');
-        let allLinguisticExamples = [];
-        let page = 0;
-        const pageSize = 1000;
-        while (true) {
-            const from = page * pageSize;
-            const to = from + pageSize - 1;
+        // --- NEW: TWO-STAGE RECOVERY & PROCESSING LOGIC ---
+        addLog("Checking for any existing pending or stale jobs...", 'info');
+        
+        // Reset any 'processing' jobs to 'pending' first.
+        await sourceDbClient.from('source_sentences').update({ processing_status: 'pending' }).eq('processing_status', 'processing');
+
+        // Now, check if there are ANY pending sentences in the entire table.
+        const { data: existingPending, error: checkError } = await sourceDbClient
+            .from('source_sentences')
+            .select('id', { count: 'exact', head: true })
+            .eq('processing_status', 'pending');
+
+        if (checkError) throw new Error(`Failed to check for pending jobs: ${checkError.message}`);
+        
+        let pendingSentences;
+
+        if (existingPending.count > 0) {
+            // --- RECOVERY MODE ---
+            addLog(`Found ${existingPending.count} existing pending sentences. Entering RECOVERY MODE. The text limit will be ignored.`, 'warning');
             const { data, error } = await sourceDbClient
-                .from('cleaned_linguistic_examples')
-                .select('halunder_term, german_equivalent, explanation, feature_type')
-                .gte('relevance_score', 4)
-                .range(from, to);
-            if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
-            if (data && data.length > 0) allLinguisticExamples.push(...data);
-            if (!data || data.length < pageSize) break;
-            page++;
-        }
-        addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
+                .from('source_sentences')
+                .select('*')
+                .eq('processing_status', 'pending')
+                .order('text_id') // Order by text_id to preserve context
+                .order('sentence_number');
+            if (error) throw new Error(`Failed to fetch pending sentences for recovery: ${error.message}`);
+            pendingSentences = data;
 
-        // --- STAGE 1: EXTRACT & SEGMENT ---
-        addLog('Fetching texts from source database...', 'info');
-        const { data: texts, error: fetchError } = await sourceDbClient
-            .from('texts')
-            .select('id, complete_helgolandic_text')
-            .or('review_status.eq.pending,review_status.eq.halunder_only')
-            .limit(textLimit);
-
-        if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
-        if (!texts || texts.length === 0) {
-            addLog('No pending texts found to process.', 'success');
-            processingState.status = 'Completed (No new texts)';
-            processingState.isProcessing = false;
-            return;
-        }
-        
-        addLog(`Found ${texts.length} texts to process.`, 'success');
-        processingState.status = 'Extracting and pairing sentences...';
-        
-        const allSentencePairsToInsert = [];
-        for (const text of texts) {
-            const initialSegments = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+/g) || [];
-            const finalSentences = [];
-            let sentenceBuffer = [];
-
-            for (const segment of initialSegments) {
-                sentenceBuffer.push(segment.trim());
-                const currentBufferString = sentenceBuffer.join(' ');
-                if (currentBufferString.trim().split(/\s+/).length >= 5) {
-                    finalSentences.push(currentBufferString);
-                    sentenceBuffer = [];
-                }
-            }
-
-            if (sentenceBuffer.length > 0) {
-                const leftoverString = sentenceBuffer.join(' ');
-                if (finalSentences.length > 0) {
-                    finalSentences[finalSentences.length - 1] += ' ' + leftoverString;
-                } else {
-                    finalSentences.push(leftoverString);
-                }
-            }
-
-            for (let i = 0; i < finalSentences.length; i += 2) {
-                let sentencePair = finalSentences[i];
-                if (finalSentences[i + 1]) {
-                    sentencePair += ' ' + finalSentences[i + 1];
-                }
-                allSentencePairsToInsert.push({
-                    text_id: text.id,
-                    sentence_number: i + 1,
-                    halunder_sentence: sentencePair.trim()
-                });
-            }
-            await sourceDbClient.from('texts').update({ review_status: 'processing_halunder_only' }).eq('id', text.id);
-        }
-
-        if (allSentencePairsToInsert.length === 0) {
-             addLog('No valid sentence pairs found in the fetched texts.', 'warning');
         } else {
-            addLog(`Extracted a total of ${allSentencePairsToInsert.length} sentence pairs. Inserting into source database...`, 'info');
-            // --- NEW: Batched Database Inserts ---
-            const insertBatchSize = 500;
-            for (let i = 0; i < allSentencePairsToInsert.length; i += insertBatchSize) {
-                const chunk = allSentencePairsToInsert.slice(i, i + insertBatchSize);
-                const { error: insertError } = await sourceDbClient.from('source_sentences').insert(chunk);
-                if (insertError) throw new Error(`Failed to insert sentence chunk: ${insertError.message}`);
-                addLog(`Inserted chunk ${i / insertBatchSize + 1} of sentences into database.`, 'info');
+            // --- NORMAL MODE ---
+            addLog("No existing pending jobs found. Starting new text extraction.", 'info');
+            
+            // Pre-fetch all linguistic examples
+            addLog('Pre-fetching all linguistic examples...', 'info');
+            let allLinguisticExamples = [];
+            let lingPage = 0;
+            const lingPageSize = 1000;
+            while (true) {
+                const from = lingPage * lingPageSize;
+                const to = from + lingPageSize - 1;
+                const { data, error } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4).range(from, to);
+                if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
+                if (data && data.length > 0) allLinguisticExamples.push(...data);
+                if (!data || data.length < lingPageSize) break;
+                lingPage++;
             }
-            addLog('All sentence pairs saved successfully.', 'success');
+            addLog(`Successfully pre-fetched ${allLinguisticExamples.length} linguistic examples.`, 'success');
+
+            // Extract from new texts
+            addLog(`Fetching up to ${textLimit} new texts...`, 'info');
+            const { data: texts, error: fetchError } = await sourceDbClient.from('texts').select('id, complete_helgolandic_text').or('review_status.eq.pending,review_status.eq.halunder_only').limit(textLimit);
+            if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
+            if (!texts || texts.length === 0) {
+                addLog('No new texts found to process.', 'success');
+                processingState.status = 'Completed (No new texts)';
+                processingState.isProcessing = false;
+                return;
+            }
+            
+            const allSentencePairsToInsert = [];
+            for (const text of texts) {
+                const initialSegments = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+/g) || [];
+                const finalSentences = [];
+                let sentenceBuffer = [];
+                for (const segment of initialSegments) {
+                    sentenceBuffer.push(segment.trim());
+                    const currentBufferString = sentenceBuffer.join(' ');
+                    if (currentBufferString.trim().split(/\s+/).length >= 5) {
+                        finalSentences.push(currentBufferString);
+                        sentenceBuffer = [];
+                    }
+                }
+                if (sentenceBuffer.length > 0) {
+                    const leftoverString = sentenceBuffer.join(' ');
+                    if (finalSentences.length > 0) finalSentences[finalSentences.length - 1] += ' ' + leftoverString;
+                    else finalSentences.push(leftoverString);
+                }
+                for (let i = 0; i < finalSentences.length; i += 2) {
+                    let sentencePair = finalSentences[i];
+                    if (finalSentences[i + 1]) sentencePair += ' ' + finalSentences[i + 1];
+                    allSentencePairsToInsert.push({ text_id: text.id, sentence_number: i + 1, halunder_sentence: sentencePair.trim() });
+                }
+                await sourceDbClient.from('texts').update({ review_status: 'processing_halunder_only' }).eq('id', text.id);
+            }
+
+            if (allSentencePairsToInsert.length > 0) {
+                addLog(`Extracted ${allSentencePairsToInsert.length} new sentence pairs. Inserting...`, 'info');
+                const insertBatchSize = 500;
+                for (let i = 0; i < allSentencePairsToInsert.length; i += insertBatchSize) {
+                    const chunk = allSentencePairsToInsert.slice(i, i + insertBatchSize);
+                    const { error: insertError } = await sourceDbClient.from('source_sentences').insert(chunk);
+                    if (insertError) throw new Error(`Failed to insert sentence chunk: ${insertError.message}`);
+                }
+                addLog('All new sentence pairs saved successfully.', 'success');
+            }
+            // Fetch the newly inserted sentences to process them
+            const { data: newPending, error: newPendingError } = await sourceDbClient.from('source_sentences').select('*').in('text_id', texts.map(t => t.id)).eq('processing_status', 'pending');
+            if (newPendingError) throw new Error(`Could not fetch newly inserted sentences: ${newPendingError.message}`);
+            pendingSentences = newPending;
         }
-        
-        // --- STAGE 2: PROCESS SENTENCES WITH AI ---
+
+        // --- AI PROCESSING STAGE (Common to both modes) ---
         processingState.status = 'Processing sentence pairs with AI...';
         let processedCount = 0;
         
-        const { data: pendingSentences, error: pendingError } = await sourceDbClient
-            .from('source_sentences')
-            .select('*')
-            .in('text_id', texts.map(t => t.id))
-            .eq('processing_status', 'pending');
-
-        if (pendingError) throw new Error(`Could not fetch pending sentences: ${pendingError.message}`);
-        
         const totalToProcess = pendingSentences.length;
         if (totalToProcess === 0) {
-             addLog('No new sentence pairs to process with AI.', 'info');
+             addLog('No sentence pairs to process with AI.', 'info');
         }
+
+        // Re-fetch linguistic examples here if we were in recovery mode
+        const allLinguisticExamples = await (async () => {
+            if (existingPending.count > 0) {
+                addLog('Pre-fetching all linguistic examples for recovery run...', 'info');
+                let examples = [];
+                let page = 0;
+                const pageSize = 1000;
+                while (true) {
+                    const from = page * pageSize;
+                    const to = from + pageSize - 1;
+                    const { data, error } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, feature_type').gte('relevance_score', 4).range(from, to);
+                    if (error) throw new Error(`Linguistic examples lookup failed: ${error.message}`);
+                    if (data && data.length > 0) examples.push(...data);
+                    if (!data || data.length < pageSize) break;
+                    page++;
+                }
+                addLog(`Successfully pre-fetched ${examples.length} linguistic examples.`, 'success');
+                return examples;
+            }
+            // If not in recovery, this was already fetched. This line is just for variable scope.
+            // A more elegant solution might restructure this, but this is safe and clear.
+            const { data } = await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term').limit(1);
+            return data ? allLinguisticExamples : []; // Return the already fetched list
+        })();
+
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
-            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1})...`, 'info');
+            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
 
             const processingPromises = chunk.map(sentence => 
                 processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples).then(promptWasPrinted => {
@@ -188,9 +215,6 @@ async function runCorpusBuilder(textLimit) {
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
 
-            // --- NEW: API Call Throttling ---
-            // Pause for a few seconds to avoid hitting API rate limits.
-            // 8 seconds is a safe delay for a batch of 5 requests to stay under 60 RPM.
             if (i + 5 < totalToProcess) {
                 addLog(`Pausing for 8 seconds to respect API rate limits...`, 'info');
                 await new Promise(resolve => setTimeout(resolve, 8000));
@@ -214,41 +238,23 @@ async function runCorpusBuilder(textLimit) {
 async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
-    // 1. Get RunPod Translations
-    const runpodResponse = await fetch('https://api.runpod.ai/v2/wyg1vwde9yva0y/runsync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RUNPOD_API_KEY}` },
-        body: JSON.stringify({ input: { text: sentence.halunder_sentence, num_alternatives: 3 } })
-    });
+    const runpodResponse = await fetch('https://api.runpod.ai/v2/wyg1vwde9yva0y/runsync', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RUNPOD_API_KEY}` }, body: JSON.stringify({ input: { text: sentence.halunder_sentence, num_alternatives: 3 } }) });
     if (!runpodResponse.ok) throw new Error('RunPod API failed.');
     const runpodData = await runpodResponse.json();
     const runpodTranslations = runpodData.output?.translations || [];
     await sourceDbClient.from('source_sentences').update({ runpod_translations: runpodTranslations }).eq('id', sentence.id);
 
-    // 2. Get Dictionary Data
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
-    const { data: dictData, error: dictError } = await dictionaryDbClient
-        .from('terms')
-        .select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`)
-        .filter('term_text', 'ilike.any', `{${words.join(',')}}`)
-        .eq('language', 'hal');
+    const { data: dictData, error: dictError } = await dictionaryDbClient.from('terms').select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`).filter('term_text', 'ilike.any', `{${words.join(',')}}`).eq('language', 'hal');
     if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
     
-    // 3. Find Linguistic Examples from the pre-fetched list
     const foundLinguisticExamples = allLinguisticExamples?.filter(ex => sentence.halunder_sentence.toLowerCase().includes(ex.halunder_term.toLowerCase())) || [];
 
-    // 4. Get Context Sentences
     const windowSize = 1;
     const fromIndex = Math.max(0, sentence.sentence_number - 1 - windowSize);
     const toIndex = sentence.sentence_number - 1 + windowSize;
-    const { data: contextSentences } = await sourceDbClient
-        .from('source_sentences')
-        .select('halunder_sentence')
-        .eq('text_id', sentence.text_id)
-        .order('sentence_number')
-        .range(fromIndex, toIndex);
+    const { data: contextSentences } = await sourceDbClient.from('source_sentences').select('halunder_sentence').eq('text_id', sentence.text_id).order('sentence_number').range(fromIndex, toIndex);
 
-    // 5. Construct and Call Gemini
     const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
     
     if (shouldPrintPrompt) {
@@ -260,26 +266,11 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
-    // 6. Save Results to Corpus
     const corpusEntries = [];
-    corpusEntries.push({
-        source_sentence_id: sentence.id,
-        halunder_sentence: sentence.halunder_sentence,
-        german_translation: geminiResult.best_translation,
-        source: 'gemini_best',
-        confidence_score: geminiResult.confidence_score,
-        notes: geminiResult.notes
-    });
+    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: sentence.halunder_sentence, german_translation: geminiResult.best_translation, source: 'gemini_best', confidence_score: geminiResult.confidence_score, notes: geminiResult.notes });
     if (geminiResult.alternative_translations) {
         geminiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({
-                source_sentence_id: sentence.id,
-                halunder_sentence: sentence.halunder_sentence,
-                german_translation: alt.translation,
-                source: 'gemini_alternative',
-                confidence_score: alt.confidence_score,
-                notes: alt.notes
-            });
+            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: sentence.halunder_sentence, german_translation: alt.translation, source: 'gemini_alternative', confidence_score: alt.confidence_score, notes: alt.notes });
         });
     }
 
@@ -294,7 +285,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT (UPDATED) ===
+// === HELPER TO BUILD THE PROMPT (UNCHANGED) ===
 function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence pair, creating a high-quality parallel corpus for machine learning.
