@@ -1,12 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const axios = require('axios'); // Add axios for direct API calls
 
 // === DATABASE CONNECTIONS ===
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 const dictionaryDbClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Create an axios instance for API calls, similar to server.js
+const axiosInstance = axios.create({
+    timeout: 0 // No timeout
+});
 
 // === STATE MANAGEMENT ===
 let processingState = {
@@ -24,6 +28,49 @@ function addLog(message, type = 'info') {
     if (processingState.logs.length > 1000) processingState.logs.shift();
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
+
+// === NEW HELPER FUNCTION FOR GEMINI 2.5 PRO API CALL ===
+async function callGemini_2_5_Pro(prompt) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
+
+    try {
+        const response = await axiosInstance.post(
+            apiUrl,
+            {
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                    temperature: 0.9,
+                    maxOutputTokens: 20000,
+                    // Note: The direct REST API does not support the 'responseMimeType' parameter.
+                    // We rely on the prompt to ensure JSON output and clean it manually.
+                }
+            },
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': apiKey
+                }
+            }
+        );
+
+        if (response.data && response.data.candidates && response.data.candidates[0]) {
+            const responseText = response.data.candidates[0].content.parts[0].text;
+            // Clean the response to ensure it's valid JSON before parsing
+            const cleanedText = responseText.replace(/^```json\s*|```$/g, '').trim();
+            return JSON.parse(cleanedText);
+        }
+        throw new Error('Invalid response format from Gemini 2.5 Pro API');
+
+    } catch (error) {
+        if (error.response) {
+            console.error("Gemini API Error Response:", error.response.data);
+            throw new Error(`Gemini API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+        }
+        throw error;
+    }
+}
+
 
 // === THE MAIN PROCESSING FUNCTION ===
 async function runCorpusBuilder(textLimit) {
@@ -71,32 +118,36 @@ async function runCorpusBuilder(textLimit) {
         if (insertError) throw new Error(`Failed to insert sentences: ${insertError.message}`);
         addLog('All sentences saved successfully.', 'success');
         
-        // --- STAGE 2: PROCESS SENTENCES WITH AI ---
+        // --- STAGE 2: PROCESS SENTENCES WITH AI (IN PARALLEL BATCHES) ---
         processingState.status = 'Processing sentences with AI...';
         let processedCount = 0;
         
-        // Re-fetch the sentences we just inserted to process them
         const { data: pendingSentences, error: pendingError } = await sourceDbClient
             .from('source_sentences')
             .select('*')
-            .in('text_id', texts.map(t => t.id)) // Only process sentences from the texts we just fetched
+            .in('text_id', texts.map(t => t.id))
             .eq('processing_status', 'pending');
 
         if (pendingError) throw new Error(`Could not fetch pending sentences: ${pendingError.message}`);
         
         const totalToProcess = pendingSentences.length;
 
-        for (const sentence of pendingSentences) {
-            processingState.details = `Processing sentence ${processedCount + 1} of ${totalToProcess}`;
+        for (let i = 0; i < totalToProcess; i += 5) {
+            const chunk = pendingSentences.slice(i, i + 5);
+            addLog(`Processing batch of ${chunk.length} sentences (starting with sentence ${i + 1})...`, 'info');
+
+            const processingPromises = chunk.map(sentence => 
+                processSingleSentence(sentence).catch(e => {
+                    addLog(`Failed to process sentence ID ${sentence.id}: ${e.message}`, 'error');
+                    return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
+                })
+            );
+
+            await Promise.all(processingPromises);
+
+            processedCount += chunk.length;
+            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentences.`;
             processingState.progress = processedCount / totalToProcess;
-            
-            try {
-                await processSingleSentence(sentence);
-            } catch (e) {
-                addLog(`Failed to process sentence ID ${sentence.id}: ${e.message}`, 'error');
-                await sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
-            }
-            processedCount++;
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
@@ -137,19 +188,19 @@ async function processSingleSentence(sentence) {
     if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
 
     // 3. Get Context Sentences
+    const windowSize = 2;
+    const fromIndex = Math.max(0, sentence.sentence_number - 1 - windowSize);
+    const toIndex = sentence.sentence_number - 1 + windowSize;
     const { data: contextSentences } = await sourceDbClient
         .from('source_sentences')
         .select('halunder_sentence')
         .eq('text_id', sentence.text_id)
         .order('sentence_number')
-        .range(sentence.sentence_number - 3, sentence.sentence_number + 1);
+        .range(fromIndex, toIndex);
 
-    // 4. Construct and Call Gemini
+    // 4. Construct and Call Gemini using the new helper function
     const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text().replace(/^```json\s*|```$/g, '');
-    const geminiResult = JSON.parse(responseText);
+    const geminiResult = await callGemini_2_5_Pro(prompt);
 
     // 5. Save Results to Corpus
     const corpusEntries = [];
@@ -174,7 +225,6 @@ async function processSingleSentence(sentence) {
         });
     }
 
-    // --- FIX IS HERE: Using the new table name 'ai_translated_corpus' ---
     const { error: corpusInsertError } = await sourceDbClient.from('ai_translated_corpus').insert(corpusEntries);
     if (corpusInsertError) throw new Error(`Failed to save to corpus: ${corpusInsertError.message}`);
 
@@ -184,6 +234,7 @@ async function processSingleSentence(sentence) {
 
 // === HELPER TO BUILD THE PROMPT ===
 function buildGeminiPrompt(targetSentence, context, proposals, dictionary) {
+    // This function is unchanged
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence, creating a high-quality parallel corpus for machine learning.
 
@@ -204,7 +255,7 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 ${JSON.stringify(context, null, 2)}
 \`\`\`
 
-**2. Target Halunder sentence:**
+**2. Target Halunder Sentence:**
 "${targetSentence}"
 
 **3. Machine Translation Proposals (from RunPod):**
