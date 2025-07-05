@@ -230,7 +230,7 @@ async function runCorpusBuilder(textLimit) {
     }
 }
 
-// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR (FIXED) ===
+// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR ===
 async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
@@ -240,27 +240,40 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const runpodTranslations = runpodData.output?.translations || [];
     await sourceDbClient.from('source_sentences').update({ runpod_translations: runpodTranslations }).eq('id', sentence.id);
 
-    // --- FIX IS HERE: The dictionary client was not being used correctly ---
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
-    // Use the `dictionaryDbClient` to query the other database
-    const { data: dictData, error: dictError } = await dictionaryDbClient 
-        .from('terms')
-        .select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`)
-        .filter('term_text', 'ilike.any', `{${words.join(',')}}`)
-        .eq('language', 'hal');
+    const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
+    const { data: dictData, error: dictError } = await dictionaryDbClient.from('terms').select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`).or(orFilter).eq('language', 'hal');
     if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
     
     const foundLinguisticExamples = allLinguisticExamples?.filter(ex => sentence.halunder_sentence.toLowerCase().includes(ex.halunder_term.toLowerCase())) || [];
 
-    const windowSize = 1;
-    const fromIndex = Math.max(0, sentence.sentence_number - 1 - windowSize);
-    const toIndex = sentence.sentence_number - 1 + windowSize;
-    const { data: contextSentences } = await sourceDbClient
+    // --- NEW: Corrected and Robust Context Fetching ---
+    const beforePromise = sourceDbClient
         .from('source_sentences')
         .select('halunder_sentence')
         .eq('text_id', sentence.text_id)
-        .order('sentence_number')
-        .range(fromIndex, toIndex);
+        .lt('sentence_number', sentence.sentence_number)
+        .order('sentence_number', { ascending: false })
+        .limit(1);
+
+    const afterPromise = sourceDbClient
+        .from('source_sentences')
+        .select('halunder_sentence')
+        .eq('text_id', sentence.text_id)
+        .gt('sentence_number', sentence.sentence_number)
+        .order('sentence_number', { ascending: true })
+        .limit(1);
+
+    const [beforeResult, afterResult] = await Promise.all([beforePromise, afterPromise]);
+
+    const contextSentences = [];
+    if (beforeResult.data && beforeResult.data.length > 0) {
+        contextSentences.push(beforeResult.data[0]);
+    }
+    if (afterResult.data && afterResult.data.length > 0) {
+        contextSentences.push(afterResult.data[0]);
+    }
+    // --- END OF CONTEXT FIX ---
 
     const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
     
@@ -274,24 +287,10 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
     const corpusEntries = [];
-    corpusEntries.push({
-        source_sentence_id: sentence.id,
-        halunder_sentence: geminiResult.corrected_halunder_sentence,
-        german_translation: geminiResult.best_translation,
-        source: 'gemini_best',
-        confidence_score: geminiResult.confidence_score,
-        notes: geminiResult.notes
-    });
+    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_sentence, german_translation: geminiResult.best_translation, source: 'gemini_best', confidence_score: geminiResult.confidence_score, notes: geminiResult.notes });
     if (geminiResult.alternative_translations) {
         geminiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({
-                source_sentence_id: sentence.id,
-                halunder_sentence: geminiResult.corrected_halunder_sentence,
-                german_translation: alt.translation,
-                source: 'gemini_alternative',
-                confidence_score: alt.confidence_score,
-                notes: alt.notes
-            });
+            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_sentence, german_translation: alt.translation, source: 'gemini_alternative', confidence_score: alt.confidence_score, notes: alt.notes });
         });
     }
 
