@@ -240,40 +240,14 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const runpodTranslations = runpodData.output?.translations || [];
     await sourceDbClient.from('source_sentences').update({ runpod_translations: runpodTranslations }).eq('id', sentence.id);
 
-    const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
+    const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
     const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
     const { data: dictData, error: dictError } = await dictionaryDbClient.from('terms').select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`).or(orFilter).eq('language', 'hal');
     if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
     
     const foundLinguisticExamples = allLinguisticExamples?.filter(ex => sentence.halunder_sentence.toLowerCase().includes(ex.halunder_term.toLowerCase())) || [];
 
-    // --- NEW: Corrected and Robust Context Fetching ---
-    const beforePromise = sourceDbClient
-        .from('source_sentences')
-        .select('halunder_sentence')
-        .eq('text_id', sentence.text_id)
-        .lt('sentence_number', sentence.sentence_number)
-        .order('sentence_number', { ascending: false })
-        .limit(1);
-
-    const afterPromise = sourceDbClient
-        .from('source_sentences')
-        .select('halunder_sentence')
-        .eq('text_id', sentence.text_id)
-        .gt('sentence_number', sentence.sentence_number)
-        .order('sentence_number', { ascending: true })
-        .limit(1);
-
-    const [beforeResult, afterResult] = await Promise.all([beforePromise, afterPromise]);
-
-    const contextSentences = [];
-    if (beforeResult.data && beforeResult.data.length > 0) {
-        contextSentences.push(beforeResult.data[0]);
-    }
-    if (afterResult.data && afterResult.data.length > 0) {
-        contextSentences.push(afterResult.data[0]);
-    }
-    // --- END OF CONTEXT FIX ---
+    const { data: contextSentences } = await sourceDbClient.from('source_sentences').select('halunder_sentence').eq('text_id', sentence.text_id).lt('sentence_number', sentence.sentence_number).order('sentence_number', { ascending: false }).limit(1);
 
     const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
     
@@ -286,11 +260,54 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
+    // --- NEW: Save multiple rows for the different translation variants ---
     const corpusEntries = [];
-    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_sentence, german_translation: geminiResult.best_translation, source: 'gemini_best', confidence_score: geminiResult.confidence_score, notes: geminiResult.notes });
+
+    // 1. The main translation for the full pair
+    corpusEntries.push({
+        source_sentence_id: sentence.id,
+        halunder_sentence: geminiResult.corrected_halunder_pair,
+        german_translation: geminiResult.best_translation_pair,
+        source: 'gemini_best_pair',
+        confidence_score: geminiResult.confidence_score,
+        notes: geminiResult.notes
+    });
+
+    // 2. The translation for the first individual sentence
+    if (geminiResult.corrected_sentence_1 && geminiResult.translation_sentence_1) {
+        corpusEntries.push({
+            source_sentence_id: sentence.id,
+            halunder_sentence: geminiResult.corrected_sentence_1,
+            german_translation: geminiResult.translation_sentence_1,
+            source: 'gemini_best_sentence1',
+            confidence_score: geminiResult.confidence_score,
+            notes: "Individual translation of the first sentence in the pair."
+        });
+    }
+
+    // 3. The translation for the second individual sentence
+    if (geminiResult.corrected_sentence_2 && geminiResult.translation_sentence_2) {
+        corpusEntries.push({
+            source_sentence_id: sentence.id,
+            halunder_sentence: geminiResult.corrected_sentence_2,
+            german_translation: geminiResult.translation_sentence_2,
+            source: 'gemini_best_sentence2',
+            confidence_score: geminiResult.confidence_score,
+            notes: "Individual translation of the second sentence in the pair."
+        });
+    }
+
+    // 4. All alternative translations for the full pair
     if (geminiResult.alternative_translations) {
         geminiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_sentence, german_translation: alt.translation, source: 'gemini_alternative', confidence_score: alt.confidence_score, notes: alt.notes });
+            corpusEntries.push({
+                source_sentence_id: sentence.id,
+                halunder_sentence: geminiResult.corrected_halunder_pair,
+                german_translation: alt.translation,
+                source: 'gemini_alternative_pair',
+                confidence_score: alt.confidence_score,
+                notes: alt.notes
+            });
         });
     }
 
@@ -299,13 +316,13 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     await sourceDbClient.from('source_sentences').update({ processing_status: 'completed' }).eq('id', sentence.id);
     
-    const logMessage = `[HAL-CORRECTED] ${geminiResult.corrected_halunder_sentence} -> [DE] ${geminiResult.best_translation}`;
+    const logMessage = `[HAL-CORRECTED] ${geminiResult.corrected_halunder_pair} -> [DE] ${geminiResult.best_translation_pair}`;
     addLog(logMessage, 'success');
     
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT (UNCHANGED) ===
+// === HELPER TO BUILD THE PROMPT (IMPROVED) ===
 function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence pair, creating a high-quality parallel corpus for machine learning.
@@ -313,12 +330,12 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 **PRIMARY GOAL:** Your first and most important task is to correct the **Target Halunder Sentence Pair**. It may contain obvious OCR errors, typos, or misplaced line breaks (like '\\n'). Your translation must be based on this corrected version.
 
 **INSTRUCTIONS:**
-1.  **Correct the Halunder:** Analyze the **Target Halunder Sentence Pair** and produce a clean, corrected version. This corrected version should be a single, flowing line of text.
-2.  **Translate the Corrected Version:** Using all available context, create the most natural-sounding and contextually accurate German translation for the *entire corrected pair*.
+1.  **Correct the Halunder:** Analyze the **Target Halunder Sentence Pair** and produce a clean, corrected version for the pair and for each individual sentence within it.
+2.  **Translate All Parts:** Provide three distinct translations: one for the entire corrected pair, one for the first corrected sentence, and one for the second corrected sentence.
 3.  **Analyze Context:** Use the **Sentence Context** to understand the surrounding conversation.
 4.  **Review Proposals:** Use the **Machine Translation Proposals** as a starting point, but do not trust them blindly.
 5.  **Consult Dictionaries:** Use the **Dictionary Entries** and **Relevant Linguistic Phrases** to understand literal meanings and idioms.
-6.  **Provide Alternatives:** If valid alternative translations exist (e.g., using different but equally accurate synonyms or slightly different wording), include them.
+6.  **Provide Alternatives:** If valid alternative translations exist for the *entire pair*, include them.
 7.  **Output JSON:** Structure your entire response in the following JSON format ONLY. Do not include any other text.
 
 **LINGUISTIC NUANCES & GUIDELINES:**
@@ -354,15 +371,19 @@ ${JSON.stringify(linguisticExamples, null, 2)}
 **YOUR JSON OUTPUT:**
 \`\`\`json
 {
-  "corrected_halunder_sentence": "This is the corrected, single-line version of the Halunder sentence pair.",
-  "best_translation": "This is your single best and most natural German translation for the entire corrected sentence pair.",
+  "corrected_halunder_pair": "The full, corrected version of the two sentences joined together.",
+  "corrected_sentence_1": "The corrected version of only the first sentence.",
+  "corrected_sentence_2": "The corrected version of only the second sentence (or null if there is no second sentence).",
+  "best_translation_pair": "The single best and most natural German translation for the entire corrected pair.",
+  "translation_sentence_1": "The German translation for only the first corrected sentence.",
+  "translation_sentence_2": "The German translation for only the second corrected sentence (or null).",
   "confidence_score": 0.95,
   "notes": "Explain briefly why you chose this translation, e.g., 'Corrected '\\n' and translated idiom X.'",
   "alternative_translations": [
     {
-      "translation": "This is a valid, but slightly less common or more literal alternative.",
+      "translation": "A valid alternative translation for the entire pair.",
       "confidence_score": 0.80,
-      "notes": "This is a more literal translation."
+      "notes": "This is a more literal translation of the pair."
     }
   ]
 }
