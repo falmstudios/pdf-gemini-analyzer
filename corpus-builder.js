@@ -83,22 +83,12 @@ async function runCorpusBuilder(textLimit, modelName) {
     addLog(`Starting corpus build process using ${modelName}...`, 'info');
 
     try {
-        // --- NEW: Corrected and Robust Startup Recovery Logic ---
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
-        const { data: resetRows, error: resetError } = await sourceDbClient
-            .from('source_sentences')
-            .update({ 
-                processing_status: 'pending',
-                error_message: null // Also clear the old error message
-            })
-            .in('processing_status', ['processing', 'error']) // Use .in() for multiple values
-            .select('id');
-        
+        const { data: resetRows, error: resetError } = await sourceDbClient.from('source_sentences').update({ processing_status: 'pending', error_message: null }).in('processing_status', ['processing', 'error']).select('id');
         if (resetError) throw new Error(`Failed to reset stale jobs: ${resetError.message}`);
         if (resetRows && resetRows.length > 0) {
             addLog(`Reset ${resetRows.length} stale/errored jobs back to 'pending'.`, 'warning');
         }
-        // --- END OF RECOVERY FIX ---
 
         const { count: existingPendingCount, error: checkError } = await sourceDbClient.from('source_sentences').select('*', { count: 'exact', head: true }).eq('processing_status', 'pending');
         if (checkError) throw new Error(`Failed to check for pending jobs: ${checkError.message}`);
@@ -191,7 +181,6 @@ async function runCorpusBuilder(textLimit, modelName) {
         // --- AI PROCESSING STAGE ---
         processingState.status = 'Processing sentence pairs with AI...';
         let processedCount = 0;
-        
         const totalToProcess = pendingSentences.length;
         if (totalToProcess === 0) {
              addLog('No sentence pairs to process with AI.', 'info');
@@ -201,27 +190,40 @@ async function runCorpusBuilder(textLimit, modelName) {
         addLog(`Using daily API budget of ${DAILY_API_LIMIT} for ${modelName}.`, 'info');
         let requestsMadeThisRun = 0;
 
-        for (const sentence of pendingSentences) {
-            if (requestsMadeThisRun >= DAILY_API_LIMIT) {
-                addLog(`Daily API limit of ${DAILY_API_LIMIT} reached. Stopping gracefully.`, 'warning');
-                break;
+        // --- FIX IS HERE: Process batches of 5, but stagger the calls within the batch ---
+        for (let i = 0; i < totalToProcess; i += 5) {
+            const chunk = pendingSentences.slice(i, i + 5);
+            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
+
+            // Use a simple for...of loop to process one by one within the chunk, with a short delay
+            for (const sentence of chunk) {
+                if (requestsMadeThisRun >= DAILY_API_LIMIT) {
+                    addLog(`Daily API limit of ${DAILY_API_LIMIT} reached. Stopping gracefully.`, 'warning');
+                    // Break out of the inner loop
+                    break; 
+                }
+                
+                try {
+                    await processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples, modelName);
+                    if (!firstPromptPrinted) firstPromptPrinted = true;
+                    requestsMadeThisRun++;
+                } catch (e) {
+                    addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
+                    await sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
+                }
+                
+                processedCount++;
+                processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs. API calls today: ${requestsMadeThisRun}/${DAILY_API_LIMIT}.`;
+                processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
+
+                // A short pause between each request to avoid bursting the API
+                await new Promise(resolve => setTimeout(resolve, 500)); // 0.5-second pause
             }
 
-            addLog(`Processing pair ${processedCount + 1} of ${totalToProcess}...`, 'info');
-            try {
-                await processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples, modelName);
-                if (!firstPromptPrinted) firstPromptPrinted = true;
-                requestsMadeThisRun++;
-            } catch (e) {
-                addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
-                await sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
+            // If we broke out of the inner loop due to the limit, also break out of the outer loop
+            if (requestsMadeThisRun >= DAILY_API_LIMIT) {
+                break;
             }
-            
-            processedCount++;
-            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs. API calls today: ${requestsMadeThisRun}/${DAILY_API_LIMIT}.`;
-            processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
-            
-            await new Promise(resolve => setTimeout(resolve, 1000));
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
@@ -241,6 +243,7 @@ async function runCorpusBuilder(textLimit, modelName) {
 async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples, modelName) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
+    // RunPod can be called quickly
     const runpodResponse = await fetch('https://api.runpod.ai/v2/wyg1vwde9yva0y/runsync', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RUNPOD_API_KEY}` }, body: JSON.stringify({ input: { text: sentence.halunder_sentence, num_alternatives: 3 } }) });
     if (!runpodResponse.ok) throw new Error('RunPod API failed.');
     const runpodData = await runpodResponse.json();
