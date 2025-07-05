@@ -260,10 +260,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
-    // --- NEW: Save multiple rows for the different translation variants ---
     const corpusEntries = [];
-
-    // 1. The main translation for the full pair
     corpusEntries.push({
         source_sentence_id: sentence.id,
         halunder_sentence: geminiResult.corrected_halunder_pair,
@@ -272,8 +269,6 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
         confidence_score: geminiResult.confidence_score,
         notes: geminiResult.notes
     });
-
-    // 2. The translation for the first individual sentence
     if (geminiResult.corrected_sentence_1 && geminiResult.translation_sentence_1) {
         corpusEntries.push({
             source_sentence_id: sentence.id,
@@ -284,8 +279,6 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
             notes: "Individual translation of the first sentence in the pair."
         });
     }
-
-    // 3. The translation for the second individual sentence
     if (geminiResult.corrected_sentence_2 && geminiResult.translation_sentence_2) {
         corpusEntries.push({
             source_sentence_id: sentence.id,
@@ -296,8 +289,6 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
             notes: "Individual translation of the second sentence in the pair."
         });
     }
-
-    // 4. All alternative translations for the full pair
     if (geminiResult.alternative_translations) {
         geminiResult.alternative_translations.forEach(alt => {
             corpusEntries.push({
@@ -325,23 +316,25 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 // === HELPER TO BUILD THE PROMPT (IMPROVED) ===
 function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
-You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence pair, creating a high-quality parallel corpus for machine learning.
+You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to proofread a raw Halunder text for OCR errors and then provide a high-quality, multi-layered German translation.
 
-**PRIMARY GOAL:** Your first and most important task is to correct the **Target Halunder Sentence Pair**. It may contain obvious OCR errors, typos, or misplaced line breaks (like '\\n'). Your translation must be based on this corrected version.
+**TASK 1: PROOFREAD THE HALUNDER TEXT**
+Your first and most important task is to correct the **Target Halunder Sentence Pair**. The source text may contain obvious, non-linguistic errors from scanning.
+- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing, and obvious typos that make a word nonsensical (e.g., "Djanne" -> "Djenne"). Combine hyphenated words that were split across lines.
+- **DO NOT:** Change grammar, word choice, or dialectal spellings. If a word is a valid, albeit archaic, Halunder word, **leave it as is**. Do not "modernize" the text. For example, do not change 'her' to 'har' even if 'har' seems more grammatically correct in the context. Preserve the original's linguistic character.
 
-**INSTRUCTIONS:**
-1.  **Correct the Halunder:** Analyze the **Target Halunder Sentence Pair** and produce a clean, corrected version for the pair and for each individual sentence within it.
-2.  **Translate All Parts:** Provide three distinct translations: one for the entire corrected pair, one for the first corrected sentence, and one for the second corrected sentence.
-3.  **Analyze Context:** Use the **Sentence Context** to understand the surrounding conversation.
-4.  **Review Proposals:** Use the **Machine Translation Proposals** as a starting point, but do not trust them blindly.
-5.  **Consult Dictionaries:** Use the **Dictionary Entries** and **Relevant Linguistic Phrases** to understand literal meanings and idioms.
-6.  **Provide Alternatives:** If valid alternative translations exist for the *entire pair*, include them.
-7.  **Output JSON:** Structure your entire response in the following JSON format ONLY. Do not include any other text.
+**TASK 2: TRANSLATE THE CORRECTED TEXT**
+After proofreading, provide three distinct translations:
+1.  A translation for the **entire corrected pair** as a whole.
+2.  A separate translation for **only the first sentence** within the pair.
+3.  A separate translation for **only the second sentence** within the pair.
+The German translation should sound natural and fluent. Prioritize this over a stiff, literal translation.
 
-**LINGUISTIC NUANCES & GUIDELINES:**
-*   **Vocabulary:** Halunder has a smaller vocabulary. A single Halunder word might map to several German concepts. Choose the most contextually appropriate German word.
-*   **Word Order:** Re-order the German translation to sound completely natural, even if it differs from the Halunder structure.
-*   **Synonyms:** You are encouraged to use accurate German synonyms that fit the context better than a literal translation.
+**TASK 3: PROVIDE ALTERNATIVES**
+If valid alternative translations exist for the *entire pair* (e.g., using different but equally accurate synonyms), include them.
+
+**TASK 4: OUTPUT JSON**
+Structure your entire response in the following JSON format ONLY. Do not include any other text, markdown, or explanations outside the JSON structure.
 
 **INPUT DATA:**
 
@@ -371,7 +364,7 @@ ${JSON.stringify(linguisticExamples, null, 2)}
 **YOUR JSON OUTPUT:**
 \`\`\`json
 {
-  "corrected_halunder_pair": "The full, corrected version of the two sentences joined together.",
+  "corrected_halunder_pair": "The full, corrected version of the two sentences joined together, with only OCR/typo fixes.",
   "corrected_sentence_1": "The corrected version of only the first sentence.",
   "corrected_sentence_2": "The corrected version of only the second sentence (or null if there is no second sentence).",
   "best_translation_pair": "The single best and most natural German translation for the entire corrected pair.",
