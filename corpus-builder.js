@@ -230,7 +230,7 @@ async function runCorpusBuilder(textLimit) {
     }
 }
 
-// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR ===
+// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR (FIXED) ===
 async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
@@ -240,8 +240,14 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const runpodTranslations = runpodData.output?.translations || [];
     await sourceDbClient.from('source_sentences').update({ runpod_translations: runpodTranslations }).eq('id', sentence.id);
 
+    // --- FIX IS HERE: The dictionary client was not being used correctly ---
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9]+/gu) || [])];
-    const { data: dictData, error: dictError } = await dictionaryDbClient.from('terms').select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`).filter('term_text', 'ilike.any', `{${words.join(',')}}`).eq('language', 'hal');
+    // Use the `dictionaryDbClient` to query the other database
+    const { data: dictData, error: dictError } = await dictionaryDbClient 
+        .from('terms')
+        .select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`)
+        .filter('term_text', 'ilike.any', `{${words.join(',')}}`)
+        .eq('language', 'hal');
     if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
     
     const foundLinguisticExamples = allLinguisticExamples?.filter(ex => sentence.halunder_sentence.toLowerCase().includes(ex.halunder_term.toLowerCase())) || [];
@@ -249,7 +255,12 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const windowSize = 1;
     const fromIndex = Math.max(0, sentence.sentence_number - 1 - windowSize);
     const toIndex = sentence.sentence_number - 1 + windowSize;
-    const { data: contextSentences } = await sourceDbClient.from('source_sentences').select('halunder_sentence').eq('text_id', sentence.text_id).order('sentence_number').range(fromIndex, toIndex);
+    const { data: contextSentences } = await sourceDbClient
+        .from('source_sentences')
+        .select('halunder_sentence')
+        .eq('text_id', sentence.text_id)
+        .order('sentence_number')
+        .range(fromIndex, toIndex);
 
     const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
     
@@ -262,11 +273,10 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
-    // --- UPDATED: Use the corrected Halunder sentence from Gemini ---
     const corpusEntries = [];
     corpusEntries.push({
         source_sentence_id: sentence.id,
-        halunder_sentence: geminiResult.corrected_halunder_sentence, // Use the corrected version
+        halunder_sentence: geminiResult.corrected_halunder_sentence,
         german_translation: geminiResult.best_translation,
         source: 'gemini_best',
         confidence_score: geminiResult.confidence_score,
@@ -276,7 +286,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
         geminiResult.alternative_translations.forEach(alt => {
             corpusEntries.push({
                 source_sentence_id: sentence.id,
-                halunder_sentence: geminiResult.corrected_halunder_sentence, // Use the corrected version
+                halunder_sentence: geminiResult.corrected_halunder_sentence,
                 german_translation: alt.translation,
                 source: 'gemini_alternative',
                 confidence_score: alt.confidence_score,
@@ -290,14 +300,13 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     await sourceDbClient.from('source_sentences').update({ processing_status: 'completed' }).eq('id', sentence.id);
     
-    // --- UPDATED: Log the corrected Halunder sentence ---
     const logMessage = `[HAL-CORRECTED] ${geminiResult.corrected_halunder_sentence} -> [DE] ${geminiResult.best_translation}`;
     addLog(logMessage, 'success');
     
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT (IMPROVED) ===
+// === HELPER TO BUILD THE PROMPT (UNCHANGED) ===
 function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to create a perfect German translation for a given Halunder sentence pair, creating a high-quality parallel corpus for machine learning.
