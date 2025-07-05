@@ -13,9 +13,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (startBtn.disabled) return;
 
         const limit = textLimitInput.value;
-        // --- NEW: Get the selected model's value ---
-        const selectedModel = document.querySelector('input[name="gemini-model"]:checked').value;
-        
         startBtn.disabled = true;
         startBtn.textContent = 'Processing...';
 
@@ -23,13 +20,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/corpus/start-processing', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                // --- NEW: Send the selected model to the backend ---
-                body: JSON.stringify({ limit, model: selectedModel })
+                body: JSON.stringify({ limit }) // No longer sending a model
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error);
             
-            progressInterval = setInterval(updateProgress, 1000);
+            progressInterval = setInterval(updateProgress, 2000); // Poll every 2 seconds
         } catch (error) {
             alert(`Error starting process: ${error.message}`);
             resetUI();
