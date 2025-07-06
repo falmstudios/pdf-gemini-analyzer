@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Corpus Builder</title>
-    <link rel="stylesheet" href="dictionary-styles.css"> <!-- Reusing styles -->
+    <link rel="stylesheet" href="dictionary-styles.css">
     <style>
         .progress-bar-container { background-color: #e0e0e0; border-radius: 4px; overflow: hidden; }
         .progress-bar { height: 20px; background-color: #4caf50; width: 0%; transition: width 0.4s ease-in-out; text-align: center; color: white; font-weight: bold;}
@@ -13,22 +13,36 @@
         .log-entry.error { color: #ff6b6b; }
         .log-entry.success { color: #69f0ae; }
         .log-entry.warning { color: #ffd54f; }
+        .button-group { display: flex; gap: 10px; align-items: center; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>AI Parallel Corpus Builder (Gemini 2.5 Pro)</h1>
+            <h1>AI Parallel Corpus Builder</h1>
             <a href="/" class="back-link">← Back to Home</a>
         </div>
         <div class="main-content">
             <div class="info-panel">
-                <h2>Start Processing</h2>
-                <p>This tool will fetch pending texts, segment them, and use Gemini 2.5 Pro to generate high-quality German translations.</p>
+                <h2>Control Panel</h2>
+                <p>Use the buttons below to manage the corpus generation process.</p>
                 
-                <label for="text-limit">Number of texts to process in this batch:</label>
-                <input type="number" id="text-limit" value="5" min="1" max="500" style="width: 100px; padding: 5px; margin-right: 10px;">
-                <button id="start-btn" class="primary-btn">Start Batch</button>
+                <hr>
+                
+                <h4>1. Process a Small Batch (with AI)</h4>
+                <p>Process a limited number of new texts from start to finish.</p>
+                <div class="button-group">
+                    <label for="text-limit">Number of texts:</label>
+                    <input type="number" id="text-limit" value="5" min="1" max="500" style="width: 100px; padding: 5px;">
+                    <button id="start-btn" class="primary-btn">Start AI Batch</button>
+                </div>
+
+                <hr style="margin-top: 20px;">
+
+                <h4>2. Prepare All Remaining Texts (No AI)</h4>
+                <p>This will scan ALL remaining texts and prepare the sentence pairs, but will NOT call the AI. Use this once to see the total number of sentence pairs.</p>
+                <button id="prepare-btn" class="secondary-btn">Prepare All Texts</button>
+
             </div>
 
             <div class="status-panel">
