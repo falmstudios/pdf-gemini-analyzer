@@ -71,12 +71,87 @@ async function callGemini_2_5_Pro(prompt) {
     }
 }
 
-// === THE MAIN PROCESSING FUNCTION ===
+// === NEW: PREPARATION-ONLY FUNCTION ===
+async function runPreparationOnly() {
+    processingState = { isProcessing: true, progress: 0, status: 'Starting Preparation...', details: '', logs: [], startTime: Date.now() };
+    addLog(`Starting PREPARATION ONLY process. This will not use the AI.`, 'info');
+
+    try {
+        let textsProcessed = 0;
+        const textBatchSize = 50; // Process texts in chunks to avoid memory issues
+        
+        while(true) {
+            addLog(`Fetching next batch of ${textBatchSize} texts...`, 'info');
+            const { data: texts, error: fetchError } = await sourceDbClient
+                .from('texts')
+                .select('id, complete_helgolandic_text')
+                .or('review_status.eq.pending,review_status.eq.halunder_only')
+                .limit(textBatchSize);
+            
+            if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
+            if (!texts || texts.length === 0) {
+                addLog('No more new texts found to prepare.', 'success');
+                break; // Exit the loop
+            }
+
+            textsProcessed += texts.length;
+            processingState.status = `Preparing texts...`;
+            processingState.details = `Prepared ${textsProcessed} texts so far.`;
+            addLog(`Found ${texts.length} texts in this batch. Extracting sentence pairs...`, 'info');
+
+            const allSentencePairsToInsert = [];
+            for (const text of texts) {
+                const initialSegments = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+/g) || [];
+                const finalSentences = [];
+                let sentenceBuffer = [];
+                for (const segment of initialSegments) {
+                    sentenceBuffer.push(segment.trim());
+                    const currentBufferString = sentenceBuffer.join(' ');
+                    if (currentBufferString.trim().split(/\s+/).length >= 5) {
+                        finalSentences.push(currentBufferString);
+                        sentenceBuffer = [];
+                    }
+                }
+                if (sentenceBuffer.length > 0) {
+                    const leftoverString = sentenceBuffer.join(' ');
+                    if (finalSentences.length > 0) finalSentences[finalSentences.length - 1] += ' ' + leftoverString;
+                    else finalSentences.push(leftoverString);
+                }
+                for (let i = 0; i < finalSentences.length; i += 2) {
+                    let sentencePair = finalSentences[i];
+                    if (finalSentences[i + 1]) sentencePair += ' ' + finalSentences[i + 1];
+                    allSentencePairsToInsert.push({ text_id: text.id, sentence_number: i + 1, halunder_sentence: sentencePair.trim() });
+                }
+                await sourceDbClient.from('texts').update({ review_status: 'processing_halunder_only' }).eq('id', text.id);
+            }
+
+            if (allSentencePairsToInsert.length > 0) {
+                addLog(`Inserting ${allSentencePairsToInsert.length} new sentence pairs into the database...`, 'info');
+                const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentencePairsToInsert);
+                if (insertError) throw new Error(`Failed to insert sentence chunk: ${insertError.message}`);
+            }
+        }
+
+        const { count } = await sourceDbClient.from('source_sentences').select('*', { count: 'exact', head: true });
+        addLog(`Preparation complete. Total sentence pairs in queue: ${count}`, 'success');
+        processingState.status = 'Preparation Complete';
+        processingState.details = `Total sentence pairs in queue: ${count}`;
+        
+    } catch (error) {
+        addLog(`A critical error occurred during preparation: ${error.message}`, 'error');
+        processingState.status = 'Error';
+        throw error;
+    } finally {
+        processingState.isProcessing = false;
+    }
+}
+
+// === THE MAIN AI PROCESSING FUNCTION ===
 async function runCorpusBuilder(textLimit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
     let allLinguisticExamples = [];
-    addLog(`Starting corpus build process using Gemini 2.5 Pro...`, 'info');
+    addLog(`Starting AI corpus build process using Gemini 2.5 Pro...`, 'info');
 
     try {
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
@@ -261,44 +336,16 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const geminiResult = await callGemini_2_5_Pro(prompt);
 
     const corpusEntries = [];
-    corpusEntries.push({
-        source_sentence_id: sentence.id,
-        halunder_sentence: geminiResult.corrected_halunder_pair,
-        german_translation: geminiResult.best_translation_pair,
-        source: 'gemini_best_pair',
-        confidence_score: geminiResult.confidence_score,
-        notes: geminiResult.notes
-    });
+    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_pair, german_translation: geminiResult.best_translation_pair, source: 'gemini_best_pair', confidence_score: geminiResult.confidence_score, notes: geminiResult.notes });
     if (geminiResult.corrected_sentence_1 && geminiResult.translation_sentence_1) {
-        corpusEntries.push({
-            source_sentence_id: sentence.id,
-            halunder_sentence: geminiResult.corrected_sentence_1,
-            german_translation: geminiResult.translation_sentence_1,
-            source: 'gemini_best_sentence1',
-            confidence_score: geminiResult.confidence_score,
-            notes: "Individual translation of the first sentence in the pair."
-        });
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_sentence_1, german_translation: geminiResult.translation_sentence_1, source: 'gemini_best_sentence1', confidence_score: geminiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
     }
     if (geminiResult.corrected_sentence_2 && geminiResult.translation_sentence_2) {
-        corpusEntries.push({
-            source_sentence_id: sentence.id,
-            halunder_sentence: geminiResult.corrected_sentence_2,
-            german_translation: geminiResult.translation_sentence_2,
-            source: 'gemini_best_sentence2',
-            confidence_score: geminiResult.confidence_score,
-            notes: "Individual translation of the second sentence in the pair."
-        });
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_sentence_2, german_translation: geminiResult.translation_sentence_2, source: 'gemini_best_sentence2', confidence_score: geminiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
     }
     if (geminiResult.alternative_translations) {
         geminiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({
-                source_sentence_id: sentence.id,
-                halunder_sentence: geminiResult.corrected_halunder_pair,
-                german_translation: alt.translation,
-                source: 'gemini_alternative_pair',
-                confidence_score: alt.confidence_score,
-                notes: alt.notes
-            });
+            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'gemini_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
         });
     }
 
@@ -313,7 +360,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT (IMPROVED) ===
+// === HELPER TO BUILD THE PROMPT ===
 function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to proofread a raw Halunder text for OCR errors and then provide a high-quality, multi-layered German translation.
