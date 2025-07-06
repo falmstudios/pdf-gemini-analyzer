@@ -78,7 +78,7 @@ async function runPreparationOnly() {
 
     try {
         let textsProcessed = 0;
-        const textBatchSize = 50; // Process texts in chunks to avoid memory issues
+        const textBatchSize = 50;
         
         while(true) {
             addLog(`Fetching next batch of ${textBatchSize} texts...`, 'info');
@@ -91,7 +91,7 @@ async function runPreparationOnly() {
             if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
             if (!texts || texts.length === 0) {
                 addLog('No more new texts found to prepare.', 'success');
-                break; // Exit the loop
+                break;
             }
 
             textsProcessed += texts.length;
@@ -145,6 +145,7 @@ async function runPreparationOnly() {
         processingState.isProcessing = false;
     }
 }
+
 
 // === THE MAIN AI PROCESSING FUNCTION ===
 async function runCorpusBuilder(textLimit) {
@@ -441,6 +442,16 @@ router.post('/start-processing', (req, res) => {
         console.error("Caught unhandled error in corpus builder:", err);
     });
     res.json({ success: true, message: `Processing started for up to ${limit} texts using Gemini 2.5 Pro.` });
+});
+
+router.post('/prepare-all-texts', (req, res) => {
+    if (processingState.isProcessing) {
+        return res.status(400).json({ error: 'Processing is already in progress.' });
+    }
+    runPreparationOnly().catch(err => {
+        console.error("Caught unhandled error in preparation:", err);
+    });
+    res.json({ success: true, message: `Preparation of all remaining texts has started.` });
 });
 
 router.get('/progress', (req, res) => {
