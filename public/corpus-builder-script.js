@@ -1,5 +1,6 @@
 document.addEventListener('DOMContentLoaded', () => {
     const startBtn = document.getElementById('start-btn');
+    const prepareBtn = document.getElementById('prepare-btn'); // New button
     const textLimitInput = document.getElementById('text-limit');
     const statusText = document.getElementById('status-text');
     const detailsText = document.getElementById('details-text');
@@ -7,27 +8,55 @@ document.addEventListener('DOMContentLoaded', () => {
     const logContainer = document.getElementById('log-container');
     let progressInterval;
 
-    startBtn.addEventListener('click', startProcessing);
+    startBtn.addEventListener('click', startAiProcessing);
+    prepareBtn.addEventListener('click', startPreparation); // New event listener
 
-    async function startProcessing() {
-        if (startBtn.disabled) return;
-
-        const limit = textLimitInput.value;
+    function disableButtons() {
         startBtn.disabled = true;
+        prepareBtn.disabled = true;
         startBtn.textContent = 'Processing...';
+        prepareBtn.textContent = 'Processing...';
+    }
 
+    function resetUI() {
+        startBtn.disabled = false;
+        prepareBtn.disabled = false;
+        startBtn.textContent = 'Start AI Batch';
+        prepareBtn.textContent = 'Prepare All Texts';
+    }
+
+    async function startAiProcessing() {
+        if (startBtn.disabled) return;
+        disableButtons();
+        
+        const limit = textLimitInput.value;
         try {
             const response = await fetch('/corpus/start-processing', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ limit }) // No longer sending a model
+                body: JSON.stringify({ limit })
             });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error);
-            
-            progressInterval = setInterval(updateProgress, 2000); // Poll every 2 seconds
+            if (!response.ok) { const data = await response.json(); throw new Error(data.error); }
+            progressInterval = setInterval(updateProgress, 2000);
         } catch (error) {
             alert(`Error starting process: ${error.message}`);
+            resetUI();
+        }
+    }
+
+    async function startPreparation() {
+        if (prepareBtn.disabled) return;
+        if (!confirm("This will prepare ALL remaining texts. This may take a while but will not use your AI budget. Continue?")) {
+            return;
+        }
+        disableButtons();
+        
+        try {
+            const response = await fetch('/corpus/prepare-all-texts', { method: 'POST' });
+            if (!response.ok) { const data = await response.json(); throw new Error(data.error); }
+            progressInterval = setInterval(updateProgress, 2000);
+        } catch (error) {
+            alert(`Error starting preparation: ${error.message}`);
             resetUI();
         }
     }
@@ -65,11 +94,6 @@ document.addEventListener('DOMContentLoaded', () => {
             `<div class="log-entry ${log.type}">${new Date(log.timestamp).toLocaleTimeString()} - ${log.message}</div>`
         ).join('');
         logContainer.scrollTop = logContainer.scrollHeight;
-    }
-
-    function resetUI() {
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start Batch';
     }
     
     updateProgress();
