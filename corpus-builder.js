@@ -41,8 +41,7 @@ async function callOpenAI_Api(prompt) {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    // --- THE ONLY CHANGE IS HERE ---
-                    model: "gpt-4.1-2025-04-14", // Using the full, powerful gpt-4.1 model
+                    model: "gpt-4.1-2025-04-14",
                     messages: [
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
@@ -192,30 +191,23 @@ async function runCorpusBuilder(textLimit) {
 
         addLog(`Using model gpt-4.1. Rate limits are high, daily budget check is removed.`, 'info');
 
-        for (let i = 0; i < totalToProcess; i += 5) {
-            const chunk = pendingSentences.slice(i, i + 5);
-            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
-
-            const processingPromises = chunk.map((sentence, index) => {
-                return new Promise(resolve => setTimeout(resolve, index * 200))
-                    .then(() => processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples))
-                    .then(promptWasPrinted => {
-                        if (promptWasPrinted) firstPromptPrinted = true;
-                    }).catch(e => {
-                        addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
-                        return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
-                    });
-            });
-
-            await Promise.all(processingPromises);
-
-            processedCount += chunk.length;
+        // --- NEW: Process one by one with a consistent, gentle pause ---
+        for (const sentence of pendingSentences) {
+            addLog(`Processing pair ${processedCount + 1} of ${totalToProcess}...`, 'info');
+            try {
+                await processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples);
+                if (!firstPromptPrinted) firstPromptPrinted = true;
+            } catch (e) {
+                addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
+                await sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
+            }
+            
+            processedCount++;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
             
-            if (i + 5 < totalToProcess) {
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
+            // A consistent pause between each API call to avoid any bursting.
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 1-second pause
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
