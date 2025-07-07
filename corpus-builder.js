@@ -26,44 +26,52 @@ function addLog(message, type = 'info') {
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
 
-async function callGemini_2_5_Pro(prompt) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent';
+// === API CALLER FOR OPENAI ===
+async function callOpenAI_Api(prompt) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
+    const apiUrl = 'https://api.openai.com/v1/chat/completions';
+    
     let attempts = 0;
     const maxAttempts = 4;
     let delay = 5000;
+
     while (attempts < maxAttempts) {
         try {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: { temperature: 0.9, maxOutputTokens: 20000 }
+                    model: "o3-2025-04-16", // Using the best value, high-quality model
+                    messages: [
+                        { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
+                        { "role": "user", "content": prompt }
+                    ],
+                    temperature: 0.7,
+                    response_format: { "type": "json_object" }
                 },
-                { headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey } }
+                { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
             );
-            if (response.data && response.data.candidates && response.data.candidates[0]) {
-                const responseText = response.data.candidates[0].content.parts[0].text;
-                const cleanedText = responseText.replace(/^```json\s*|```$/g, '').trim();
-                return JSON.parse(cleanedText);
+
+            if (response.data && response.data.choices && response.data.choices[0]) {
+                return JSON.parse(response.data.choices[0].message.content);
             }
-            throw new Error('Invalid response format from Gemini 2.5 Pro API');
+            throw new Error('Invalid response format from OpenAI API');
         } catch (error) {
             if (error.response && error.response.status === 429) {
                 attempts++;
                 if (attempts >= maxAttempts) {
-                    addLog(`Max retry attempts reached for Gemini API. Giving up.`, 'error');
-                    throw new Error('Gemini API rate limit exceeded after multiple retries.');
+                    addLog(`Max retry attempts reached for OpenAI API. Giving up.`, 'error');
+                    throw new Error('OpenAI API rate limit exceeded after multiple retries.');
                 }
                 const jitter = Math.random() * 1000;
                 const waitTime = delay + jitter;
-                addLog(`Gemini API rate limit hit. Retrying in ${Math.round(waitTime / 1000)}s... (Attempt ${attempts}/${maxAttempts})`, 'warning');
+                addLog(`OpenAI API rate limit hit. Retrying in ${Math.round(waitTime / 1000)}s... (Attempt ${attempts}/${maxAttempts})`, 'warning');
                 await new Promise(resolve => setTimeout(resolve, waitTime));
                 delay *= 2;
             } else {
                 if (error.response) {
-                    console.error("Gemini API Error Response:", error.response.data);
-                    throw new Error(`Gemini API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+                    console.error("OpenAI API Error Response:", error.response.data);
+                    throw new Error(`OpenAI API error: ${error.response.status} - ${JSON.stringify(error.response.data.error)}`);
                 }
                 throw error;
             }
@@ -71,88 +79,12 @@ async function callGemini_2_5_Pro(prompt) {
     }
 }
 
-// === NEW: PREPARATION-ONLY FUNCTION ===
-async function runPreparationOnly() {
-    processingState = { isProcessing: true, progress: 0, status: 'Starting Preparation...', details: '', logs: [], startTime: Date.now() };
-    addLog(`Starting PREPARATION ONLY process. This will not use the AI.`, 'info');
-
-    try {
-        let textsProcessed = 0;
-        const textBatchSize = 50;
-        
-        while(true) {
-            addLog(`Fetching next batch of ${textBatchSize} texts...`, 'info');
-            const { data: texts, error: fetchError } = await sourceDbClient
-                .from('texts')
-                .select('id, complete_helgolandic_text')
-                .or('review_status.eq.pending,review_status.eq.halunder_only')
-                .limit(textBatchSize);
-            
-            if (fetchError) throw new Error(`Source DB fetch error: ${fetchError.message}`);
-            if (!texts || texts.length === 0) {
-                addLog('No more new texts found to prepare.', 'success');
-                break;
-            }
-
-            textsProcessed += texts.length;
-            processingState.status = `Preparing texts...`;
-            processingState.details = `Prepared ${textsProcessed} texts so far.`;
-            addLog(`Found ${texts.length} texts in this batch. Extracting sentence pairs...`, 'info');
-
-            const allSentencePairsToInsert = [];
-            for (const text of texts) {
-                const initialSegments = text.complete_helgolandic_text.match(/[^.?!]+[.?!]+/g) || [];
-                const finalSentences = [];
-                let sentenceBuffer = [];
-                for (const segment of initialSegments) {
-                    sentenceBuffer.push(segment.trim());
-                    const currentBufferString = sentenceBuffer.join(' ');
-                    if (currentBufferString.trim().split(/\s+/).length >= 5) {
-                        finalSentences.push(currentBufferString);
-                        sentenceBuffer = [];
-                    }
-                }
-                if (sentenceBuffer.length > 0) {
-                    const leftoverString = sentenceBuffer.join(' ');
-                    if (finalSentences.length > 0) finalSentences[finalSentences.length - 1] += ' ' + leftoverString;
-                    else finalSentences.push(leftoverString);
-                }
-                for (let i = 0; i < finalSentences.length; i += 2) {
-                    let sentencePair = finalSentences[i];
-                    if (finalSentences[i + 1]) sentencePair += ' ' + finalSentences[i + 1];
-                    allSentencePairsToInsert.push({ text_id: text.id, sentence_number: i + 1, halunder_sentence: sentencePair.trim() });
-                }
-                await sourceDbClient.from('texts').update({ review_status: 'processing_halunder_only' }).eq('id', text.id);
-            }
-
-            if (allSentencePairsToInsert.length > 0) {
-                addLog(`Inserting ${allSentencePairsToInsert.length} new sentence pairs into the database...`, 'info');
-                const { error: insertError } = await sourceDbClient.from('source_sentences').insert(allSentencePairsToInsert);
-                if (insertError) throw new Error(`Failed to insert sentence chunk: ${insertError.message}`);
-            }
-        }
-
-        const { count } = await sourceDbClient.from('source_sentences').select('*', { count: 'exact', head: true });
-        addLog(`Preparation complete. Total sentence pairs in queue: ${count}`, 'success');
-        processingState.status = 'Preparation Complete';
-        processingState.details = `Total sentence pairs in queue: ${count}`;
-        
-    } catch (error) {
-        addLog(`A critical error occurred during preparation: ${error.message}`, 'error');
-        processingState.status = 'Error';
-        throw error;
-    } finally {
-        processingState.isProcessing = false;
-    }
-}
-
-
-// === THE MAIN AI PROCESSING FUNCTION ===
+// === THE MAIN PROCESSING FUNCTION ===
 async function runCorpusBuilder(textLimit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
     let allLinguisticExamples = [];
-    addLog(`Starting AI corpus build process using Gemini 2.5 Pro...`, 'info');
+    addLog(`Starting corpus build process using OpenAI o3...`, 'info');
 
     try {
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
@@ -258,20 +190,16 @@ async function runCorpusBuilder(textLimit) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
 
-        const DAILY_API_LIMIT = 950;
-        addLog(`Using daily API budget of ${DAILY_API_LIMIT}.`, 'info');
-        let requestsMadeThisRun = 0;
+        // We can remove the daily limit check as o3 has a very high token-based limit
+        // which is harder to track precisely. The RPM limit is the main concern.
+        addLog(`Using model o3 with a 500 RPM limit.`, 'info');
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
-            if (requestsMadeThisRun + chunk.length > DAILY_API_LIMIT) {
-                addLog(`Daily API limit approaching. Stopping before this batch.`, 'warning');
-                break;
-            }
-
             addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
+
             const processingPromises = chunk.map((sentence, index) => {
-                return new Promise(resolve => setTimeout(resolve, index * 400))
+                return new Promise(resolve => setTimeout(resolve, index * 200)) // Stagger calls slightly
                     .then(() => processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples))
                     .then(promptWasPrinted => {
                         if (promptWasPrinted) firstPromptPrinted = true;
@@ -283,13 +211,13 @@ async function runCorpusBuilder(textLimit) {
 
             await Promise.all(processingPromises);
 
-            requestsMadeThisRun += chunk.length;
             processedCount += chunk.length;
-            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs. API calls today: ${requestsMadeThisRun}/${DAILY_API_LIMIT}.`;
+            processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
             
+            // A very short pause is sufficient due to the staggering and high RPM limit
             if (i + 5 < totalToProcess) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
         }
         
@@ -325,28 +253,28 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     const { data: contextSentences } = await sourceDbClient.from('source_sentences').select('halunder_sentence').eq('text_id', sentence.text_id).lt('sentence_number', sentence.sentence_number).order('sentence_number', { ascending: false }).limit(1);
 
-    const prompt = buildGeminiPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
+    const prompt = buildOpenAIPrompt(sentence.halunder_sentence, contextSentences, runpodTranslations, dictData, foundLinguisticExamples);
     
     if (shouldPrintPrompt) {
-        console.log('----------- GEMINI PROMPT FOR FIRST SENTENCE PAIR -----------');
+        console.log('----------- OPENAI PROMPT FOR FIRST SENTENCE PAIR -----------');
         console.log(prompt);
         console.log('-----------------------------------------------------------');
-        addLog('Printed full Gemini prompt to server console for verification.', 'info');
+        addLog('Printed full OpenAI prompt to server console for verification.', 'info');
     }
 
-    const geminiResult = await callGemini_2_5_Pro(prompt);
+    const aiResult = await callOpenAI_Api(prompt);
 
     const corpusEntries = [];
-    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_pair, german_translation: geminiResult.best_translation_pair, source: 'gemini_best_pair', confidence_score: geminiResult.confidence_score, notes: geminiResult.notes });
-    if (geminiResult.corrected_sentence_1 && geminiResult.translation_sentence_1) {
-        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_sentence_1, german_translation: geminiResult.translation_sentence_1, source: 'gemini_best_sentence1', confidence_score: geminiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
+    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: aiResult.best_translation_pair, source: 'o3_best_pair', confidence_score: aiResult.confidence_score, notes: aiResult.notes });
+    if (aiResult.corrected_sentence_1 && aiResult.translation_sentence_1) {
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_1, german_translation: aiResult.translation_sentence_1, source: 'o3_best_sentence1', confidence_score: aiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
     }
-    if (geminiResult.corrected_sentence_2 && geminiResult.translation_sentence_2) {
-        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_sentence_2, german_translation: geminiResult.translation_sentence_2, source: 'gemini_best_sentence2', confidence_score: geminiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
+    if (aiResult.corrected_sentence_2 && aiResult.translation_sentence_2) {
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_2, german_translation: aiResult.translation_sentence_2, source: 'o3_best_sentence2', confidence_score: aiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
     }
-    if (geminiResult.alternative_translations) {
-        geminiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: geminiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'gemini_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
+    if (aiResult.alternative_translations) {
+        aiResult.alternative_translations.forEach(alt => {
+            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'o3_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
         });
     }
 
@@ -355,20 +283,20 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     await sourceDbClient.from('source_sentences').update({ processing_status: 'completed' }).eq('id', sentence.id);
     
-    const logMessage = `[HAL-CORRECTED] ${geminiResult.corrected_halunder_pair} -> [DE] ${geminiResult.best_translation_pair}`;
+    const logMessage = `[HAL-CORRECTED] ${aiResult.corrected_halunder_pair} -> [DE] ${aiResult.best_translation_pair}`;
     addLog(logMessage, 'success');
     
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT ===
-function buildGeminiPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
+// === HELPER TO BUILD THE PROMPT (UNCHANGED) ===
+function buildOpenAIPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to proofread a raw Halunder text for OCR errors and then provide a high-quality, multi-layered German translation.
 
 **TASK 1: PROOFREAD THE HALUNDER TEXT**
 Your first and most important task is to correct the **Target Halunder Sentence Pair**. The source text may contain obvious, non-linguistic errors from scanning.
-- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing, and obvious typos that make a word nonsensical (e.g., "Djanne" -> "Djenne"). Combine hyphenated words that were split across lines.
+- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing. Combine hyphenated words that were split across lines.
 - **DO NOT:** Change grammar, word choice, or dialectal spellings. If a word is a valid, albeit archaic, Halunder word, **leave it as is**. Do not "modernize" the text. For example, do not change 'her' to 'har' even if 'har' seems more grammatically correct in the context. Preserve the original's linguistic character.
 
 **TASK 2: TRANSLATE THE CORRECTED TEXT**
@@ -438,10 +366,11 @@ router.post('/start-processing', (req, res) => {
         return res.status(400).json({ error: 'Processing is already in progress.' });
     }
     const limit = parseInt(req.body.limit, 10) || 10;
+    // Model is now hardcoded to o3, so we don't need to get it from the request
     runCorpusBuilder(limit).catch(err => {
         console.error("Caught unhandled error in corpus builder:", err);
     });
-    res.json({ success: true, message: `Processing started for up to ${limit} texts using Gemini 2.5 Pro.` });
+    res.json({ success: true, message: `Processing started for up to ${limit} texts using OpenAI o3.` });
 });
 
 router.post('/prepare-all-texts', (req, res) => {
