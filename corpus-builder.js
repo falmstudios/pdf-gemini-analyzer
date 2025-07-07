@@ -189,25 +189,35 @@ async function runCorpusBuilder(textLimit) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
 
-        addLog(`Using model gpt-4.1. Rate limits are high, daily budget check is removed.`, 'info');
+        addLog(`Using model gpt-4.1. Rate limits are high.`, 'info');
 
-        // --- NEW: Process one by one with a consistent, gentle pause ---
-        for (const sentence of pendingSentences) {
-            addLog(`Processing pair ${processedCount + 1} of ${totalToProcess}...`, 'info');
-            try {
-                await processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples);
-                if (!firstPromptPrinted) firstPromptPrinted = true;
-            } catch (e) {
-                addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
-                await sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
-            }
-            
-            processedCount++;
+        // --- NEW: Staggered Parallel Processing Logic ---
+        for (let i = 0; i < totalToProcess; i += 5) {
+            const chunk = pendingSentences.slice(i, i + 5);
+            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
+
+            const processingPromises = chunk.map((sentence, index) => {
+                // Stagger the start of each promise to avoid bursting the API
+                return new Promise(resolve => setTimeout(resolve, index * 200)) // Stagger by 200ms
+                    .then(() => processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples))
+                    .then(promptWasPrinted => {
+                        if (promptWasPrinted) firstPromptPrinted = true;
+                    }).catch(e => {
+                        addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
+                        return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
+                    });
+            });
+
+            await Promise.all(processingPromises);
+
+            processedCount += chunk.length;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
             
-            // A consistent pause between each API call to avoid any bursting.
-            await new Promise(resolve => setTimeout(resolve, 1000)); // 1-second pause
+            // A short, polite pause after each full batch completes
+            if (i + 5 < totalToProcess) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
