@@ -26,7 +26,7 @@ function addLog(message, type = 'info') {
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === API CALLER FOR OPENAI ===
+// === API CALLER FOR OPENAI (FIXED) ===
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
@@ -41,12 +41,12 @@ async function callOpenAI_Api(prompt) {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    model: "o3-2025-04-16", // Using the best value, high-quality model
+                    model: "o3-2025-04-16",
                     messages: [
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    temperature: 0.7,
+                    // temperature: 0.7, // <-- THIS LINE IS REMOVED
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -189,9 +189,7 @@ async function runCorpusBuilder(textLimit) {
         if (totalToProcess === 0) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
-
-        // We can remove the daily limit check as o3 has a very high token-based limit
-        // which is harder to track precisely. The RPM limit is the main concern.
+        
         addLog(`Using model o3 with a 500 RPM limit.`, 'info');
 
         for (let i = 0; i < totalToProcess; i += 5) {
@@ -199,7 +197,7 @@ async function runCorpusBuilder(textLimit) {
             addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
 
             const processingPromises = chunk.map((sentence, index) => {
-                return new Promise(resolve => setTimeout(resolve, index * 200)) // Stagger calls slightly
+                return new Promise(resolve => setTimeout(resolve, index * 200))
                     .then(() => processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples))
                     .then(promptWasPrinted => {
                         if (promptWasPrinted) firstPromptPrinted = true;
@@ -215,7 +213,6 @@ async function runCorpusBuilder(textLimit) {
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
             
-            // A very short pause is sufficient due to the staggering and high RPM limit
             if (i + 5 < totalToProcess) {
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
@@ -296,7 +293,7 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 
 **TASK 1: PROOFREAD THE HALUNDER TEXT**
 Your first and most important task is to correct the **Target Halunder Sentence Pair**. The source text may contain obvious, non-linguistic errors from scanning.
-- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing. Combine hyphenated words that were split across lines.
+- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing, and obvious typos that make a word nonsensical (e.g., "Djanne" -> "Djenne"). Combine hyphenated words that were split across lines.
 - **DO NOT:** Change grammar, word choice, or dialectal spellings. If a word is a valid, albeit archaic, Halunder word, **leave it as is**. Do not "modernize" the text. For example, do not change 'her' to 'har' even if 'har' seems more grammatically correct in the context. Preserve the original's linguistic character.
 
 **TASK 2: TRANSLATE THE CORRECTED TEXT**
@@ -366,7 +363,6 @@ router.post('/start-processing', (req, res) => {
         return res.status(400).json({ error: 'Processing is already in progress.' });
     }
     const limit = parseInt(req.body.limit, 10) || 10;
-    // Model is now hardcoded to o3, so we don't need to get it from the request
     runCorpusBuilder(limit).catch(err => {
         console.error("Caught unhandled error in corpus builder:", err);
     });
