@@ -26,7 +26,7 @@ function addLog(message, type = 'info') {
     console.log(`[CORPUS-BUILDER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === API CALLER FOR OPENAI (FIXED) ===
+// === API CALLER FOR OPENAI ===
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
@@ -41,12 +41,12 @@ async function callOpenAI_Api(prompt) {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    model: "o3-2025-04-16",
+                    // --- THE ONLY CHANGE IS HERE ---
+                    model: "gpt-4.1-2025-04-14", // Using the full, powerful gpt-4.1 model
                     messages: [
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    // temperature: 0.7, // <-- THIS LINE IS REMOVED
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -84,7 +84,7 @@ async function runCorpusBuilder(textLimit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
     let allLinguisticExamples = [];
-    addLog(`Starting corpus build process using OpenAI o3...`, 'info');
+    addLog(`Starting corpus build process using OpenAI gpt-4.1...`, 'info');
 
     try {
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
@@ -189,8 +189,8 @@ async function runCorpusBuilder(textLimit) {
         if (totalToProcess === 0) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
-        
-        addLog(`Using model o3 with a 500 RPM limit.`, 'info');
+
+        addLog(`Using model gpt-4.1. Rate limits are high, daily budget check is removed.`, 'info');
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
@@ -262,16 +262,16 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const aiResult = await callOpenAI_Api(prompt);
 
     const corpusEntries = [];
-    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: aiResult.best_translation_pair, source: 'o3_best_pair', confidence_score: aiResult.confidence_score, notes: aiResult.notes });
+    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: aiResult.best_translation_pair, source: 'gpt-4.1_best_pair', confidence_score: aiResult.confidence_score, notes: aiResult.notes });
     if (aiResult.corrected_sentence_1 && aiResult.translation_sentence_1) {
-        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_1, german_translation: aiResult.translation_sentence_1, source: 'o3_best_sentence1', confidence_score: aiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_1, german_translation: aiResult.translation_sentence_1, source: 'gpt-4.1_best_sentence1', confidence_score: aiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
     }
     if (aiResult.corrected_sentence_2 && aiResult.translation_sentence_2) {
-        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_2, german_translation: aiResult.translation_sentence_2, source: 'o3_best_sentence2', confidence_score: aiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_2, german_translation: aiResult.translation_sentence_2, source: 'gpt-4.1_best_sentence2', confidence_score: aiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
     }
     if (aiResult.alternative_translations) {
         aiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'o3_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
+            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'gpt-4.1_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
         });
     }
 
@@ -366,7 +366,7 @@ router.post('/start-processing', (req, res) => {
     runCorpusBuilder(limit).catch(err => {
         console.error("Caught unhandled error in corpus builder:", err);
     });
-    res.json({ success: true, message: `Processing started for up to ${limit} texts using OpenAI o3.` });
+    res.json({ success: true, message: `Processing started for up to ${limit} texts using OpenAI gpt-4.1.` });
 });
 
 router.post('/prepare-all-texts', (req, res) => {
