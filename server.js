@@ -14,8 +14,6 @@ const PORT = process.env.PORT || 8080;
 // === ROUTE REQUIRES ===
 const dictionaryRoutes = require('./dictionary-routes.js');
 const linguisticRoutes = require('./linguistic-routes.js');
-// In server.js, near your other route requires
-const migrationRoutes = require('./migration-routes.js');
 const translatorRoutes = require('./translator-routes.js');
 // Add this for the new Corpus Builder feature
 const corpusBuilderRoutes = require('./corpus-builder.js');
@@ -48,7 +46,6 @@ app.use(express.static('public'));
 // === API ROUTES ===
 app.use('/linguistic', linguisticRoutes);
 app.use('/dictionary', dictionaryRoutes);
-app.use('/migration', migrationRoutes);
 app.use('/translator', translatorRoutes);
 // Add this for the new Corpus Builder feature
 app.use('/corpus', corpusBuilderRoutes);
@@ -76,10 +73,6 @@ app.get('/corpus-builder', (req, res) => {
 });
 app.get('/dictionary-cleaner', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'dictionary-cleaner.html'));
-});
-// ... (where your other app.get lines for pages are) ...
-app.get('/migration', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'migration.html'));
 });
 
 // Health check route
