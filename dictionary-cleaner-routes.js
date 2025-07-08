@@ -4,7 +4,6 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
-// This client connects to your SOURCE database where all the tables for this process exist.
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -40,12 +39,11 @@ async function callOpenAI_Api(prompt) {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    model: "o3-2025-04-16",
+                    model: "gpt-4.1-2025-04-14",
                     messages: [
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    // temperature is removed as the model does not support it
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -85,7 +83,6 @@ async function runDictionaryCleaner(limit) {
     addLog(`Starting Dictionary Example Cleaner process...`, 'info');
 
     try {
-        // --- FIX: Use the correct database client for ALL operations ---
         addLog("Checking for any stale 'processing' jobs...", 'info');
         await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
@@ -113,7 +110,6 @@ async function runDictionaryCleaner(limit) {
             .not('halunder_sentence', 'is', null)
             .not('german_sentence', 'is', null)
             .limit(limit);
-        // --- END OF FIX ---
 
         if (fetchError) throw new Error(`Failed to fetch examples: ${fetchError.message}`);
         if (!pendingExamples || pendingExamples.length === 0) {
@@ -121,6 +117,31 @@ async function runDictionaryCleaner(limit) {
             processingState.status = 'Completed (No new examples)';
             processingState.isProcessing = false;
             return;
+        }
+
+        const entriesMap = new Map();
+        if (pendingExamples.length > 0) {
+            const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
+            const { data: entriesData, error: entriesError } = await sourceDbClient
+                .from('dictionary_entries')
+                .select(`
+                    id,
+                    german_word,
+                    word_type,
+                    etymology,
+                    additional_info,
+                    idioms,
+                    reference_notes,
+                    usage_notes,
+                    references:dictionary_references!entry_id(
+                        reference_type,
+                        target_entry:dictionary_entries!referenced_entry_id(german_word)
+                    )
+                `)
+                .in('id', entryIds);
+            
+            if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
+            entriesData.forEach(entry => entriesMap.set(entry.id, entry));
         }
 
         const totalToProcess = pendingExamples.length;
@@ -131,7 +152,8 @@ async function runDictionaryCleaner(limit) {
         for (const example of pendingExamples) {
             addLog(`Processing example ${processedCount + 1} of ${totalToProcess}...`, 'info');
             try {
-                await processSingleExample(example, !firstPromptPrinted);
+                const entryContext = entriesMap.get(example.entry_id);
+                await processSingleExample(example, entryContext, !firstPromptPrinted);
                 if (!firstPromptPrinted) firstPromptPrinted = true;
             } catch (e) {
                 addLog(`Failed to process example ID ${example.id}: ${e.message}`, 'error');
@@ -157,10 +179,10 @@ async function runDictionaryCleaner(limit) {
 }
 
 // === THE AI PIPELINE FOR A SINGLE EXAMPLE ===
-async function processSingleExample(example, shouldPrintPrompt) {
+async function processSingleExample(example, entryContext, shouldPrintPrompt) {
     await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    const prompt = buildExampleCleanerPrompt(example);
+    const prompt = buildExampleCleanerPrompt(example, entryContext);
     
     if (shouldPrintPrompt) {
         console.log('----------- DICTIONARY CLEANER PROMPT -----------');
@@ -176,7 +198,7 @@ async function processSingleExample(example, shouldPrintPrompt) {
         original_example_id: example.id,
         cleaned_halunder: aiResult.cleaned_halunder,
         cleaned_german: aiResult.best_translation,
-        source: 'o3_best',
+        source: 'gpt-4.1_best',
         confidence_score: aiResult.confidence_score,
         ai_notes: aiResult.notes
     });
@@ -186,7 +208,7 @@ async function processSingleExample(example, shouldPrintPrompt) {
                 original_example_id: example.id,
                 cleaned_halunder: aiResult.cleaned_halunder,
                 cleaned_german: alt.translation,
-                source: 'o3_alternative',
+                source: 'gpt-4.1_alternative',
                 confidence_score: alt.confidence_score,
                 ai_notes: alt.notes
             });
@@ -198,37 +220,38 @@ async function processSingleExample(example, shouldPrintPrompt) {
 
     await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
     
-    const logMessage = `[HAL-CLEANED] ${aiResult.cleaned_halunder} -> [DE] ${aiResult.cleaned_german}`;
+    // --- FIX IS HERE: Use `best_translation` instead of `cleaned_german` ---
+    const logMessage = `[HAL-CLEANED] ${aiResult.cleaned_halunder} -> [DE] ${aiResult.best_translation}`;
     addLog(logMessage, 'success');
     
     return shouldPrintPrompt;
 }
 
 // === HELPER TO BUILD THE PROMPT ===
-function buildExampleCleanerPrompt(example) {
+function buildExampleCleanerPrompt(example, entryContext) {
     const headwordContext = {
-        headword: example.entry?.german_word || "Unknown",
-        word_type: example.entry?.word_type,
-        etymology: example.entry?.etymology,
-        additional_info: example.entry?.additional_info,
-        idioms: example.entry?.idioms,
-        reference_notes: example.entry?.reference_notes,
-        usage_notes: example.entry?.usage_notes,
-        related_words: example.entry?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
+        headword: entryContext?.german_word || "Unknown",
+        word_type: entryContext?.word_type,
+        etymology: entryContext?.etymology,
+        additional_info: entryContext?.additional_info,
+        idioms: entryContext?.idioms,
+        reference_notes: entryContext?.reference_notes,
+        usage_notes: entryContext?.usage_notes,
+        related_words: entryContext?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
     };
 
     return `
 You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning.
 
 **PRIMARY GOAL:**
-Your main job is to "clean" both the Halunder and German sentences. This involves fixing obvious OCR errors (like misplaced line breaks, typos) and making the German translation sound natural and fluent, while explaining any idiomatic translations.
+Your main job is to "clean" both the Halunder and German sentences. This involves fixing obvious OCR errors and making the German translation sound natural and fluent, while explaining any idiomatic translations.
 
 **INSTRUCTIONS:**
 1.  **Analyze the Raw Pair:** Look at the provided Halunder and German example.
 2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context**. This provides crucial information about the main word the example illustrates, including its etymology, usage, and idioms.
-3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain". **Do not change the original wording or grammar.**
+3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain", misplaced punctuation, and incorrect spacing. Combine hyphenated words that were split across lines. Ensure the sentence starts with a capital letter and ends with appropriate terminal punctuation ('.', '!', '?').
 4.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker. You can and should change the wording from the raw German example if it improves fluency.
-5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal. For example, if 'keen Read tu ween' is translated as 'keinen Ausweg geben', explain that this is an idiomatic translation. Use the provided context to inform your explanation.
+5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal. For example, if 'keen Read tu ween' is translated as 'keinen Ausweg geben', explain that this is an idiomatic translation.
 6.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
 7.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
