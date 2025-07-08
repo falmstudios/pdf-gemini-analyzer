@@ -12,16 +12,16 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // === ROUTE REQUIRES ===
+const dictionaryBuilderRoutes = require('./dictionary-builder-routes.js');
 const dictionaryRoutes = require('./dictionary-routes.js');
 const linguisticRoutes = require('./linguistic-routes.js');
 const translatorRoutes = require('./translator-routes.js');
-// Add this for the new Corpus Builder feature
 const corpusBuilderRoutes = require('./corpus-builder.js');
 const dictionaryCleanerRoutes = require('./dictionary-cleaner-routes.js');
 
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
-  timeout: 0, // No timeout
+  timeout: 0,
   maxContentLength: Infinity,
   maxBodyLength: Infinity
 });
@@ -29,9 +29,11 @@ const axiosInstance = axios.create({
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Initialize Supabase (for the dictionary database)
+// This client is now only used for the old PDF analyzer's "Save" feature.
+// It will be safely ignored if the old SUPABASE_URL is not set.
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+  console.warn("Legacy SUPABASE_URL is set, but should be phased out. The old PDF Analyzer will use it for saving.");
   supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_ANON_KEY
@@ -44,10 +46,10 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
 // === API ROUTES ===
-app.use('/linguistic', linguisticRoutes);
+app.use('/dictionary-builder', dictionaryBuilderRoutes);
 app.use('/dictionary', dictionaryRoutes);
+app.use('/linguistic', linguisticRoutes);
 app.use('/translator', translatorRoutes);
-// Add this for the new Corpus Builder feature
 app.use('/corpus', corpusBuilderRoutes);
 app.use('/dictionary-cleaner', dictionaryCleanerRoutes);
 
@@ -67,7 +69,6 @@ app.get('/dictionary-builder', (req, res) => {
 app.get('/linguistic-cleaner', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'linguistic.html'));
 });
-// Add this route to serve the Corpus Builder page
 app.get('/corpus-builder', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'corpus-builder.html'));
 });
@@ -497,6 +498,6 @@ app.use((err, req, res, next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Gemini API Key: ${process.env.GEMINI_API_KEY ? 'Configured' : 'Not configured'}`);
-  console.log(`Supabase (Dictionary): ${supabase ? 'Configured' : 'Not configured'}`);
+  console.log(`OpenAI API Key: ${process.env.OPENAI_API_KEY ? 'Configured' : 'Not configured'}`);
+  console.log(`SOURCE Supabase (Primary): ${process.env.SOURCE_SUPABASE_URL ? 'Configured' : 'Not configured'}`);
 });
