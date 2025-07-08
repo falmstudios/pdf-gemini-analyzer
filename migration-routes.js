@@ -23,7 +23,7 @@ function addLog(message, type = 'info') {
 }
 
 // === MIGRATION LOGIC ===
-async function migrateTable({ sourceTable, destTable, columns, renameMap = {} }) {
+async function migrateTable({ sourceTable, destTable, columns }) {
     addLog(`--- Starting migration for ${sourceTable} -> ${destTable} ---`, 'info');
     
     // Phase 1: Get the full list of IDs to migrate
@@ -38,7 +38,6 @@ async function migrateTable({ sourceTable, destTable, columns, renameMap = {} })
     // Phase 2: Migrate one row at a time for safety
     for (const row of allRows) {
         try {
-            // Fetch the full data for this single row
             const { data: singleRowData, error: fetchError } = await sourceOfTruthDb
                 .from(sourceTable)
                 .select('*')
@@ -47,23 +46,24 @@ async function migrateTable({ sourceTable, destTable, columns, renameMap = {} })
             
             if (fetchError) throw new Error(`Failed to fetch row ${row.id}: ${fetchError.message}`);
             
-            // Prepare the object for the destination table
             const dataToInsert = {};
             for (const col of columns) {
-                const destCol = renameMap[col] || col; // Use renamed column if it exists
                 if (singleRowData.hasOwnProperty(col)) {
-                    dataToInsert[destCol] = singleRowData[col];
+                    dataToInsert[col] = singleRowData[col];
                 }
             }
             
-            // Insert the single row into the destination
             const { error: insertError } = await destinationDb.from(destTable).insert(dataToInsert);
             if (insertError) throw new Error(`Failed to insert row ${row.id} into ${destTable}: ${insertError.message}`);
             
             migratedCount++;
-            migrationState.progress = totalToMigrate > 0 ? (migratedCount / totalToProcess) : 1;
-            migrationState.details = `Migrated ${migratedCount} of ${totalToProcess} rows from ${sourceTable}.`;
-            if (migratedCount % 25 === 0) { // Log every 25 rows
+            
+            // --- FIX IS HERE: Use the correct variable name ---
+            migrationState.progress = totalToMigrate > 0 ? (migratedCount / totalToMigrate) : 1;
+            migrationState.details = `Migrated ${migratedCount} of ${totalToMigrate} rows from ${sourceTable}.`;
+            // --- END OF FIX ---
+
+            if (migratedCount % 25 === 0 || migratedCount === totalToMigrate) {
                 addLog(migrationState.details, 'info');
             }
 
@@ -79,14 +79,12 @@ async function runFullMigration() {
     migrationState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [] };
 
     try {
-        // Migration for pdf_analyses -> ahrhammar_uploads
         await migrateTable({
             sourceTable: 'pdf_analyses',
             destTable: 'ahrhammar_uploads',
             columns: ['filename', 'result', 'processed_at', 'settings']
         });
 
-        // Migration for krogmann_uploads
         await migrateTable({
             sourceTable: 'krogmann_uploads',
             destTable: 'krogmann_uploads',
