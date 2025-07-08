@@ -4,8 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
-// This is the ONLY database client we need for this script.
-const dictionaryDbClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
 
@@ -84,27 +83,32 @@ async function runDictionaryCleaner(limit) {
     addLog(`Starting Dictionary Example Cleaner process...`, 'info');
 
     try {
-        // --- FIX: Use the correct table name 'examples' ---
+        // --- Pre-fetch all existing idioms ---
+        addLog('Pre-fetching existing idioms...', 'info');
+        const { data: existingIdioms, error: idiomError } = await sourceDbClient.from('idioms').select('*');
+        if (idiomError) throw new Error(`Failed to pre-fetch idioms: ${idiomError.message}`);
+        addLog(`Successfully pre-fetched ${existingIdioms.length} idioms.`, 'success');
+
         addLog("Checking for any stale 'processing' jobs...", 'info');
-        await dictionaryDbClient.from('examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
+        await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
         addLog(`Fetching up to ${limit} pending examples from the dictionary...`, 'info');
         
-        // --- FIX: Use the correct table name and join syntax ---
-        const { data: pendingExamples, error: fetchError } = await dictionaryDbClient
-            .from('examples')
+        const { data: pendingExamples, error: fetchError } = await sourceDbClient
+            .from('dictionary_examples')
             .select(`
                 *,
-                concept:concepts!inner(
-                    primary_german_label,
-                    part_of_speech,
-                    german_definition,
-                    notes,
-                    krogmann_info,
-                    krogmann_idioms,
-                    relations!source_concept_id(
-                        relation_type,
-                        target_concept:concepts!target_concept_id(primary_german_label)
+                entry:dictionary_entries!entry_id(
+                    german_word,
+                    word_type,
+                    etymology,
+                    additional_info,
+                    idioms,
+                    reference_notes,
+                    usage_notes,
+                    references:dictionary_references!entry_id(
+                        reference_type,
+                        target_entry:dictionary_entries!referenced_entry_id(german_word)
                     )
                 )
             `)
@@ -112,7 +116,6 @@ async function runDictionaryCleaner(limit) {
             .not('halunder_sentence', 'is', null)
             .not('german_sentence', 'is', null)
             .limit(limit);
-        // --- END OF FIX ---
 
         if (fetchError) throw new Error(`Failed to fetch examples: ${fetchError.message}`);
         if (!pendingExamples || pendingExamples.length === 0) {
@@ -120,6 +123,25 @@ async function runDictionaryCleaner(limit) {
             processingState.status = 'Completed (No new examples)';
             processingState.isProcessing = false;
             return;
+        }
+
+        const entriesMap = new Map();
+        if (pendingExamples.length > 0) {
+            const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
+            const { data: entriesData, error: entriesError } = await sourceDbClient
+                .from('dictionary_entries')
+                .select(`
+                    id, german_word, word_type, etymology, additional_info, idioms,
+                    reference_notes, usage_notes,
+                    references:dictionary_references!entry_id(
+                        reference_type,
+                        target_entry:dictionary_entries!referenced_entry_id(german_word)
+                    )
+                `)
+                .in('id', entryIds);
+            
+            if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
+            entriesData.forEach(entry => entriesMap.set(entry.id, entry));
         }
 
         const totalToProcess = pendingExamples.length;
@@ -130,11 +152,12 @@ async function runDictionaryCleaner(limit) {
         for (const example of pendingExamples) {
             addLog(`Processing example ${processedCount + 1} of ${totalToProcess}...`, 'info');
             try {
-                await processSingleExample(example, !firstPromptPrinted);
+                const entryContext = entriesMap.get(example.entry_id);
+                await processSingleExample(example, entryContext, !firstPromptPrinted, existingIdioms);
                 if (!firstPromptPrinted) firstPromptPrinted = true;
             } catch (e) {
                 addLog(`Failed to process example ID ${example.id}: ${e.message}`, 'error');
-                await dictionaryDbClient.from('examples').update({ cleaning_status: 'error' }).eq('id', example.id);
+                await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'error' }).eq('id', example.id);
             }
             processedCount++;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} examples.`;
@@ -156,24 +179,14 @@ async function runDictionaryCleaner(limit) {
 }
 
 // === THE AI PIPELINE FOR A SINGLE EXAMPLE ===
-async function processSingleExample(example, shouldPrintPrompt) {
-    await dictionaryDbClient.from('examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
+async function processSingleExample(example, entryContext, shouldPrintPrompt, existingIdioms) {
+    await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    // Get Dictionary Data for all words in the sentence
-    const words = [...new Set(example.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
-    let wordDictionaryData = null;
-    if (words.length > 0) {
-        const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
-        const { data, error } = await dictionaryDbClient
-            .from('terms')
-            .select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`)
-            .or(orFilter)
-            .eq('language', 'hal');
-        if (error) addLog(`Dictionary lookup failed for example ${example.id}: ${error.message}`, 'warning');
-        else wordDictionaryData = data;
-    }
+    const knownIdiomsInSentence = existingIdioms.filter(idiom => 
+        example.halunder_sentence.toLowerCase().includes(idiom.halunder_phrase.toLowerCase())
+    );
 
-    const prompt = buildExampleCleanerPrompt(example, wordDictionaryData);
+    const prompt = buildExampleCleanerPrompt(example, entryContext, knownIdiomsInSentence);
     
     if (shouldPrintPrompt) {
         console.log('----------- DICTIONARY CLEANER PROMPT -----------');
@@ -183,6 +196,25 @@ async function processSingleExample(example, shouldPrintPrompt) {
     }
 
     const aiResult = await callOpenAI_Api(prompt);
+
+    if (aiResult.discovered_idioms && aiResult.discovered_idioms.length > 0) {
+        const idiomsToUpsert = aiResult.discovered_idioms.map(idiom => ({
+            halunder_phrase: idiom.halunder_phrase,
+            german_equivalent: idiom.german_equivalent,
+            explanation: idiom.explanation,
+            tags: idiom.tags || []
+        }));
+
+        const { error: upsertError } = await sourceDbClient
+            .from('idioms')
+            .upsert(idiomsToUpsert, { onConflict: 'halunder_phrase' });
+
+        if (upsertError) {
+            addLog(`Failed to save discovered idioms: ${upsertError.message}`, 'warning');
+        } else {
+            addLog(`Successfully saved/updated ${idiomsToUpsert.length} idioms to the knowledge base.`, 'success');
+        }
+    }
 
     const cleanedEntries = [];
     cleanedEntries.push({
@@ -206,10 +238,10 @@ async function processSingleExample(example, shouldPrintPrompt) {
         });
     }
 
-    const { error: insertError } = await dictionaryDbClient.from('cleaned_dictionary_examples').insert(cleanedEntries);
+    const { error: insertError } = await sourceDbClient.from('cleaned_dictionary_examples').insert(cleanedEntries);
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
-    await dictionaryDbClient.from('examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
+    await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
     
     const logMessage = `[HAL-CLEANED] ${aiResult.cleaned_halunder} -> [DE] ${aiResult.cleaned_german}`;
     addLog(logMessage, 'success');
@@ -217,43 +249,45 @@ async function processSingleExample(example, shouldPrintPrompt) {
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT ===
-function buildExampleCleanerPrompt(example, wordDictionaryData) {
+// === HELPER TO BUILD THE PROMPT (IMPROVED) ===
+function buildExampleCleanerPrompt(example, entryContext, knownIdioms) {
     const headwordContext = {
-        headword: example.concept?.primary_german_label || "Unknown",
-        word_type: example.concept?.part_of_speech,
-        definition: example.concept?.german_definition,
-        usage_notes: example.concept?.notes,
-        krogmann_info: example.concept?.krogmann_info,
-        krogmann_idioms: example.concept?.krogmann_idioms,
-        related_words: example.concept?.relations?.map(r => r.target_concept?.primary_german_label).filter(Boolean) || []
+        headword: entryContext?.german_word || "Unknown",
+        word_type: entryContext?.word_type,
+        etymology: entryContext?.etymology,
+        additional_info: entryContext?.additional_info,
+        idioms: entryContext?.idioms,
+        reference_notes: entryContext?.reference_notes,
+        usage_notes: entryContext?.usage_notes,
+        related_words: entryContext?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
     };
 
     return `
-You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning.
+You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning. You also act as an idiom discovery engine.
 
 **PRIMARY GOAL:**
-Your main job is to "clean" both the Halunder and German sentences. This involves fixing obvious OCR errors and making the German translation sound natural and fluent, while explaining any idiomatic translations.
+Your main job is to "clean" both the Halunder and German sentences, and to identify any idioms within the sentence.
 
 **INSTRUCTIONS:**
 1.  **Analyze the Raw Pair:** Look at the provided Halunder and German example.
-2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context** AND the **Word-by-Word Dictionary Entries**. This provides crucial information.
-3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain", misplaced punctuation, and incorrect spacing. Ensure the sentence starts with a capital letter and ends with appropriate terminal punctuation ('.', '!', '?'). **Do not change the original wording or grammar.**
+2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context** and any **Already Known Idioms**.
+3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors (e.g., "letj\\ninaptain" -> "letj inaptain"), misplaced punctuation, and incorrect spacing. Ensure the sentence starts with a capital letter and ends with appropriate terminal punctuation ('.', '!', '?'). **Do not change the original wording or grammar.**
 4.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker.
-5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal.
-6.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
-7.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
+5.  **IDENTIFY NEW IDIOMS:** Look for phrases in the Halunder sentence that are translated non-literally. If you find one that is NOT in the "Already Known Idioms" list, add it to the "discovered_idioms" array in your output. For example, if you see "beerigermarri" translated as "kleiner Penis", this is a new idiom.
+6.  **Explain Translation:** In the "notes" field, explain *why* your final translation is what it is, especially if it's idiomatic.
+7.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
+8.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
 **INPUT DATA:**
 
-**1. Full Dictionary Headword Context (The entry this example belongs to):**
+**1. Full Dictionary Headword Context:**
 \`\`\`json
 ${JSON.stringify(headwordContext, null, 2)}
 \`\`\`
 
-**2. Word-by-Word Dictionary Entries for the Halunder sentence:**
+**2. Already Known Idioms Found in This Sentence:**
 \`\`\`json
-${JSON.stringify(wordDictionaryData, null, 2)}
+${JSON.stringify(knownIdioms, null, 2)}
 \`\`\`
 
 **3. Raw Example Pair (may contain errors):**
@@ -261,7 +295,7 @@ ${JSON.stringify(wordDictionaryData, null, 2)}
 - German: "${example.german_sentence}"
 
 **4. Original Note on the Example (if any):**
-"${example.note || 'N/A'}"
+"${example.context_note || 'N/A'}"
 
 **YOUR JSON OUTPUT:**
 \`\`\`json
@@ -275,6 +309,14 @@ ${JSON.stringify(wordDictionaryData, null, 2)}
       "translation": "A valid alternative translation.",
       "confidence_score": 0.80,
       "notes": "This is a more literal translation."
+    }
+  ],
+  "discovered_idioms": [
+    {
+      "halunder_phrase": "beerigermarri",
+      "german_equivalent": "kleiner Penis",
+      "explanation": "Auf Helgoländisch sagt man 'beerigermarri' (wörtlich: Konfirmandenwurst) umgangssprachlich für einen kleinen Penis. Dies ist eine metaphorische und humorvolle Umschreibung.",
+      "tags": ["idiom", "slang"]
     }
   ]
 }
