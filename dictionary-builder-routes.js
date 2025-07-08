@@ -19,7 +19,6 @@ let processingStates = {
     admin: { isProcessing: false, progress: 0, status: 'idle', details: '', logs: [], results: null }
 };
 
-// Helper function to add logs
 function addLog(processType, message, type = 'info') {
     if (!processingStates[processType]) {
         console.error(`[LOGGING ERROR] Invalid process type: ${processType}. Message: ${message}`);
@@ -33,22 +32,9 @@ function addLog(processType, message, type = 'info') {
     console.log(`[${processType.toUpperCase()}] [${type.toUpperCase()}] ${message}`);
 }
 
-// --- FINAL ENHANCED HELPER: Finds concept IDs with multi-stage fallback logic ---
 async function findTargetConceptId(dirtyTerm) {
     if (!dirtyTerm) return null;
-
-    const cleanGermanTerm = (term) => {
-        return term
-            .replace(/\d+$/, '')
-            .replace(/[¹²³]$/, '')
-            .replace(/-$/, '')
-            .replace(/!$/, '')
-            .replace(/\s*\(.*\)\s*$/, '')
-            .replace(/\s*,\s*sich\s*$/, '')
-            .replace(/\*$/, '')
-            .trim();
-    };
-
+    const cleanGermanTerm = (term) => term.replace(/\d+$/, '').replace(/[¹²³]$/, '').replace(/-$/, '').replace(/!$/, '').replace(/\s*\(.*\)\s*$/, '').replace(/\s*,\s*sich\s*$/, '').replace(/\*$/, '').trim();
     const attemptSingularization = (term) => {
         if (term.endsWith('en') && term.length > 3) return term.slice(0, -1);
         if (term.endsWith('er') && term.length > 3) return term.slice(0, -2);
@@ -57,13 +43,11 @@ async function findTargetConceptId(dirtyTerm) {
         if (term.endsWith('s') && term.length > 2) return term.slice(0, -1);
         return null;
     }
-
     const attemptMatch = async (term) => {
         if (!term) return null;
         const { data } = await supabase.from('new_concepts').select('id').eq('primary_german_label', term).limit(1).single();
         return data ? data.id : null;
     };
-
     const strategies = [
         () => attemptMatch(dirtyTerm),
         () => attemptMatch(cleanGermanTerm(dirtyTerm)),
@@ -91,16 +75,12 @@ async function findTargetConceptId(dirtyTerm) {
             return null;
         }
     ];
-
     for (const strategy of strategies) {
         const conceptId = await strategy();
         if (conceptId) return conceptId;
     }
-    
     return null;
 }
-
-// --- API ROUTES ---
 
 router.get('/stats', async (req, res) => {
     try {
@@ -165,9 +145,6 @@ router.get('/progress/:type', (req, res) => {
     res.json({ percentage, status: state.status, details: state.details, logs: state.logs.slice(-50), completed, results: state.results });
 });
 
-
-// --- AHRHAMMAR PROCESSING LOGIC ---
-
 async function processAhrhammarData() {
     const state = processingStates.ahrhammar;
     try {
@@ -185,7 +162,6 @@ async function processAhrhammarData() {
             state.status = `Pass 1/2: ${analysis.filename}`;
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.05 + (0.45 * ((i + 1) / pdfAnalyses.length));
-            
             const perFileResults = { entries: 0, terms: 0, examples: 0, citations: 0, links: 0 };
             try {
                 let jsonData = typeof analysis.result === 'string' ? analysis.result.replace(/^```json\s*|```$/g, '') : JSON.stringify(analysis.result);
@@ -207,7 +183,6 @@ async function processAhrhammarData() {
             state.status = `Pass 2/2: ${analysis.filename}`;
             state.details = `File ${i + 1} of ${pdfAnalyses.length}`;
             state.progress = 0.5 + (0.45 * ((i + 1) / pdfAnalyses.length));
-
             const perFileResults = { relations: 0, skipped: 0 };
             try {
                 let jsonData = typeof analysis.result === 'string' ? analysis.result.replace(/^```json\s*|```$/g, '') : JSON.stringify(analysis.result);
@@ -316,7 +291,6 @@ async function processKrogmannData() {
             state.status = `Pass 1/2: ${file.filename}`;
             state.details = `File ${i + 1} of ${krogmannData.length}`;
             state.progress = 0.05 + (0.45 * ((i + 1) / krogmannData.length));
-            
             const perFileResults = { entries: 0, enriched: 0, created: 0, examples: 0 };
             try {
                 const entries = file.data;
