@@ -5,7 +5,6 @@ const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
 const mainDictionaryDb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-// Note: sourceDbClient is not needed for this script, but we can leave it for future use.
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -90,24 +89,15 @@ async function runDictionaryCleaner(limit) {
         await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
         addLog(`Fetching up to ${limit} pending examples from the dictionary...`, 'info');
-        // --- FIX IS HERE: Corrected the join syntax ---
+        
+        // Stage 1: Get the raw examples
         const { data: pendingExamples, error: fetchError } = await mainDictionaryDb
             .from('dictionary_examples')
-            .select(`
-                *,
-                entry:dictionary_entries!entry_id(
-                    german_word,
-                    references:dictionary_references!entry_id(
-                        reference_type,
-                        target_entry:dictionary_entries!referenced_entry_id(german_word)
-                    )
-                )
-            `)
+            .select(`*`)
             .eq('cleaning_status', 'pending')
             .not('halunder_sentence', 'is', null)
             .not('german_sentence', 'is', null)
             .limit(limit);
-        // --- END OF FIX ---
 
         if (fetchError) throw new Error(`Failed to fetch examples: ${fetchError.message}`);
         if (!pendingExamples || pendingExamples.length === 0) {
@@ -117,6 +107,30 @@ async function runDictionaryCleaner(limit) {
             return;
         }
 
+        // Stage 2: Get the "Super Context" for all found examples in one go
+        const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
+        const { data: entriesData, error: entriesError } = await mainDictionaryDb
+            .from('dictionary_entries')
+            .select(`
+                id,
+                german_word,
+                word_type,
+                etymology,
+                additional_info,
+                idioms,
+                reference_notes,
+                usage_notes,
+                references:dictionary_references!entry_id(
+                    reference_type,
+                    target_entry:dictionary_entries!referenced_entry_id(german_word)
+                )
+            `)
+            .in('id', entryIds);
+        
+        if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
+
+        const entriesMap = new Map(entriesData.map(entry => [entry.id, entry]));
+
         const totalToProcess = pendingExamples.length;
         addLog(`Found ${totalToProcess} examples to process.`, 'success');
         processingState.status = 'Cleaning examples with AI...';
@@ -125,7 +139,8 @@ async function runDictionaryCleaner(limit) {
         for (const example of pendingExamples) {
             addLog(`Processing example ${processedCount + 1} of ${totalToProcess}...`, 'info');
             try {
-                await processSingleExample(example, !firstPromptPrinted);
+                const entryContext = entriesMap.get(example.entry_id);
+                await processSingleExample(example, entryContext, !firstPromptPrinted);
                 if (!firstPromptPrinted) firstPromptPrinted = true;
             } catch (e) {
                 addLog(`Failed to process example ID ${example.id}: ${e.message}`, 'error');
@@ -151,10 +166,10 @@ async function runDictionaryCleaner(limit) {
 }
 
 // === THE AI PIPELINE FOR A SINGLE EXAMPLE ===
-async function processSingleExample(example, shouldPrintPrompt) {
+async function processSingleExample(example, entryContext, shouldPrintPrompt) {
     await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    const prompt = buildExampleCleanerPrompt(example);
+    const prompt = buildExampleCleanerPrompt(example, entryContext);
     
     if (shouldPrintPrompt) {
         console.log('----------- DICTIONARY CLEANER PROMPT -----------');
@@ -199,10 +214,18 @@ async function processSingleExample(example, shouldPrintPrompt) {
 }
 
 // === HELPER TO BUILD THE PROMPT ===
-function buildExampleCleanerPrompt(example) {
-    // Gracefully handle cases where the join might not have worked perfectly
-    const headword = example.entry?.german_word || "Unknown";
-    const relatedWords = example.entry?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || [];
+function buildExampleCleanerPrompt(example, entryContext) {
+    // Sanitize context to avoid sending nulls, which can confuse the AI
+    const headwordContext = {
+        headword: entryContext?.german_word || "Unknown",
+        word_type: entryContext?.word_type,
+        etymology: entryContext?.etymology,
+        additional_info: entryContext?.additional_info,
+        idioms: entryContext?.idioms,
+        reference_notes: entryContext?.reference_notes,
+        usage_notes: entryContext?.usage_notes,
+        related_words: entryContext?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
+    };
 
     return `
 You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning.
@@ -212,25 +235,25 @@ Your main job is to "clean" both the Halunder and German sentences. This involve
 
 **INSTRUCTIONS:**
 1.  **Analyze the Raw Pair:** Look at the provided Halunder and German example.
-2.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain". **Do not change the original wording or grammar.**
-3.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker. You can and should change the wording from the raw German example if it improves fluency.
-4.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal. For example, if 'keen Read tu ween' is translated as 'keinen Ausweg geben', explain that this is an idiomatic translation. Use the provided context (Headword, Related Words, Notes) to inform your explanation.
-5.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
-6.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
+2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context**. This provides crucial information about the main word the example illustrates, including its etymology, usage, and idioms.
+3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain". **Do not change the original wording or grammar.**
+4.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker. You can and should change the wording from the raw German example if it improves fluency.
+5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal. For example, if 'keen Read tu ween' is translated as 'keinen Ausweg geben', explain that this is an idiomatic translation. Use the provided context to inform your explanation.
+6.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
+7.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
 **INPUT DATA:**
 
-**1. Dictionary Headword (The context this example belongs to):**
-"${headword}"
+**1. Full Dictionary Headword Context:**
+\`\`\`json
+${JSON.stringify(headwordContext, null, 2)}
+\`\`\`
 
-**2. Related Words for Context:**
-${JSON.stringify(relatedWords)}
-
-**3. Raw Example Pair (may contain errors):**
+**2. Raw Example Pair (may contain errors):**
 - Halunder: "${example.halunder_sentence}"
 - German: "${example.german_sentence}"
 
-**4. Original Note on the Example (if any):**
+**3. Original Note on the Example (if any):**
 "${example.context_note || 'N/A'}"
 
 **YOUR JSON OUTPUT:**
