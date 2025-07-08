@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 
-// Use the SOURCE database for ALL operations now
+// === FIX IS HERE: Use the correct environment variables for the SOURCE database ===
 const supabase = createClient(
     process.env.SOURCE_SUPABASE_URL,
     process.env.SOURCE_SUPABASE_ANON_KEY
@@ -14,6 +14,7 @@ router.get('/search', async (req, res) => {
         const limit = 20;
         const offset = (page - 1) * limit;
         
+        // This query now correctly points to the 'new_' prefixed tables
         let query = supabase
             .from('new_concepts')
             .select(`
