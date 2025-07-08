@@ -4,7 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
-// This client connects to your SOURCE database where all the tables for this process exist.
+const mainDictionaryDb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -26,6 +26,7 @@ function addLog(message, type = 'info') {
     console.log(`[DICT-CLEANER] [${type.toUpperCase()}] ${message}`);
 }
 
+// === API CALLER (FIXED) ===
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
@@ -45,7 +46,7 @@ async function callOpenAI_Api(prompt) {
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    temperature: 0.7,
+                    // temperature: 0.7, <-- REMOVED THIS LINE
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -85,14 +86,12 @@ async function runDictionaryCleaner(limit) {
     addLog(`Starting Dictionary Example Cleaner process...`, 'info');
 
     try {
-        // --- FIX: Use the correct database client ---
         addLog("Checking for any stale 'processing' jobs...", 'info');
-        await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
+        await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
         addLog(`Fetching up to ${limit} pending examples from the dictionary...`, 'info');
         
-        // Stage 1: Get the raw examples from the SOURCE database
-        const { data: pendingExamples, error: fetchError } = await sourceDbClient
+        const { data: pendingExamples, error: fetchError } = await mainDictionaryDb
             .from('dictionary_examples')
             .select(`*`)
             .eq('cleaning_status', 'pending')
@@ -108,9 +107,8 @@ async function runDictionaryCleaner(limit) {
             return;
         }
 
-        // Stage 2: Get the context from the SOURCE database
         const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
-        const { data: entriesData, error: entriesError } = await sourceDbClient
+        const { data: entriesData, error: entriesError } = await mainDictionaryDb
             .from('dictionary_entries')
             .select(`
                 id,
@@ -129,7 +127,6 @@ async function runDictionaryCleaner(limit) {
             .in('id', entryIds);
         
         if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
-        // --- END OF FIX ---
 
         const entriesMap = new Map(entriesData.map(entry => [entry.id, entry]));
 
@@ -146,7 +143,7 @@ async function runDictionaryCleaner(limit) {
                 if (!firstPromptPrinted) firstPromptPrinted = true;
             } catch (e) {
                 addLog(`Failed to process example ID ${example.id}: ${e.message}`, 'error');
-                await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'error' }).eq('id', example.id);
+                await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'error' }).eq('id', example.id);
             }
             processedCount++;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} examples.`;
@@ -169,7 +166,7 @@ async function runDictionaryCleaner(limit) {
 
 // === THE AI PIPELINE FOR A SINGLE EXAMPLE ===
 async function processSingleExample(example, entryContext, shouldPrintPrompt) {
-    await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
+    await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
     const prompt = buildExampleCleanerPrompt(example, entryContext);
     
@@ -204,10 +201,10 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt) {
         });
     }
 
-    const { error: insertError } = await sourceDbClient.from('cleaned_dictionary_examples').insert(cleanedEntries);
+    const { error: insertError } = await mainDictionaryDb.from('cleaned_dictionary_examples').insert(cleanedEntries);
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
-    await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
+    await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
     
     const logMessage = `[HAL-CLEANED] ${aiResult.cleaned_halunder} -> [DE] ${aiResult.cleaned_german}`;
     addLog(logMessage, 'success');
