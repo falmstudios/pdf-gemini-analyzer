@@ -4,9 +4,8 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
-// This client connects to your DICTIONARY database (the one in the screenshot)
 const mainDictionaryDb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-// This client connects to your SOURCE database (for linguistic examples, if needed)
+// Note: sourceDbClient is not needed for this script, but we can leave it for future use.
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -87,17 +86,16 @@ async function runDictionaryCleaner(limit) {
     addLog(`Starting Dictionary Example Cleaner process...`, 'info');
 
     try {
-        // Startup Recovery
         addLog("Checking for any stale 'processing' jobs...", 'info');
         await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
-        // Fetch pending examples to process
         addLog(`Fetching up to ${limit} pending examples from the dictionary...`, 'info');
+        // --- FIX IS HERE: Corrected the join syntax ---
         const { data: pendingExamples, error: fetchError } = await mainDictionaryDb
             .from('dictionary_examples')
             .select(`
                 *,
-                entry:dictionary_entries!inner(
+                entry:dictionary_entries!entry_id(
                     german_word,
                     references:dictionary_references!entry_id(
                         reference_type,
@@ -109,6 +107,7 @@ async function runDictionaryCleaner(limit) {
             .not('halunder_sentence', 'is', null)
             .not('german_sentence', 'is', null)
             .limit(limit);
+        // --- END OF FIX ---
 
         if (fetchError) throw new Error(`Failed to fetch examples: ${fetchError.message}`);
         if (!pendingExamples || pendingExamples.length === 0) {
@@ -155,7 +154,6 @@ async function runDictionaryCleaner(limit) {
 async function processSingleExample(example, shouldPrintPrompt) {
     await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    // No need for a separate dictionary lookup, as the data is already in the 'example' object.
     const prompt = buildExampleCleanerPrompt(example);
     
     if (shouldPrintPrompt) {
@@ -189,7 +187,6 @@ async function processSingleExample(example, shouldPrintPrompt) {
         });
     }
 
-    // Save the results to the same database
     const { error: insertError } = await mainDictionaryDb.from('cleaned_dictionary_examples').insert(cleanedEntries);
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
@@ -203,8 +200,9 @@ async function processSingleExample(example, shouldPrintPrompt) {
 
 // === HELPER TO BUILD THE PROMPT ===
 function buildExampleCleanerPrompt(example) {
-    const headword = example.entry.german_word;
-    const relatedWords = example.entry.references.map(r => r.target_entry.german_word);
+    // Gracefully handle cases where the join might not have worked perfectly
+    const headword = example.entry?.german_word || "Unknown";
+    const relatedWords = example.entry?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || [];
 
     return `
 You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning.
