@@ -4,7 +4,6 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
-// This client connects to your SOURCE database where all the tables for this process exist.
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -26,7 +25,6 @@ function addLog(message, type = 'info') {
     console.log(`[DICT-CLEANER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === API CALLER (CORRECTED) ===
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
@@ -41,12 +39,11 @@ async function callOpenAI_Api(prompt) {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    model: "gpt-4.1-2025-04-14", // Using the exact model you specified
+                    model: "gpt-4.1-2025-04-14",
                     messages: [
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    // Temperature is not supported by this specific model version and is removed.
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -196,6 +193,7 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt) {
 
     const aiResult = await callOpenAI_Api(prompt);
 
+    // --- FIX IS HERE: Use the correct source tags ---
     const cleanedEntries = [];
     cleanedEntries.push({
         original_example_id: example.id,
@@ -217,6 +215,7 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt) {
             });
         });
     }
+    // --- END OF FIX ---
 
     const { error: insertError } = await sourceDbClient.from('cleaned_dictionary_examples').insert(cleanedEntries);
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
@@ -251,9 +250,11 @@ Your main job is to "clean" both the Halunder and German sentences. This involve
 **INSTRUCTIONS:**
 1.  **Analyze the Raw Pair:** Look at the provided Halunder and German example.
 2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context**. This provides crucial information about the main word the example illustrates, including its etymology, usage, and idioms.
-3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix obvious OCR errors like "letj\\ninaptain" to "letj inaptain", misplaced punctuation, and incorrect spacing. Combine hyphenated words that were split across lines. **Do not change the original wording, grammar, or dialectal spellings.** Preserve the original's linguistic character.
+3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence.
+    - **DO:** Fix OCR errors like "letj\\ninaptain" to "letj inaptain", combine hyphenated words, and ensure correct sentence structure (starts with a capital letter, ends with '.', '!', or '?').
+    - **DO NOT:** Change the original wording, grammar, or dialectal spellings. Preserve the original's linguistic character.
 4.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker. You can and should change the wording from the raw German example if it improves fluency.
-5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal. For example, if 'keen Read tu ween' is translated as 'keinen Ausweg geben', explain that this is an idiomatic translation. Use the provided context to inform your explanation.
+5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal. For example, if 'keen Read tu ween' is translated as 'keinen Ausweg geben', explain that this is an idiomatic translation.
 6.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
 7.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
