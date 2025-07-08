@@ -5,6 +5,8 @@ const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
+// This client connects to your separate, main dictionary with the 'terms' table
+const dictionaryDbClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
 
@@ -83,12 +85,6 @@ async function runDictionaryCleaner(limit) {
     addLog(`Starting Dictionary Example Cleaner process...`, 'info');
 
     try {
-        // --- Pre-fetch all existing idioms ---
-        addLog('Pre-fetching existing idioms...', 'info');
-        const { data: existingIdioms, error: idiomError } = await sourceDbClient.from('idioms').select('*');
-        if (idiomError) throw new Error(`Failed to pre-fetch idioms: ${idiomError.message}`);
-        addLog(`Successfully pre-fetched ${existingIdioms.length} idioms.`, 'success');
-
         addLog("Checking for any stale 'processing' jobs...", 'info');
         await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
@@ -153,7 +149,7 @@ async function runDictionaryCleaner(limit) {
             addLog(`Processing example ${processedCount + 1} of ${totalToProcess}...`, 'info');
             try {
                 const entryContext = entriesMap.get(example.entry_id);
-                await processSingleExample(example, entryContext, !firstPromptPrinted, existingIdioms);
+                await processSingleExample(example, entryContext, !firstPromptPrinted);
                 if (!firstPromptPrinted) firstPromptPrinted = true;
             } catch (e) {
                 addLog(`Failed to process example ID ${example.id}: ${e.message}`, 'error');
@@ -179,14 +175,30 @@ async function runDictionaryCleaner(limit) {
 }
 
 // === THE AI PIPELINE FOR A SINGLE EXAMPLE ===
-async function processSingleExample(example, entryContext, shouldPrintPrompt, existingIdioms) {
+async function processSingleExample(example, entryContext, shouldPrintPrompt) {
     await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    const knownIdiomsInSentence = existingIdioms.filter(idiom => 
-        example.halunder_sentence.toLowerCase().includes(idiom.halunder_phrase.toLowerCase())
-    );
+    // --- NEW: Dictionary Lookup for all words in the sentence ---
+    const words = [...new Set(example.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
+    let wordDictionaryData = null;
+    if (words.length > 0) {
+        const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
+        // This query now uses the separate dictionaryDbClient
+        const { data, error } = await dictionaryDbClient
+            .from('terms')
+            .select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`)
+            .or(orFilter)
+            .eq('language', 'hal');
+        
+        if (error) {
+            addLog(`Dictionary lookup failed for example ${example.id}: ${error.message}`, 'warning');
+        } else {
+            wordDictionaryData = data;
+        }
+    }
+    // --- END OF NEW LOGIC ---
 
-    const prompt = buildExampleCleanerPrompt(example, entryContext, knownIdiomsInSentence);
+    const prompt = buildExampleCleanerPrompt(example, entryContext, wordDictionaryData);
     
     if (shouldPrintPrompt) {
         console.log('----------- DICTIONARY CLEANER PROMPT -----------');
@@ -196,25 +208,6 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt, ex
     }
 
     const aiResult = await callOpenAI_Api(prompt);
-
-    if (aiResult.discovered_idioms && aiResult.discovered_idioms.length > 0) {
-        const idiomsToUpsert = aiResult.discovered_idioms.map(idiom => ({
-            halunder_phrase: idiom.halunder_phrase,
-            german_equivalent: idiom.german_equivalent,
-            explanation: idiom.explanation,
-            tags: idiom.tags || []
-        }));
-
-        const { error: upsertError } = await sourceDbClient
-            .from('idioms')
-            .upsert(idiomsToUpsert, { onConflict: 'halunder_phrase' });
-
-        if (upsertError) {
-            addLog(`Failed to save discovered idioms: ${upsertError.message}`, 'warning');
-        } else {
-            addLog(`Successfully saved/updated ${idiomsToUpsert.length} idioms to the knowledge base.`, 'success');
-        }
-    }
 
     const cleanedEntries = [];
     cleanedEntries.push({
@@ -249,8 +242,8 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt, ex
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT (IMPROVED) ===
-function buildExampleCleanerPrompt(example, entryContext, knownIdioms) {
+// === HELPER TO BUILD THE PROMPT ===
+function buildExampleCleanerPrompt(example, entryContext, wordDictionaryData) {
     const headwordContext = {
         headword: entryContext?.german_word || "Unknown",
         word_type: entryContext?.word_type,
@@ -263,31 +256,30 @@ function buildExampleCleanerPrompt(example, entryContext, knownIdioms) {
     };
 
     return `
-You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning. You also act as an idiom discovery engine.
+You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning.
 
 **PRIMARY GOAL:**
-Your main job is to "clean" both the Halunder and German sentences, and to identify any idioms within the sentence.
+Your main job is to "clean" both the Halunder and German sentences. This involves fixing obvious OCR errors and making the German translation sound natural and fluent, while explaining any idiomatic translations.
 
 **INSTRUCTIONS:**
 1.  **Analyze the Raw Pair:** Look at the provided Halunder and German example.
-2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context** and any **Already Known Idioms**.
-3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors (e.g., "letj\\ninaptain" -> "letj inaptain"), misplaced punctuation, and incorrect spacing. Ensure the sentence starts with a capital letter and ends with appropriate terminal punctuation ('.', '!', '?'). **Do not change the original wording or grammar.**
+2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context** AND the **Word-by-Word Dictionary Entries**. This provides crucial information.
+3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain", misplaced punctuation, and incorrect spacing. Ensure the sentence starts with a capital letter and ends with appropriate terminal punctuation ('.', '!', '?'). **Do not change the original wording or grammar.**
 4.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker.
-5.  **IDENTIFY NEW IDIOMS:** Look for phrases in the Halunder sentence that are translated non-literally. If you find one that is NOT in the "Already Known Idioms" list, add it to the "discovered_idioms" array in your output. For example, if you see "beerigermarri" translated as "kleiner Penis", this is a new idiom.
-6.  **Explain Translation:** In the "notes" field, explain *why* your final translation is what it is, especially if it's idiomatic.
-7.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
-8.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
+5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal.
+6.  **Provide Alternatives:** If other valid, high-quality German translations exist, provide them.
+7.  **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
 **INPUT DATA:**
 
-**1. Full Dictionary Headword Context:**
+**1. Full Dictionary Headword Context (The entry this example belongs to):**
 \`\`\`json
 ${JSON.stringify(headwordContext, null, 2)}
 \`\`\`
 
-**2. Already Known Idioms Found in This Sentence:**
+**2. Word-by-Word Dictionary Entries for the Halunder sentence:**
 \`\`\`json
-${JSON.stringify(knownIdioms, null, 2)}
+${JSON.stringify(wordDictionaryData, null, 2)}
 \`\`\`
 
 **3. Raw Example Pair (may contain errors):**
@@ -309,14 +301,6 @@ ${JSON.stringify(knownIdioms, null, 2)}
       "translation": "A valid alternative translation.",
       "confidence_score": 0.80,
       "notes": "This is a more literal translation."
-    }
-  ],
-  "discovered_idioms": [
-    {
-      "halunder_phrase": "beerigermarri",
-      "german_equivalent": "kleiner Penis",
-      "explanation": "Auf Helgoländisch sagt man 'beerigermarri' (wörtlich: Konfirmandenwurst) umgangssprachlich für einen kleinen Penis. Dies ist eine metaphorische und humorvolle Umschreibung.",
-      "tags": ["idiom", "slang"]
     }
   ]
 }
