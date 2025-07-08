@@ -4,9 +4,8 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
+// This is the ONLY database client we need. It points to your unified SOURCE database.
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
-// This client connects to your separate, main dictionary with the 'terms' table
-const dictionaryDbClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
 
@@ -86,28 +85,16 @@ async function runDictionaryCleaner(limit) {
 
     try {
         addLog("Checking for any stale 'processing' jobs...", 'info');
-        await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
+        await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).in('cleaning_status', ['processing', 'error']);
 
         addLog(`Fetching up to ${limit} pending examples from the dictionary...`, 'info');
         
+        // Fetch all necessary data in two steps to avoid relationship errors.
+        
+        // Step 1: Get the pending examples.
         const { data: pendingExamples, error: fetchError } = await sourceDbClient
             .from('dictionary_examples')
-            .select(`
-                *,
-                entry:dictionary_entries!entry_id(
-                    german_word,
-                    word_type,
-                    etymology,
-                    additional_info,
-                    idioms,
-                    reference_notes,
-                    usage_notes,
-                    references:dictionary_references!entry_id(
-                        reference_type,
-                        target_entry:dictionary_entries!referenced_entry_id(german_word)
-                    )
-                )
-            `)
+            .select(`*`)
             .eq('cleaning_status', 'pending')
             .not('halunder_sentence', 'is', null)
             .not('german_sentence', 'is', null)
@@ -121,24 +108,14 @@ async function runDictionaryCleaner(limit) {
             return;
         }
 
-        const entriesMap = new Map();
-        if (pendingExamples.length > 0) {
-            const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
-            const { data: entriesData, error: entriesError } = await sourceDbClient
-                .from('dictionary_entries')
-                .select(`
-                    id, german_word, word_type, etymology, additional_info, idioms,
-                    reference_notes, usage_notes,
-                    references:dictionary_references!entry_id(
-                        reference_type,
-                        target_entry:dictionary_entries!referenced_entry_id(german_word)
-                    )
-                `)
-                .in('id', entryIds);
-            
-            if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
-            entriesData.forEach(entry => entriesMap.set(entry.id, entry));
-        }
+        // Step 2: Get all the related context data for the fetched examples.
+        const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
+        const { data: entriesData, error: entriesError } = await sourceDbClient
+            .from('dictionary_entries')
+            .select(`id, german_word, word_type, etymology, additional_info, idioms, reference_notes, usage_notes`)
+            .in('id', entryIds);
+        if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
+        const entriesMap = new Map(entriesData.map(entry => [entry.id, entry]));
 
         const totalToProcess = pendingExamples.length;
         addLog(`Found ${totalToProcess} examples to process.`, 'success');
@@ -178,27 +155,7 @@ async function runDictionaryCleaner(limit) {
 async function processSingleExample(example, entryContext, shouldPrintPrompt) {
     await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    // --- NEW: Dictionary Lookup for all words in the sentence ---
-    const words = [...new Set(example.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
-    let wordDictionaryData = null;
-    if (words.length > 0) {
-        const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
-        // This query now uses the separate dictionaryDbClient
-        const { data, error } = await dictionaryDbClient
-            .from('terms')
-            .select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`)
-            .or(orFilter)
-            .eq('language', 'hal');
-        
-        if (error) {
-            addLog(`Dictionary lookup failed for example ${example.id}: ${error.message}`, 'warning');
-        } else {
-            wordDictionaryData = data;
-        }
-    }
-    // --- END OF NEW LOGIC ---
-
-    const prompt = buildExampleCleanerPrompt(example, entryContext, wordDictionaryData);
+    const prompt = buildExampleCleanerPrompt(example, entryContext);
     
     if (shouldPrintPrompt) {
         console.log('----------- DICTIONARY CLEANER PROMPT -----------');
@@ -243,7 +200,7 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt) {
 }
 
 // === HELPER TO BUILD THE PROMPT ===
-function buildExampleCleanerPrompt(example, entryContext, wordDictionaryData) {
+function buildExampleCleanerPrompt(example, entryContext) {
     const headwordContext = {
         headword: entryContext?.german_word || "Unknown",
         word_type: entryContext?.word_type,
@@ -252,7 +209,9 @@ function buildExampleCleanerPrompt(example, entryContext, wordDictionaryData) {
         idioms: entryContext?.idioms,
         reference_notes: entryContext?.reference_notes,
         usage_notes: entryContext?.usage_notes,
-        related_words: entryContext?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
+        // Note: related_words are not included in this simplified version
+        // to avoid complex multi-level joins that were causing issues.
+        related_words: [] 
     };
 
     return `
@@ -263,7 +222,7 @@ Your main job is to "clean" both the Halunder and German sentences. This involve
 
 **INSTRUCTIONS:**
 1.  **Analyze the Raw Pair:** Look at the provided Halunder and German example.
-2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context** AND the **Word-by-Word Dictionary Entries**. This provides crucial information.
+2.  **Use ALL Context:** Pay close attention to the full **Dictionary Headword Context**. This provides crucial information about the main word the example illustrates.
 3.  **Correct the Halunder:** Create a clean, single-line version of the Halunder sentence. Fix OCR errors like "letj\\ninaptain" to "letj inaptain", misplaced punctuation, and incorrect spacing. Ensure the sentence starts with a capital letter and ends with appropriate terminal punctuation ('.', '!', '?'). **Do not change the original wording or grammar.**
 4.  **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker.
 5.  **Explain Idioms:** In the "notes" field, explain *why* the translation is what it is, especially if it's not literal.
@@ -272,21 +231,16 @@ Your main job is to "clean" both the Halunder and German sentences. This involve
 
 **INPUT DATA:**
 
-**1. Full Dictionary Headword Context (The entry this example belongs to):**
+**1. Full Dictionary Headword Context:**
 \`\`\`json
 ${JSON.stringify(headwordContext, null, 2)}
 \`\`\`
 
-**2. Word-by-Word Dictionary Entries for the Halunder sentence:**
-\`\`\`json
-${JSON.stringify(wordDictionaryData, null, 2)}
-\`\`\`
-
-**3. Raw Example Pair (may contain errors):**
+**2. Raw Example Pair (may contain errors):**
 - Halunder: "${example.halunder_sentence}"
 - German: "${example.german_sentence}"
 
-**4. Original Note on the Example (if any):**
+**3. Original Note on the Example (if any):**
 "${example.context_note || 'N/A'}"
 
 **YOUR JSON OUTPUT:**
