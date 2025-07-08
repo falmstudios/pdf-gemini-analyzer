@@ -17,6 +17,7 @@ const linguisticRoutes = require('./linguistic-routes.js');
 const translatorRoutes = require('./translator-routes.js');
 // Add this for the new Corpus Builder feature
 const corpusBuilderRoutes = require('./corpus-builder.js');
+const dictionaryCleanerRoutes = require('./dictionary-cleaner-routes.js');
 
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
@@ -48,6 +49,7 @@ app.use('/dictionary', dictionaryRoutes);
 app.use('/translator', translatorRoutes);
 // Add this for the new Corpus Builder feature
 app.use('/corpus', corpusBuilderRoutes);
+app.use('/dictionary-cleaner', dictionaryCleanerRoutes);
 
 // === PAGE SERVING ROUTES ===
 app.get('/', (req, res) => {
@@ -68,6 +70,9 @@ app.get('/linguistic-cleaner', (req, res) => {
 // Add this route to serve the Corpus Builder page
 app.get('/corpus-builder', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'corpus-builder.html'));
+});
+app.get('/dictionary-cleaner', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dictionary-cleaner.html'));
 });
 
 // Health check route
