@@ -4,7 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 // === DATABASE CONNECTIONS ===
-const mainDictionaryDb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+// This client connects to your SOURCE database where all the tables for this process exist.
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -26,7 +26,6 @@ function addLog(message, type = 'info') {
     console.log(`[DICT-CLEANER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === API CALLER (FIXED) ===
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
@@ -46,7 +45,7 @@ async function callOpenAI_Api(prompt) {
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    // temperature: 0.7, <-- REMOVED THIS LINE
+                    // temperature is removed as the model does not support it
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -86,18 +85,35 @@ async function runDictionaryCleaner(limit) {
     addLog(`Starting Dictionary Example Cleaner process...`, 'info');
 
     try {
+        // --- FIX: Use the correct database client for ALL operations ---
         addLog("Checking for any stale 'processing' jobs...", 'info');
-        await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
+        await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'pending' }).eq('cleaning_status', 'processing');
 
         addLog(`Fetching up to ${limit} pending examples from the dictionary...`, 'info');
         
-        const { data: pendingExamples, error: fetchError } = await mainDictionaryDb
+        const { data: pendingExamples, error: fetchError } = await sourceDbClient
             .from('dictionary_examples')
-            .select(`*`)
+            .select(`
+                *,
+                entry:dictionary_entries!entry_id(
+                    german_word,
+                    word_type,
+                    etymology,
+                    additional_info,
+                    idioms,
+                    reference_notes,
+                    usage_notes,
+                    references:dictionary_references!entry_id(
+                        reference_type,
+                        target_entry:dictionary_entries!referenced_entry_id(german_word)
+                    )
+                )
+            `)
             .eq('cleaning_status', 'pending')
             .not('halunder_sentence', 'is', null)
             .not('german_sentence', 'is', null)
             .limit(limit);
+        // --- END OF FIX ---
 
         if (fetchError) throw new Error(`Failed to fetch examples: ${fetchError.message}`);
         if (!pendingExamples || pendingExamples.length === 0) {
@@ -107,29 +123,6 @@ async function runDictionaryCleaner(limit) {
             return;
         }
 
-        const entryIds = [...new Set(pendingExamples.map(ex => ex.entry_id))];
-        const { data: entriesData, error: entriesError } = await mainDictionaryDb
-            .from('dictionary_entries')
-            .select(`
-                id,
-                german_word,
-                word_type,
-                etymology,
-                additional_info,
-                idioms,
-                reference_notes,
-                usage_notes,
-                references:dictionary_references!entry_id(
-                    reference_type,
-                    target_entry:dictionary_entries!referenced_entry_id(german_word)
-                )
-            `)
-            .in('id', entryIds);
-        
-        if (entriesError) throw new Error(`Failed to fetch entry context: ${entriesError.message}`);
-
-        const entriesMap = new Map(entriesData.map(entry => [entry.id, entry]));
-
         const totalToProcess = pendingExamples.length;
         addLog(`Found ${totalToProcess} examples to process.`, 'success');
         processingState.status = 'Cleaning examples with AI...';
@@ -138,12 +131,11 @@ async function runDictionaryCleaner(limit) {
         for (const example of pendingExamples) {
             addLog(`Processing example ${processedCount + 1} of ${totalToProcess}...`, 'info');
             try {
-                const entryContext = entriesMap.get(example.entry_id);
-                await processSingleExample(example, entryContext, !firstPromptPrinted);
+                await processSingleExample(example, !firstPromptPrinted);
                 if (!firstPromptPrinted) firstPromptPrinted = true;
             } catch (e) {
                 addLog(`Failed to process example ID ${example.id}: ${e.message}`, 'error');
-                await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'error' }).eq('id', example.id);
+                await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'error' }).eq('id', example.id);
             }
             processedCount++;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} examples.`;
@@ -165,10 +157,10 @@ async function runDictionaryCleaner(limit) {
 }
 
 // === THE AI PIPELINE FOR A SINGLE EXAMPLE ===
-async function processSingleExample(example, entryContext, shouldPrintPrompt) {
-    await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
+async function processSingleExample(example, shouldPrintPrompt) {
+    await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
-    const prompt = buildExampleCleanerPrompt(example, entryContext);
+    const prompt = buildExampleCleanerPrompt(example);
     
     if (shouldPrintPrompt) {
         console.log('----------- DICTIONARY CLEANER PROMPT -----------');
@@ -201,10 +193,10 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt) {
         });
     }
 
-    const { error: insertError } = await mainDictionaryDb.from('cleaned_dictionary_examples').insert(cleanedEntries);
+    const { error: insertError } = await sourceDbClient.from('cleaned_dictionary_examples').insert(cleanedEntries);
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
-    await mainDictionaryDb.from('dictionary_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
+    await sourceDbClient.from('dictionary_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
     
     const logMessage = `[HAL-CLEANED] ${aiResult.cleaned_halunder} -> [DE] ${aiResult.cleaned_german}`;
     addLog(logMessage, 'success');
@@ -213,16 +205,16 @@ async function processSingleExample(example, entryContext, shouldPrintPrompt) {
 }
 
 // === HELPER TO BUILD THE PROMPT ===
-function buildExampleCleanerPrompt(example, entryContext) {
+function buildExampleCleanerPrompt(example) {
     const headwordContext = {
-        headword: entryContext?.german_word || "Unknown",
-        word_type: entryContext?.word_type,
-        etymology: entryContext?.etymology,
-        additional_info: entryContext?.additional_info,
-        idioms: entryContext?.idioms,
-        reference_notes: entryContext?.reference_notes,
-        usage_notes: entryContext?.usage_notes,
-        related_words: entryContext?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
+        headword: example.entry?.german_word || "Unknown",
+        word_type: example.entry?.word_type,
+        etymology: example.entry?.etymology,
+        additional_info: example.entry?.additional_info,
+        idioms: example.entry?.idioms,
+        reference_notes: example.entry?.reference_notes,
+        usage_notes: example.entry?.usage_notes,
+        related_words: example.entry?.references?.map(r => r.target_entry?.german_word).filter(Boolean) || []
     };
 
     return `
