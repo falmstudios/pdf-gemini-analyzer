@@ -26,15 +26,12 @@ const axiosInstance = axios.create({
   maxBodyLength: Infinity
 });
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
 // This client is now only used for the old PDF analyzer's "Save" feature.
 // It will be safely ignored if the old SUPABASE_URL is not set.
-let supabase = null;
+let supabase_old = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
-  console.warn("Legacy SUPABASE_URL is set, but should be phased out. The old PDF Analyzer will use it for saving.");
-  supabase = createClient(
+  console.warn("Legacy SUPABASE_URL is set. The old PDF Analyzer will use it for saving.");
+  supabase_old = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_ANON_KEY
   );
@@ -45,9 +42,9 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
-// === API ROUTES ===
-app.use('/dictionary-builder', dictionaryBuilderRoutes);
-app.use('/dictionary', dictionaryRoutes);
+// === API ROUTES (CORRECTED) ===
+app.use('/dictionary-builder', dictionaryBuilderRoutes); // For the admin builder tool
+app.use('/dictionary', dictionaryRoutes); // For the public viewer tool
 app.use('/linguistic', linguisticRoutes);
 app.use('/translator', translatorRoutes);
 app.use('/corpus', corpusBuilderRoutes);
@@ -60,11 +57,11 @@ app.get('/', (req, res) => {
 app.get('/dictionary-viewer', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'dictionary-viewer.html'));
 });
-app.get('/pdf-analyzer', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
 app.get('/dictionary-builder', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'dictionary.html'));
+});
+app.get('/pdf-analyzer', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 app.get('/linguistic-cleaner', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'linguistic.html'));
