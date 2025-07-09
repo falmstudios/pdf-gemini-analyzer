@@ -26,7 +26,7 @@ function addLog(processType, message, type = 'info') {
     }
     const log = { id: Date.now() + Math.random(), message, type, timestamp: new Date().toISOString() };
     processingStates[processType].logs.push(log);
-    if (processingStates[processType].logs.length > 1000) {
+    if (processingState.logs.length > 1000) {
         processingStates[processType].logs = processingStates[processType].logs.slice(-1000);
     }
     console.log(`[${processType.toUpperCase()}] [${type.toUpperCase()}] ${message}`);
