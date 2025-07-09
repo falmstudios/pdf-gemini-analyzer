@@ -2,103 +2,77 @@ const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 
-// === FIX IS HERE: Use the correct environment variables for the SOURCE database ===
+// Use the SOURCE database for ALL operations now
 const supabase = createClient(
     process.env.SOURCE_SUPABASE_URL,
     process.env.SOURCE_SUPABASE_ANON_KEY
 );
 
-// The main route that does all the work
-router.post('/analyze-and-translate', async (req, res) => {
-    const { sentence } = req.body;
-
-    if (!sentence) {
-        return res.status(400).json({ error: 'Sentence is required.' });
-    }
-
+router.get('/search', async (req, res) => {
     try {
-        // --- 1. WORD-BY-WORD ANALYSIS ---
-        const words = [...new Set(sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
-        let wordAnalysis = [];
-
-        if (words.length > 0) {
-            // This query now correctly joins through the 'new_concept_to_term' table in the SOURCE database
-            const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
-            const dictionaryPromise = supabase
-                .from('new_terms')
-                .select(`
-                    term_text,
-                    new_concept_to_term!inner(
-                        concept:new_concepts!inner(primary_german_label)
-                    )
-                `)
-                .or(orFilter)
-                .eq('language', 'hal');
-            
-            const featuresPromise = supabase
-                .from('cleaned_linguistic_examples')
-                .select('halunder_term, explanation, feature_type')
-                .in('halunder_term', words);
-
-            const [dictionaryResults, featuresResults] = await Promise.all([dictionaryPromise, featuresPromise]);
-
-            if (dictionaryResults.error) throw new Error(`Dictionary search error: ${dictionaryResults.error.message}`);
-            if (featuresResults.error) throw new Error(`Linguistic features search error: ${featuresResults.error.message}`);
-
-            const dictionaryMap = new Map();
-            if (dictionaryResults.data) {
-                dictionaryResults.data.forEach(item => {
-                    const germanLabel = item.new_concept_to_term[0]?.concept?.primary_german_label;
-                    if (germanLabel) {
-                        dictionaryMap.set(item.term_text.toLowerCase(), germanLabel);
-                    }
-                });
+        const { term, letter, lang = 'both', page = 1 } = req.query;
+        const limit = 20;
+        const offset = (page - 1) * limit;
+        
+        let query = supabase
+            .from('new_concepts')
+            .select(`
+                id, primary_german_label, part_of_speech, notes, german_definition, krogmann_info, krogmann_idioms, sense_id, sense_number,
+                new_concept_to_term:new_concept_to_term!inner(pronunciation, gender, plural_form, etymology, homonym_number, note, source_name, alternative_forms, term:new_terms!inner(term_text, language)),
+                new_examples:new_examples(halunder_sentence, german_sentence, note, example_type),
+                source_relations:new_relations!source_concept_id(relation_type, note, target_concept:new_concepts!target_concept_id(id, primary_german_label)),
+                new_source_citations:new_source_citations(citation_text)
+            `, { count: 'exact' })
+            .order('primary_german_label');
+        
+        if (term) {
+            if (lang === 'de') {
+                query = query.ilike('primary_german_label', `%${term}%`);
+            } else if (lang === 'hal') {
+                query = query.filter('new_concept_to_term.new_terms.term_text', 'ilike', `%${term}%`);
+            } else {
+                query = query.or(
+                    `primary_german_label.ilike.%${term}%`,
+                    `new_concept_to_term.new_terms.term_text.ilike.%${term}%`
+                );
             }
-
-            const featuresMap = new Map();
-            if (featuresResults.data) {
-                featuresResults.data.forEach(item => {
-                    featuresMap.set(item.halunder_term.toLowerCase(), item);
-                });
-            }
-
-            wordAnalysis = words.map(word => ({
-                word: word,
-                dictionaryMeaning: dictionaryMap.get(word) || null,
-                linguisticFeature: featuresMap.get(word) || null
-            }));
+        } else if (letter) {
+            query = query.ilike('primary_german_label', `${letter}%`);
         }
-
-        // --- 2. EXTERNAL API TRANSLATION ---
-        const apiUrl = 'https://api.runpod.ai/v2/wyg1vwde9yva0y/runsync';
-        const apiKey = process.env.RUNPOD_API_KEY;
-
-        const apiResponse = await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-            body: JSON.stringify({
-                input: {
-                    text: sentence,
-                    num_alternatives: 3
+        
+        const { data, error, count } = await query.range(offset, offset + limit - 1);
+        if (error) throw error;
+        
+        const entries = data.map(concept => {
+            const translationMap = new Map();
+            concept.new_concept_to_term.filter(ct => ct.term.language === 'hal').forEach(ct => {
+                const key = ct.term.term_text;
+                if (!translationMap.has(key)) {
+                    translationMap.set(key, { term: ct.term.term_text, pronunciation: ct.pronunciation, gender: ct.gender, plural: ct.plural_form, etymology: ct.etymology, note: ct.note, alternativeForms: ct.alternative_forms, sources: [] });
                 }
-            })
+                translationMap.get(key).sources.push(ct.source_name);
+            });
+            return {
+                id: concept.id,
+                headword: concept.primary_german_label,
+                partOfSpeech: concept.part_of_speech,
+                germanDefinition: concept.german_definition,
+                ahrhammarNotes: concept.notes,
+                krogmannInfo: concept.krogmann_info,
+                krogmannIdioms: concept.krogmann_idioms,
+                senseId: concept.sense_id,
+                senseNumber: concept.sense_number,
+                homonymNumber: concept.new_concept_to_term[0]?.homonym_number,
+                translations: Array.from(translationMap.values()),
+                examples: concept.new_examples.map(ex => ({ halunder: ex.halunder_sentence, german: ex.german_sentence, note: ex.note, type: ex.example_type })),
+                relations: concept.source_relations.map(rel => ({ type: rel.relation_type.replace(/_/g, ' '), targetTerm: rel.target_concept.primary_german_label, targetId: rel.target_concept.id, note: rel.note })),
+                citations: concept.new_source_citations.map(c => c.citation_text)
+            };
         });
-
-        if (!apiResponse.ok) {
-            const errorBody = await apiResponse.text();
-            throw new Error(`Translation API failed with status ${apiResponse.status}: ${errorBody}`);
-        }
-
-        const translationData = await apiResponse.json();
-
-        // --- 3. SEND COMBINED RESPONSE ---
-        res.json({
-            wordAnalysis: wordAnalysis,
-            apiTranslation: translationData
-        });
-
+        
+        res.json({ entries, totalEntries: count || 0, totalPages: Math.ceil((count || 0) / limit), currentPage: parseInt(page) });
     } catch (error) {
-        console.error('Translation/Analysis Error:', error);
+        console.error('Search error:', error);
         res.status(500).json({ error: error.message });
     }
 });
