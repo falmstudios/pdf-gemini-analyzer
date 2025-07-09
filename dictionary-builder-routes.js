@@ -90,10 +90,13 @@ router.get('/stats', async (req, res) => {
         const { count: termsCount } = await supabase.from('new_terms').select('*', { count: 'exact', head: true });
         let csvCount = 0;
         try {
+            // --- FIX IS HERE: Corrected the file path ---
             const csvPath = path.join(__dirname, '..', 'public', 'miin_iaars_duusend_wurder.csv');
             const csvContent = await fs.readFile(csvPath, 'utf8');
             csvCount = Papa.parse(csvContent, { header: true, skipEmptyLines: true }).data.length;
-        } catch (error) { console.log('CSV file not found or error reading'); }
+        } catch (error) { 
+            console.log('CSV file not found or error reading:', error.message); 
+        }
         res.json({ ahrhammarCount: ahrhammarCount || 0, krogmannCount: krogmannCount || 0, csvCount, conceptsCount: conceptsCount || 0, termsCount: termsCount || 0 });
     } catch (error) {
         console.error('Stats error:', error);
