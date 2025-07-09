@@ -37,7 +37,7 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
   );
 }
 
-// === MIDDLEWARE ===
+// === MIDDLEWARE ====
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
