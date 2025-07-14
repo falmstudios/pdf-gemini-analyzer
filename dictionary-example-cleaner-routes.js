@@ -1,5 +1,5 @@
 // ===============================================
-// COMPLETE DICTIONARY EXAMPLE CLEANER ROUTES WITH PROMPT DISPLAY
+// FIXED DICTIONARY EXAMPLE CLEANER ROUTES - ONE ROW PER TRANSLATION
 // File: dictionary-example-cleaner-routes.js
 // Location: /dictionary-example-cleaner-routes.js (root of your project)
 // ===============================================
@@ -53,7 +53,6 @@ async function callOpenAI_Api(prompt) {
                         { "role": "user", "content": prompt }
                     ],
                     response_format: { "type": "json_object" }
-                    // Removed temperature as requested
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
             );
@@ -229,7 +228,7 @@ async function runDictionaryExampleCleaner(limit) {
     }
 }
 
-// Enhanced single example processing
+// Enhanced single example processing - FIXED to create separate rows
 async function processSingleExample(example, shouldPrintPrompt) {
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
@@ -274,20 +273,39 @@ async function processSingleExample(example, shouldPrintPrompt) {
 
     const aiResult = await callOpenAI_Api(prompt);
 
-    // Save cleaned result with the prompt
-    const cleanedEntry = {
+    // FIXED: Create separate rows for each translation instead of storing as JSON
+    const translationsToInsert = [];
+    
+    // 1. Best translation (primary)
+    translationsToInsert.push({
         original_example_id: example.id,
         cleaned_halunder: aiResult.cleaned_halunder,
         cleaned_german: aiResult.best_translation,
         confidence_score: aiResult.confidence_score,
         ai_notes: aiResult.notes,
-        alternative_translations: aiResult.alternative_translations,
-        openai_prompt: prompt // Store the exact prompt
-    };
+        alternative_translations: 'gpt4_best', // Source identifier
+        openai_prompt: prompt
+    });
 
+    // 2. Alternative translations (separate rows)
+    if (aiResult.alternative_translations && Array.isArray(aiResult.alternative_translations)) {
+        aiResult.alternative_translations.forEach((alt, index) => {
+            translationsToInsert.push({
+                original_example_id: example.id,
+                cleaned_halunder: aiResult.cleaned_halunder,
+                cleaned_german: alt.translation,
+                confidence_score: alt.confidence_score || 0.7,
+                ai_notes: alt.notes || '',
+                alternative_translations: `gpt4_alternative_${index + 1}`, // Source identifier
+                openai_prompt: prompt
+            });
+        });
+    }
+
+    // Insert all translation rows
     const { error: insertError } = await sourceDbClient
         .from('ai_cleaned_dictsentences')
-        .insert([cleanedEntry]);
+        .insert(translationsToInsert);
     
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
@@ -317,7 +335,7 @@ async function processSingleExample(example, shouldPrintPrompt) {
 
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
     
-    const logMessage = `[CLEANED] ${aiResult.cleaned_halunder} -> ${aiResult.best_translation}`;
+    const logMessage = `[CLEANED] ${aiResult.cleaned_halunder} -> ${aiResult.best_translation} (+${translationsToInsert.length - 1} alternatives)`;
     addLog(logMessage, 'success');
     
     return shouldPrintPrompt;
@@ -342,7 +360,8 @@ Your main job is to "clean" both the Halunder and German sentences, and to ident
    - **Cultural references**: Traditions, customs, local practices
    - **Historical references**: People, events, old practices
    - **Metaphorical expressions**: Colorful language unique to Helgoland
-6. **Output JSON:** Structure your entire response in the following JSON format ONLY.
+6. **Provide Multiple Valid Translations:** Give 2-3 different ways to translate the German that are all correct but use different words or styles.
+7. **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
 **INPUT DATA:**
 
@@ -377,9 +396,14 @@ ${JSON.stringify(knownIdioms, null, 2)}
   "notes": "Explain why the translation is what it is, especially referencing the individual word contexts provided.",
   "alternative_translations": [
     {
-      "translation": "A valid alternative translation.",
-      "confidence_score": 0.80,
-      "notes": "This is a more literal translation."
+      "translation": "Wahr werden.",
+      "confidence_score": 0.90,
+      "notes": "More literal translation focusing on 'becoming true'."
+    },
+    {
+      "translation": "Es wird Realität.",
+      "confidence_score": 0.85,
+      "notes": "Alternative emphasizing the reality aspect."
     }
   ],
   "discovered_highlights": [
@@ -389,13 +413,6 @@ ${JSON.stringify(knownIdioms, null, 2)}
       "german_meaning": "kleiner Penis",
       "explanation_german": "Auf Helgoländisch sagt man 'beerigermarri' (wörtlich: Konfirmandenwurst) umgangssprachlich für einen kleinen Penis. Dies ist eine metaphorische und humorvolle Umschreibung, die in der lokalen Kultur verwurzelt ist.",
       "type": "idiom"
-    },
-    {
-      "halunder_phrase": "Nathurnstak",
-      "german_literal": "Nordspitze",
-      "german_meaning": "Lange Anna",
-      "explanation_german": "Das Wahrzeichen Helgolands ist die Lange Anna, welche auf Halunder 'Nathurnstak' heißt. Die Bezeichnung bezieht sich auf die Nordspitze der Insel.",
-      "type": "place_name"
     }
   ]
 }
