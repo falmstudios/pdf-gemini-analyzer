@@ -1,6 +1,16 @@
 // ===============================================
-// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE BATCH VERSION WITH FULL CONTEXT
+// FINAL FIXED DICTIONARY EXAMPLE CLEANER ROUTES
 // File: dictionary-example-cleaner-routes.js
+// Uses cleaned_linguistic_examples table for discovered idioms
+//
+// FEATURES:
+// - Fetches all pending examples using pagination.
+// - Groups examples by concept_id for contextual AI processing.
+// - Processes groups concurrently in staggered chunks for high throughput.
+// - AI expands sentence variations (e.g., A/B/C) into distinct entries.
+// - AI judges and provides a relevance_score (1-10) for discovered highlights.
+// - AI prioritizes natural, idiomatic German for the primary translation.
+// - Robust logic to save all expanded sentences and update/insert highlights.
 // ===============================================
 
 const express = require('express');
@@ -8,169 +18,240 @@ const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
-// === DATABASE & API CLIENTS ===
+// Database connection - using SOURCE database only
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
+
+// Use a long timeout for the OpenAI API calls
 const axiosInstance = axios.create({ timeout: 0 });
 
-// === TUNING PARAMETERS (TIER 2) ===
-const BATCH_SIZE = 3; 
-const CONCURRENT_BATCHES = 10; 
-
-// === STATE MANAGEMENT ===
-let processingState = { isProcessing: false, progress: 0, status: 'Idle', details: '', logs: [], startTime: null, lastPromptUsed: null };
+// State management
+let processingState = {
+    isProcessing: false,
+    progress: 0,
+    status: 'Idle',
+    details: '',
+    logs: [],
+    startTime: null,
+    lastPromptUsed: null
+};
 
 function addLog(message, type = 'info') {
     const log = { id: Date.now() + Math.random(), message, type, timestamp: new Date().toISOString() };
     processingState.logs.push(log);
-    if (processingState.logs.length > 2000) processingState.logs.shift();
+    if (processingState.logs.length > 1000) processingState.logs.shift();
     console.log(`[DICT-EXAMPLE-CLEANER] [${type.toUpperCase()}] ${message}`);
 }
 
-// === API CALLER ===
+// OpenAI API caller (no temperature)
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
     const apiUrl = 'https://api.openai.com/v1/chat/completions';
+    
     let attempts = 0;
     const maxAttempts = 4;
     let delay = 5000;
+
     while (attempts < maxAttempts) {
         try {
-            const response = await axiosInstance.post(apiUrl, {
-                model: "gpt-4-turbo",
-                messages: [{ "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },{ "role": "user", "content": prompt }],
-                response_format: { "type": "json_object" }
-            }, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${apiKey}` } });
-            if (response.data?.choices?.[0]) return JSON.parse(response.data.choices[0].message.content);
+            const response = await axiosInstance.post(
+                apiUrl,
+                {
+                    model: "gpt-4.1-2025-04-14",
+                    messages: [
+                        { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
+                        { "role": "user", "content": prompt }
+                    ],
+                    response_format: { "type": "json_object" }
+                },
+                { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
+            );
+
+            if (response.data && response.data.choices && response.data.choices[0]) {
+                const content = response.data.choices[0].message.content;
+                try {
+                    return JSON.parse(content);
+                } catch (jsonError) {
+                    addLog(`Failed to parse JSON from OpenAI response. Content: ${content}`, 'error');
+                    throw new Error('OpenAI returned invalid JSON.');
+                }
+            }
             throw new Error('Invalid response format from OpenAI API');
         } catch (error) {
-            if (error instanceof SyntaxError) {
-                addLog(`CRITICAL: OpenAI API returned non-JSON. Likely a network/firewall issue.`, 'error');
-                throw new Error("OpenAI API returned invalid data (likely HTML block page).");
-            }
-            if (error.response?.status === 429) {
+            if (error.response && error.response.status === 429) {
                 attempts++;
-                if (attempts >= maxAttempts) throw new Error('OpenAI API rate limit exceeded after multiple retries.');
-                const waitTime = delay + (Math.random() * 1000);
-                addLog(`Rate limit hit. Retrying in ${Math.round(waitTime/1000)}s...`, 'warning');
+                if (attempts >= maxAttempts) {
+                    addLog(`Max retry attempts reached for OpenAI API. Giving up.`, 'error');
+                    throw new Error('OpenAI API rate limit exceeded after multiple retries.');
+                }
+                const jitter = Math.random() * 1000;
+                const waitTime = delay + jitter;
+                addLog(`OpenAI API rate limit hit. Retrying in ${Math.round(waitTime / 1000)}s... (Attempt ${attempts}/${maxAttempts})`, 'warning');
                 await new Promise(resolve => setTimeout(resolve, waitTime));
                 delay *= 2;
-            } else { throw error; }
+            } else {
+                const errorMessage = error.response ? JSON.stringify(error.response.data) : error.message;
+                addLog(`OpenAI API Error: ${errorMessage}`, 'error');
+                throw new Error(`OpenAI API error: ${errorMessage}`);
+            }
         }
     }
 }
 
-// === DATABASE HELPERS ===
-async function fetchAllWithPagination(queryBuilder, limit) {
-    const PAGE_SIZE = 1000;
-    let allData = [];
+// Fetches ALL pending examples from Supabase, handling pagination.
+async function fetchAllPendingExamples() {
+    let allExamples = [];
     let page = 0;
-    let fetchedData;
-    do {
-        const { data, error } = await queryBuilder.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
-        if (error) throw error;
-        fetchedData = data;
-        if (fetchedData?.length > 0) allData.push(...fetchedData);
-        page++;
-    } while (fetchedData && fetchedData.length === PAGE_SIZE && (!limit || allData.length < limit));
-    return limit ? allData.slice(0, limit) : allData;
+    const pageSize = 1000; // Supabase limit per query
+    let hasMore = true;
+
+    while(hasMore) {
+        const { data, error } = await sourceDbClient
+            .from('new_examples')
+            .select(`
+                *,
+                concept:new_concepts!inner(
+                    id, primary_german_label, part_of_speech, german_definition,
+                    notes, krogmann_info, krogmann_idioms
+                )
+            `)
+            .eq('cleaning_status', 'pending')
+            .not('halunder_sentence', 'is', null)
+            .not('german_sentence', 'is', null)
+            .range(page * pageSize, (page + 1) * pageSize - 1);
+
+        if (error) throw new Error(`Failed to fetch examples: ${error.message}`);
+
+        if (data && data.length > 0) {
+            allExamples = allExamples.concat(data);
+            page++;
+            if(data.length < pageSize) {
+                hasMore = false;
+            }
+        } else {
+            hasMore = false;
+        }
+    }
+    return allExamples;
 }
 
 async function getWordContext(words) {
-    if (!words || words.length === 0) return {};
-    const uniqueWords = [...new Set(words)];
-    const orFilter = uniqueWords.map(word => `term_text.ilike.${word}`).join(',');
-    const query = sourceDbClient.from('new_terms').select(`
-            term_text, new_concept_to_term!inner(
-                pronunciation, gender, plural_form, etymology, note,
-                concept:new_concepts!inner(primary_german_label, part_of_speech, german_definition)
+    if (!words || words.length === 0) return [];
+
+    const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
+    
+    const { data: termData, error } = await sourceDbClient
+        .from('new_terms')
+        .select(`
+            term_text,
+            language,
+            new_concept_to_term!inner(
+                pronunciation, gender, plural_form, etymology, note, source_name, alternative_forms,
+                concept:new_concepts!inner(id, primary_german_label, part_of_speech, german_definition, notes, krogmann_info, krogmann_idioms, sense_number)
             )
-        `).or(orFilter).eq('language', 'hal');
-    const termData = await fetchAllWithPagination(query);
-    const wordContextMap = {};
-    termData.forEach(term => {
-        if (!wordContextMap[term.term_text.toLowerCase()]) wordContextMap[term.term_text.toLowerCase()] = [];
-        term.new_concept_to_term.forEach(connection => {
-            wordContextMap[term.term_text.toLowerCase()].push({
-                german_equivalent: connection.concept.primary_german_label,
-                part_of_speech: connection.concept.part_of_speech,
-                german_definition: connection.concept.german_definition,
-                pronunciation: connection.pronunciation, gender: connection.gender,
-                plural_form: connection.plural_form, etymology: connection.etymology, note: connection.note,
+        `)
+        .or(orFilter)
+        .eq('language', 'hal');
+
+    if (error) {
+        addLog(`Dictionary lookup error: ${error.message}`, 'warning');
+        return [];
+    }
+    
+    const wordContext = [];
+    if (termData) {
+        termData.forEach(term => {
+            term.new_concept_to_term.forEach(connection => {
+                wordContext.push({
+                    halunder_word: term.term_text,
+                    german_equivalent: connection.concept.primary_german_label,
+                    part_of_speech: connection.concept.part_of_speech,
+                    german_definition: connection.concept.german_definition,
+                    pronunciation: connection.pronunciation,
+                    gender: connection.gender,
+                    plural_form: connection.plural_form,
+                    etymology: connection.etymology,
+                    notes: connection.concept.notes,
+                    krogmann_info: connection.concept.krogmann_info,
+                    source_name: connection.source_name
+                });
             });
         });
-    });
-    return wordContextMap;
-}
-
-function chunkArray(array, size) {
-    const chunked_arr = [];
-    for (let i = 0; i < array.length; i += size) {
-        chunked_arr.push(array.slice(i, i + size));
     }
-    return chunked_arr;
+
+    return wordContext;
 }
 
-
-// === MAIN PROCESSING LOGIC ===
-async function runDictionaryExampleCleaner(limit) {
+// Main processing function - now runs concurrently on groups
+async function runDictionaryExampleCleaner() {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now(), lastPromptUsed: null };
-    addLog(`Starting... Batch Size: ${BATCH_SIZE}, Concurrent Batches: ${CONCURRENT_BATCHES}`, 'info');
+    let firstPromptPrinted = false;
+    addLog(`Starting enhanced dictionary example cleaning process...`, 'info');
 
     try {
+        addLog("Resetting any stale 'processing' or 'error' jobs to 'pending'...", 'info');
         await sourceDbClient.from('new_examples').update({ cleaning_status: 'pending' }).in('cleaning_status', ['processing', 'error']);
-        addLog("Reset stale jobs.", 'info');
 
-        const pendingQuery = sourceDbClient.from('new_examples').select(`*, concept:new_concepts!inner(*)`).eq('cleaning_status', 'pending');
-        const pendingExamples = await fetchAllWithPagination(pendingQuery, limit);
-        if (pendingExamples.length === 0) {
-            processingState = { ...processingState, status: 'Completed (No new examples)', isProcessing: false };
-            addLog('No pending examples found.', 'success');
+        addLog(`Fetching all pending examples from the dictionary (with pagination)...`, 'info');
+        const pendingExamples = await fetchAllPendingExamples();
+
+        if (!pendingExamples || pendingExamples.length === 0) {
+            addLog('No pending examples found to clean.', 'success');
+            processingState.status = 'Completed (No new examples)';
+            processingState.isProcessing = false;
             return;
         }
 
-        const totalToProcess = pendingExamples.length;
-        addLog(`Found ${totalToProcess} examples to process.`, 'success');
-        processingState.status = 'Batching and cleaning examples...';
+        addLog(`Found ${pendingExamples.length} total examples. Grouping by concept ID...`, 'info');
+        
+        const exampleGroups = pendingExamples.reduce((acc, ex) => {
+            const key = ex.concept.id;
+            if (!acc[key]) acc[key] = [];
+            acc[key].push(ex);
+            return acc;
+        }, {});
 
-        const batches = chunkArray(pendingExamples, BATCH_SIZE);
-        let processedCount = 0;
-        let firstPromptPrinted = false;
+        const groupsToProcess = Object.values(exampleGroups);
+        const totalGroups = groupsToProcess.length;
+        addLog(`Created ${totalGroups} groups to process.`, 'success');
+        
+        processingState.status = 'Cleaning example groups with enhanced AI context...';
+        let processedGroupCount = 0;
 
-        const idiomQuery = sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, tags').gte('relevance_score', 6);
-        const knownIdioms = await fetchAllWithPagination(idiomQuery);
-        addLog(`Loaded ${knownIdioms.length} known idioms from all pages.`, 'info');
-
-        for (let i = 0; i < batches.length; i += CONCURRENT_BATCHES) {
-            const concurrentBatchGroup = batches.slice(i, i + CONCURRENT_BATCHES);
-            addLog(`Processing a block of ${concurrentBatchGroup.length} batches (starting at batch #${i + 1})...`, 'info');
-
-            const batchPromises = concurrentBatchGroup.map((batch, index) => {
-                const shouldPrintPrompt = !firstPromptPrinted && i === 0 && index === 0;
-                return processBatch(batch, knownIdioms || [], shouldPrintPrompt)
-                    .then(res => {
-                        if (res.promptWasPrinted) firstPromptPrinted = true;
-                        return res.processedCount;
+        // Process in concurrent chunks
+        const CONCURRENT_CHUNKS = 5;
+        for (let i = 0; i < totalGroups; i += CONCURRENT_CHUNKS) {
+            const chunk = groupsToProcess.slice(i, i + CONCURRENT_CHUNKS);
+            
+            const processingPromises = chunk.map((group, index) => {
+                return new Promise(resolve => setTimeout(resolve, index * 200)) // Stagger calls slightly
+                    .then(() => processExampleGroup(group, !firstPromptPrinted && index === 0))
+                    .catch(e => {
+                        addLog(`Failed to process group for concept ID ${group[0].concept.id}: ${e.message}`, 'error');
+                        const idsToUpdate = group.map(ex => ex.id);
+                        return sourceDbClient.from('new_examples').update({ cleaning_status: 'error' }).in('id', idsToUpdate);
                     });
             });
 
-            const results = await Promise.allSettled(batchPromises);
-            results.forEach(result => {
-                if(result.status === 'fulfilled' && result.value) {
-                    processedCount += result.value;
-                }
-            });
+            await Promise.all(processingPromises);
+            
+            if (!firstPromptPrinted && chunk.length > 0) firstPromptPrinted = true;
 
-            processingState.details = `Processed ${processedCount} of ${totalToProcess} total examples.`;
-            processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
+            processedGroupCount += chunk.length;
+            processingState.details = `Processed ${processedGroupCount} of ${totalGroups} groups.`;
+            processingState.progress = totalGroups > 0 ? (processedGroupCount / totalGroups) : 1;
+
+            if (i + CONCURRENT_CHUNKS < totalGroups) {
+                await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause between chunks
+            }
         }
-
+        
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
-        addLog(`Processing complete in ${processingTime}s.`, 'success');
+        addLog(`Processing complete for all ${totalGroups} groups in ${processingTime}s.`, 'success');
         processingState.status = 'Completed';
 
     } catch (error) {
-        addLog(`CRITICAL ERROR: ${error.message}`, 'error');
+        addLog(`A critical error occurred: ${error.message}`, 'error');
         processingState.status = 'Error';
         throw error;
     } finally {
@@ -178,194 +259,297 @@ async function runDictionaryExampleCleaner(limit) {
     }
 }
 
-// Processes a batch of examples
-async function processBatch(batch, knownIdioms, shouldPrintPrompt) {
-    if (!batch || batch.length === 0) return { processedCount: 0, promptWasPrinted: false };
-    const batchIds = batch.map(ex => ex.id);
-    await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', batchIds);
+// Processes a group of examples related to the same concept
+async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
+    const concept = exampleGroup[0].concept;
+    const groupIds = exampleGroup.map(ex => ex.id);
+    await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', groupIds);
+
+    const allSentences = exampleGroup.map(ex => ex.halunder_sentence).join(' ');
+    const words = [...new Set(allSentences.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
     
-    try {
-        const allWordsInBatch = batch.flatMap(ex => ex.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
-        const wordContext = await getWordContext(allWordsInBatch);
-        
-        const prompt = buildBatchCleaningPrompt(batch, wordContext, knownIdioms);
-        if (shouldPrintPrompt) {
-            processingState.lastPromptUsed = prompt;
-            addLog('Printed first batch prompt to console.', 'info');
-        }
+    const [wordContexts, knownIdioms] = await Promise.all([
+        getWordContext(words),
+        sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, tags').gte('relevance_score', 6)
+    ]);
+    
+    const headwordContext = {
+        headword: concept.primary_german_label,
+        part_of_speech: concept.part_of_speech,
+        german_definition: concept.german_definition,
+        notes: concept.notes,
+        krogmann_info: concept.krogmann_info,
+        krogmann_idioms: concept.krogmann_idioms
+    };
 
-        const aiResult = await callOpenAI_Api(prompt);
-        if (!aiResult.results || !Array.isArray(aiResult.results)) throw new Error("AI response did not contain 'results' array.");
-
-        for (const processedItem of aiResult.results) {
-            const originalExample = batch.find(ex => ex.id === processedItem.original_id);
-            if (!originalExample) {
-                addLog(`AI returned data for an unknown original_id ${processedItem.original_id}`, 'warning');
-                continue;
-            }
-
-            try {
-                const expansions = processedItem.expansions || [];
-                const translationsToInsert = expansions.flatMap(exp => [
-                    { original_example_id: originalExample.id, cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation, confidence_score: exp.confidence_score, ai_notes: exp.notes, alternative_translations: 'gpt4_best' },
-                    ...(exp.alternative_translations || []).map((alt, i) => ({
-                        original_example_id: originalExample.id, cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
-                        confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes, alternative_translations: `gpt4_alternative_${i + 1}`
-                    }))
-                ]);
-                
-                if (translationsToInsert.length > 0) {
-                    const { error } = await sourceDbClient.from('ai_cleaned_dictsentences').insert(translationsToInsert);
-                    if (error) throw new Error(`Cleaned sentence insert failed: ${error.message}`);
-                }
-
-                const highlights = expansions.flatMap(exp => exp.discovered_highlights || []);
-                if (highlights.length > 0) {
-                    const highlightsToUpsert = highlights
-                        .filter(h => typeof h.relevance_score === 'number')
-                        .map(h => ({
-                            halunder_term: h.halunder_phrase.trim(),
-                            german_equivalent: h.german_meaning,
-                            explanation: h.explanation_german,
-                            feature_type: h.type,
-                            source_table: 'new_examples',
-                            relevance_score: h.relevance_score,
-                            tags: [h.type],
-                            // *** FIX: Pass the correct original example ID ***
-                            source_ids: [originalExample.id] 
-                        }));
-                    
-                    if (highlightsToUpsert.length > 0) {
-                        const { error } = await sourceDbClient.from('cleaned_linguistic_examples').upsert(highlightsToUpsert, { onConflict: 'halunder_term' });
-                        if (error) throw new Error(`Highlight upsert failed: ${error.message}`);
-                    }
-                }
-
-                await sourceDbClient.from('new_examples').update({ cleaning_status: 'completed' }).eq('id', originalExample.id);
-
-            } catch (e) {
-                 addLog(`Failed to save data for example ID ${originalExample.id}: ${e.message}`, 'error');
-                 await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).eq('id', originalExample.id);
-            }
-        }
-        
-        addLog(`[OK] Processed batch of ${batch.length} items.`, 'success');
-        return { processedCount: batch.length, promptWasPrinted: shouldPrintPrompt };
-    } catch(e) {
-        addLog(`[FAIL] A whole batch failed: ${e.message}`, 'error');
-        await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).in('id', batchIds);
-        return { processedCount: 0, promptWasPrinted: false };
+    const prompt = buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, knownIdioms.data || []);
+    
+    processingState.lastPromptUsed = prompt;
+    if (shouldPrintPrompt) {
+        console.log('----------- ENHANCED DICTIONARY EXAMPLE CLEANER PROMPT -----------');
+        console.log(prompt);
+        console.log('-------------------------------------------------------------------');
+        addLog('Printed full enhanced prompt to server console for verification.', 'info');
     }
+
+    const aiResult = await callOpenAI_Api(prompt);
+    if (!aiResult.processed_examples || !Array.isArray(aiResult.processed_examples)) {
+        throw new Error("AI response did not contain a 'processed_examples' array.");
+    }
+    
+    let totalCleanedSentences = 0;
+    for (const cleanedExample of aiResult.processed_examples) {
+        // --- 1. Save Translations ---
+        const translationsToInsert = [];
+        translationsToInsert.push({
+            original_example_id: cleanedExample.original_example_id,
+            cleaned_halunder: cleanedExample.cleaned_halunder,
+            cleaned_german: cleanedExample.best_translation,
+            confidence_score: cleanedExample.confidence_score,
+            ai_notes: cleanedExample.notes,
+            alternative_translations: 'gpt4_best',
+            openai_prompt: prompt
+        });
+
+        if (cleanedExample.alternative_translations && Array.isArray(cleanedExample.alternative_translations)) {
+            cleanedExample.alternative_translations.forEach((alt, index) => {
+                translationsToInsert.push({
+                    original_example_id: cleanedExample.original_example_id,
+                    cleaned_halunder: cleanedExample.cleaned_halunder,
+                    cleaned_german: alt.translation,
+                    confidence_score: alt.confidence_score || 0.7,
+                    ai_notes: alt.notes || '',
+                    alternative_translations: `gpt4_alternative_${index + 1}`,
+                    openai_prompt: prompt
+                });
+            });
+        }
+        
+        const { error: insertError } = await sourceDbClient.from('ai_cleaned_dictsentences').insert(translationsToInsert);
+        if (insertError) {
+             addLog(`Failed to save cleaned translation for original ID ${cleanedExample.original_example_id}: ${insertError.message}`, 'warning');
+             continue; // Skip to next cleaned example
+        }
+        totalCleanedSentences += translationsToInsert.length;
+
+        // --- 2. Save Discovered Highlights ---
+        if (cleanedExample.discovered_highlights && cleanedExample.discovered_highlights.length > 0) {
+            for (const highlight of cleanedExample.discovered_highlights) {
+                if (!highlight.relevance_score) {
+                    addLog(`Skipping highlight "${highlight.halunder_phrase}" because AI did not provide a relevance_score.`, 'warning');
+                    continue;
+                }
+
+                const linguisticEntry = {
+                    halunder_term: highlight.halunder_phrase.trim(),
+                    german_equivalent: highlight.german_meaning,
+                    explanation: highlight.explanation_german,
+                    feature_type: highlight.type,
+                    source_table: 'new_examples',
+                    relevance_score: highlight.relevance_score,
+                    tags: [highlight.type],
+                    source_ids: [cleanedExample.original_example_id],
+                    processed_at: new Date().toISOString()
+                };
+
+                try {
+                    const { data: existingEntry } = await sourceDbClient
+                        .from('cleaned_linguistic_examples')
+                        .select('id, relevance_score')
+                        .ilike('halunder_term', linguisticEntry.halunder_term)
+                        .single();
+
+                    if (existingEntry) {
+                        if (linguisticEntry.relevance_score > existingEntry.relevance_score) {
+                            const { error: updateError } = await sourceDbClient.from('cleaned_linguistic_examples').update({ ...linguisticEntry, source_ids: undefined, id: undefined }).eq('id', existingEntry.id);
+                            if (updateError) throw updateError;
+                            addLog(`Updated linguistic feature: ${linguisticEntry.halunder_term} (score: ${existingEntry.relevance_score} → ${linguisticEntry.relevance_score})`, 'success');
+                        }
+                    } else {
+                        const { error: insertError } = await sourceDbClient.from('cleaned_linguistic_examples').insert([linguisticEntry]);
+                        if (insertError) throw insertError;
+                        addLog(`Saved new linguistic feature: ${linguisticEntry.halunder_term} (AI score: ${linguisticEntry.relevance_score})`, 'success');
+                    }
+                } catch (linguisticError) {
+                     addLog(`Error saving linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
+                }
+            }
+        }
+    }
+
+    await sourceDbClient.from('new_examples').update({ cleaning_status: 'completed' }).in('id', groupIds);
+    addLog(`[GROUP PROCESSED] Concept ${concept.id} (${concept.primary_german_label}): Processed ${exampleGroup.length} raw examples into ${totalCleanedSentences} clean sentences.`, 'success');
 }
 
-// Builds a prompt for a batch of items with full context
-function buildBatchCleaningPrompt(batch, wordContexts, knownIdioms) {
-    const inputData = batch.map(example => ({
-        original_id: example.id,
-        halunder_sentence: example.halunder_sentence,
-        german_sentence: example.german_sentence,
-        note: example.note,
-        headword_context: {
-            headword: example.concept.primary_german_label,
-            part_of_speech: example.concept.part_of_speech,
-            german_definition: example.concept.german_definition,
-        }
+
+// Enhanced AI prompt that processes groups and expects AI-judged relevance
+function buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, knownIdioms) {
+    const rawExamples = exampleGroup.map(ex => ({
+        id: ex.id,
+        halunder: ex.halunder_sentence,
+        german: ex.german_sentence,
+        note: ex.note || 'N/A'
     }));
 
-    return `You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to process an array of raw dictionary example sentences, clean them meticulously, and provide high-quality, natural translations for AI training.
+    return `
+You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to process a batch of related example sentence pairs from a dictionary.
 
-**CRITICAL INSTRUCTIONS FOR EVERY EXAMPLE:**
+**PRIMARY GOALS:**
+1.  **EXPAND & CLEAN:** For each raw example, clean it up. If it contains variations (e.g., using "/"), you MUST expand it into multiple, separate, complete sentence objects.
+2.  **NATURAL TRANSLATION:** Your `best_translation` MUST be the most natural, idiomatic German a native speaker would use. Literal translations are valuable but should be put in `alternative_translations` or explained in the notes.
+3.  **DISCOVER HIGHLIGHTS:** Identify idioms, cultural notes, place names, or other linguistically interesting elements.
+4.  **JUDGE RELEVANCE:** For each discovered highlight, you MUST assign a `relevance_score` from 1 (very basic) to 10 (extremely rare and insightful).
 
-1.  **CAPITALIZATION & PUNCTUATION (MANDATORY):**
-    - The final \`cleaned_halunder\` MUST start with a capital letter and end with appropriate punctuation (., ?, !).
-    - The final \`best_translation\` and all \`alternative_translations\` in German MUST also start with a capital letter and end with proper punctuation. This is non-negotiable.
+**INSTRUCTIONS:**
+- Analyze the entire group of `Raw Example Pairs` below. They are all related to the same headword.
+- Use the provided `Dictionary Context` for individual words to understand their meaning.
+- For EACH raw example, produce one or more cleaned objects in the output array.
+- Your entire response MUST be a single JSON object with ONE key: \`processed_examples\`. This key holds an array of result objects.
 
-2.  **SENTENCE EXPANSION:**
-    - If a Halunder sentence contains slashes (e.g., "man kiid di kiis/bitten/friis wuune"), you MUST expand this into multiple, separate sentence objects in the "expansions" array for that example. Each expansion should be a complete, valid sentence.
+**INPUT DATA:**
 
-3.  **TRANSLATION HIERARCHY:**
-    - \`best_translation\`: This MUST be the most natural, common, and idiomatic German translation. Improve the original German hint if it's awkward or too literal.
-    - \`alternative_translations\`: Include other natural variations. If a literal translation exists and is different, you MUST include it here for linguistic analysis.
+**1. Main Dictionary Headword Context (applies to all examples below):**
+\`\`\`json
+${JSON.stringify(headwordContext, null, 2)}
+\`\`\`
 
-**MAIN TASK:**
-For each item in the "input_examples" array, generate a corresponding object in the "results" array of your response.
-
-**CONTEXT DATA FOR THE ENTIRE BATCH:**
-
-**1. Dictionary Context for Individual Words:**
+**2. Dictionary Context for Individual Words (from all sentences):**
 \`\`\`json
 ${JSON.stringify(wordContexts, null, 2)}
 \`\`\`
 
-**2. Known Idioms & Cultural References (for reference):**
+**3. Already Known Idioms/Features:**
 \`\`\`json
-${JSON.stringify(knownIdioms.slice(0, 100), null, 2)}
+${JSON.stringify(knownIdioms, null, 2)}
 \`\`\`
 
-**EXAMPLES TO PROCESS:**
+**4. Raw Example Pairs to Process (a group of related examples):**
 \`\`\`json
-${JSON.stringify(inputData, null, 2)}
+${JSON.stringify(rawExamples, null, 2)}
 \`\`\`
 
-**YOUR JSON OUTPUT FORMAT:**
-Your entire response must be a single JSON object. The "results" array order must match the "input_examples" order.
+**YOUR JSON OUTPUT (STRUCTURE EXAMPLE):**
+Your output must be a single JSON object. The \`processed_examples\` array should contain one object for each *final, expanded, and cleaned sentence*.
 
 \`\`\`json
 {
-  "results": [
+  "processed_examples": [
     {
-      "original_id": "The UUID of the first input example",
-      "expansions": [
+      "original_example_id": "d201763a-f4a9-406e-a8b6-c8c5a248ff23",
+      "cleaned_halunder": "Bisterk Locht.",
+      "best_translation": "Schlechtes Wetter.",
+      "confidence_score": 0.95,
+      "notes": "This is the first variation expanded from 'bisterk Locht / Weder'. 'Locht' means 'air' and is used idiomatically for 'weather'.",
+      "alternative_translations": [
+        { "translation": "Garstiges Wetter.", "confidence_score": 0.85, "notes": "A strong alternative using 'garstig'." },
+        { "translation": "böse Luft", "confidence_score": 0.70, "notes": "This is the literal, word-for-word translation, less natural in German." }
+      ],
+      "discovered_highlights": [
         {
-          "cleaned_halunder": "Hi froaget mi miin Grummen it.",
-          "best_translation": "Er fragt mir ein Loch in den Bauch.",
-          "confidence_score": 0.97,
-          "notes": "Idiomatic translation is best for training. The literal meaning is included as an alternative.",
-          "alternative_translations": [
-            {"translation": "Er löchert mich mit seinen Fragen.", "confidence_score": 0.9, "notes": "Another natural variation."},
-            {"translation": "Er fragt mich meine Eingeweide aus.", "confidence_score": 0.6, "notes": "Literal translation for linguistic analysis."}
-          ],
-          "discovered_highlights": [{"halunder_phrase": "miin Grummen it froage", "german_meaning": "jemandem Löcher in den Bauch fragen", "explanation_german": "Eine Redewendung für intensives Ausfragen.", "type": "idiom", "relevance_score": 9}]
+          "halunder_phrase": "bisterk Locht",
+          "german_literal": "böse Luft",
+          "german_meaning": "schlechtes Wetter",
+          "explanation_german": "Eine gebräuchliche Redewendung auf Helgoland, um schlechtes Wetter oder stürmische Bedingungen zu beschreiben. 'Locht' (Luft) wird hier synonym für Wetter verwendet.",
+          "type": "idiom",
+          "relevance_score": 7
         }
       ]
+    },
+    {
+      "original_example_id": "d201763a-f4a9-406e-a8b6-c8c5a248ff23",
+      "cleaned_halunder": "Bisterk Weder.",
+      "best_translation": "Schlechtes Wetter.",
+      "confidence_score": 0.98,
+      "notes": "This is the second variation expanded from 'bisterk Locht / Weder'. 'Weder' is a direct cognate of German 'Wetter'.",
+      "alternative_translations": [],
+      "discovered_highlights": []
     }
   ]
 }
 \`\`\`
+
+**Types for discovered_highlights:** "idiom", "place_name", "cultural_reference", "historical_reference", "maritime_term", "food_tradition", "religious_reference", "family_name".
+
+**Relevance Score Guidelines:**
+- **10**: Extremely rare idioms, deep cultural insights that would fascinate linguists.
+- **8-9**: Important cultural markers, characteristic expressions, significant place names.
+- **6-7**: Moderately interesting local terms, common idioms, maritime vocabulary.
+- **4-5**: Common local expressions, basic dialectal differences.
+- **1-3**: Very basic terms, obvious cognates, simple vocabulary variations.
 `;
 }
 
 
-// --- API ROUTES ---
+// --- API Routes ---
+
 router.post('/start-cleaning', (req, res) => {
-    if (processingState.isProcessing) return res.status(400).json({ error: 'Processing is already in progress.' });
-    const limit = parseInt(req.body.limit, 10) || 10000;
-    runDictionaryExampleCleaner(limit).catch(err => console.error("Caught unhandled error in dictionary example cleaner:", err));
-    res.json({ success: true, message: `Definitive cleaning started for up to ${limit} examples.` });
+    if (processingState.isProcessing) {
+        return res.status(400).json({ error: 'Processing is already in progress.' });
+    }
+    // Limit is no longer needed as we process all pending items, but we keep the route structure
+    runDictionaryExampleCleaner().catch(err => {
+        console.error("Caught unhandled error in dictionary example cleaner:", err);
+        processingState.status = 'Error';
+        processingState.isProcessing = false;
+    });
+    res.json({ success: true, message: `Enhanced dictionary example cleaning started for ALL pending examples.` });
 });
-router.get('/progress', (req, res) => res.json(processingState));
+
+router.get('/progress', (req, res) => {
+    res.json({
+        ...processingState,
+        lastPromptUsed: processingState.lastPromptUsed // Optionally send the large prompt
+    });
+});
+
 router.get('/stats', async (req, res) => {
     try {
-        const { count: total } = await sourceDbClient.from('new_examples').select('*', { count: 'exact', head: true });
-        const { count: pending } = await sourceDbClient.from('new_examples').select('*', { count: 'exact', head: true }).eq('cleaning_status', 'pending');
-        const { count: cleaned } = await sourceDbClient.from('ai_cleaned_dictsentences').select('*', { count: 'exact', head: true });
-        const { count: features } = await sourceDbClient.from('cleaned_linguistic_examples').select('*', { count: 'exact', head: true }).eq('source_table', 'new_examples');
-        res.json({ totalExamples: total || 0, pendingExamples: pending || 0, cleanedExamples: cleaned || 0, discoveredIdioms: features || 0 });
-    } catch (error) { res.status(500).json({ error: error.message }); }
+        const { count: totalExamples } = await sourceDbClient.from('new_examples').select('*', { count: 'exact', head: true });
+        const { count: pendingExamples } = await sourceDbClient.from('new_examples').select('*', { count: 'exact', head: true }).eq('cleaning_status', 'pending');
+        const { count: cleanedExamples } = await sourceDbClient.from('ai_cleaned_dictsentences').select('*', { count: 'exact', head: true });
+        const { count: discoveredFeatures } = await sourceDbClient.from('cleaned_linguistic_examples').select('*', { count: 'exact', head: true }).eq('source_table', 'new_examples');
+
+        res.json({
+            totalExamples: totalExamples || 0,
+            pendingExamples: pendingExamples || 0,
+            cleanedExamples: cleanedExamples || 0,
+            discoveredIdioms: discoveredFeatures || 0
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
+
+router.get('/sample-prompt', (req, res) => {
+    if (processingState.lastPromptUsed) {
+        res.json({ prompt: processingState.lastPromptUsed });
+    } else {
+        res.json({ prompt: 'No prompt available yet. Start processing to see the latest prompt.' });
+    }
+});
+
 router.post('/reset-all', async (req, res) => {
     try {
-        const { data, error } = await sourceDbClient.from('new_examples').update({ cleaning_status: 'pending' }).neq('id', '00000000-0000-0000-0000-000000000000').select('id');
+        const { error, count } = await sourceDbClient.from('new_examples').update({ cleaning_status: 'pending' }).neq('id', '00000000-0000-0000-0000-000000000000').select({count: 'exact'});
         if (error) throw error;
-        res.json({ success: true, message: `Reset ${data.length} examples to pending`, resetCount: data.length });
-    } catch (error) { res.status(500).json({ error: error.message }); }
+        res.json({ success: true, message: `Reset ${count} examples to pending status`, resetCount: count });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
+
 router.post('/clear-cleaned', async (req, res) => {
     try {
-        await sourceDbClient.from('ai_cleaned_dictsentences').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-        await sourceDbClient.from('cleaned_linguistic_examples').delete().eq('source_table', 'new_examples');
+        const { error: cleanedError } = await sourceDbClient.from('ai_cleaned_dictsentences').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        if (cleanedError) throw cleanedError;
+
+        const { error: linguisticError } = await sourceDbClient.from('cleaned_linguistic_examples').delete().eq('source_table', 'new_examples');
+        if (linguisticError) throw linguisticError;
+
         res.json({ success: true, message: 'Cleared all cleaned data and discovered linguistic features' });
-    } catch (error) { res.status(500).json({ error: error.message }); }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 module.exports = router;
