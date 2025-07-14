@@ -96,6 +96,55 @@
         .warning-btn:hover {
             background-color: #e0a800;
         }
+        .prompt-display {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .prompt-content {
+            background-color: #2b2b2b;
+            color: #f1f1f1;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .prompt-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .copy-btn {
+            background-color: #6c757d;
+            color: white;
+            padding: 5px 10px;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .copy-btn:hover {
+            background-color: #5a6268;
+        }
+        .prompt-toggle {
+            background-color: #17a2b8;
+            color: white;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-left: 10px;
+        }
+        .prompt-toggle:hover {
+            background-color: #138496;
+        }
     </style>
 </head>
 <body>
@@ -130,14 +179,29 @@
                 </div>
             </div>
 
+            <div class="prompt-display" id="prompt-display" style="display: none;">
+                <div class="prompt-header">
+                    <h3>Latest OpenAI Prompt Used</h3>
+                    <div>
+                        <button onclick="copyPrompt()" class="copy-btn">Copy Prompt</button>
+                        <button onclick="togglePrompt()" class="copy-btn">Hide Prompt</button>
+                    </div>
+                </div>
+                <div class="prompt-content" id="prompt-content">
+                    No prompt available yet. Start processing to see the latest prompt.
+                </div>
+            </div>
+
             <div class="admin-controls">
                 <h3>⚠️ Administrative Controls</h3>
                 <p>Use these controls to manage the processing queue and clean up data.</p>
                 <button onclick="resetAllExamples()" class="warning-btn">Reset All to Pending</button>
                 <button onclick="clearAllCleaned()" class="danger-btn">Clear All Cleaned Data</button>
+                <button onclick="togglePrompt()" class="prompt-toggle">Show/Hide AI Prompt</button>
                 <p style="margin-top: 10px; font-size: 0.9em; color: #856404;">
                     <strong>Reset All:</strong> Marks all examples as pending for reprocessing.<br>
-                    <strong>Clear All:</strong> Deletes all cleaned sentences and discovered idioms (irreversible).
+                    <strong>Clear All:</strong> Deletes all cleaned sentences and discovered idioms (irreversible).<br>
+                    <strong>AI Prompt:</strong> Shows the exact prompt sent to OpenAI (useful for debugging).
                 </p>
             </div>
 
@@ -158,6 +222,7 @@
                         <li><strong>Comprehensive cleanup:</strong> Better OCR error correction with full linguistic context</li>
                         <li><strong>Idiom cataloging:</strong> Saves discovered highlights to dedicated new_idioms_from_dict table</li>
                         <li><strong>Smart categorization:</strong> Classifies findings as idioms, places, cultural references, etc.</li>
+                        <li><strong>Prompt transparency:</strong> View the exact prompt sent to OpenAI for debugging</li>
                     </ul>
                 </div>
             </div>
@@ -202,6 +267,39 @@
                 
             } catch (error) {
                 console.error('Error loading statistics:', error);
+            }
+        }
+
+        // Toggle prompt display
+        function togglePrompt() {
+            const promptDisplay = document.getElementById('prompt-display');
+            if (promptDisplay.style.display === 'none') {
+                promptDisplay.style.display = 'block';
+                loadLatestPrompt();
+            } else {
+                promptDisplay.style.display = 'none';
+            }
+        }
+
+        // Load the latest prompt
+        async function loadLatestPrompt() {
+            try {
+                const response = await fetch('/dictionary-example-cleaner/sample-prompt');
+                const data = await response.json();
+                document.getElementById('prompt-content').textContent = data.prompt;
+            } catch (error) {
+                document.getElementById('prompt-content').textContent = 'Error loading prompt: ' + error.message;
+            }
+        }
+
+        // Copy prompt to clipboard
+        async function copyPrompt() {
+            const promptContent = document.getElementById('prompt-content').textContent;
+            try {
+                await navigator.clipboard.writeText(promptContent);
+                addLogEntry('Prompt copied to clipboard', 'success');
+            } catch (error) {
+                addLogEntry('Failed to copy prompt: ' + error.message, 'error');
             }
         }
 
@@ -302,6 +400,11 @@
                 // Update logs
                 if (data.logs && data.logs.length > 0) {
                     renderLogs(data.logs);
+                }
+
+                // Update prompt if available
+                if (data.lastPromptUsed && document.getElementById('prompt-display').style.display !== 'none') {
+                    document.getElementById('prompt-content').textContent = data.lastPromptUsed;
                 }
 
                 // Check if completed
