@@ -1,5 +1,5 @@
 // ===============================================
-// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE BATCH VERSION
+// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE BATCH VERSION WITH FULL CONTEXT
 // File: dictionary-example-cleaner-routes.js
 // ===============================================
 
@@ -76,6 +76,33 @@ async function fetchAllWithPagination(queryBuilder, limit) {
     return limit ? allData.slice(0, limit) : allData;
 }
 
+async function getWordContext(words) {
+    if (!words || words.length === 0) return {};
+    const uniqueWords = [...new Set(words)];
+    const orFilter = uniqueWords.map(word => `term_text.ilike.${word}`).join(',');
+    const query = sourceDbClient.from('new_terms').select(`
+            term_text, new_concept_to_term!inner(
+                pronunciation, gender, plural_form, etymology, note,
+                concept:new_concepts!inner(primary_german_label, part_of_speech, german_definition)
+            )
+        `).or(orFilter).eq('language', 'hal');
+    const termData = await fetchAllWithPagination(query);
+    const wordContextMap = {};
+    termData.forEach(term => {
+        if (!wordContextMap[term.term_text.toLowerCase()]) wordContextMap[term.term_text.toLowerCase()] = [];
+        term.new_concept_to_term.forEach(connection => {
+            wordContextMap[term.term_text.toLowerCase()].push({
+                german_equivalent: connection.concept.primary_german_label,
+                part_of_speech: connection.concept.part_of_speech,
+                german_definition: connection.concept.german_definition,
+                pronunciation: connection.pronunciation, gender: connection.gender,
+                plural_form: connection.plural_form, etymology: connection.etymology, note: connection.note,
+            });
+        });
+    });
+    return wordContextMap;
+}
+
 function chunkArray(array, size) {
     const chunked_arr = [];
     for (let i = 0; i < array.length; i += size) {
@@ -83,6 +110,7 @@ function chunkArray(array, size) {
     }
     return chunked_arr;
 }
+
 
 // === MAIN PROCESSING LOGIC ===
 async function runDictionaryExampleCleaner(limit) {
@@ -109,13 +137,17 @@ async function runDictionaryExampleCleaner(limit) {
         let processedCount = 0;
         let firstPromptPrinted = false;
 
+        const idiomQuery = sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, tags').gte('relevance_score', 6);
+        const knownIdioms = await fetchAllWithPagination(idiomQuery);
+        addLog(`Loaded ${knownIdioms.length} known idioms from all pages.`, 'info');
+
         for (let i = 0; i < batches.length; i += CONCURRENT_BATCHES) {
             const concurrentBatchGroup = batches.slice(i, i + CONCURRENT_BATCHES);
             addLog(`Processing a block of ${concurrentBatchGroup.length} batches (starting at batch #${i + 1})...`, 'info');
 
             const batchPromises = concurrentBatchGroup.map((batch, index) => {
                 const shouldPrintPrompt = !firstPromptPrinted && i === 0 && index === 0;
-                return processBatch(batch, shouldPrintPrompt)
+                return processBatch(batch, knownIdioms || [], shouldPrintPrompt)
                     .then(res => {
                         if (res.promptWasPrinted) firstPromptPrinted = true;
                         return res.processedCount;
@@ -147,18 +179,18 @@ async function runDictionaryExampleCleaner(limit) {
 }
 
 // Processes a batch of examples
-async function processBatch(batch, shouldPrintPrompt) {
+async function processBatch(batch, knownIdioms, shouldPrintPrompt) {
     if (!batch || batch.length === 0) return { processedCount: 0, promptWasPrinted: false };
     const batchIds = batch.map(ex => ex.id);
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', batchIds);
     
     try {
-        const prompt = buildBatchCleaningPrompt(batch);
+        const allWordsInBatch = batch.flatMap(ex => ex.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
+        const wordContext = await getWordContext(allWordsInBatch);
+        
+        const prompt = buildBatchCleaningPrompt(batch, wordContext, knownIdioms);
         if (shouldPrintPrompt) {
             processingState.lastPromptUsed = prompt;
-            console.log('----------- FIRST BATCH PROMPT -----------');
-            console.log(prompt);
-            console.log('-------------------------------------------');
             addLog('Printed first batch prompt to console.', 'info');
         }
 
@@ -187,15 +219,26 @@ async function processBatch(batch, shouldPrintPrompt) {
                     if (error) throw new Error(`Cleaned sentence insert failed: ${error.message}`);
                 }
 
-                const highlights = expansions.flatMap(exp => exp.discovered_highlights || []).filter(h => typeof h.relevance_score === 'number');
+                const highlights = expansions.flatMap(exp => exp.discovered_highlights || []);
                 if (highlights.length > 0) {
-                    const highlightsToUpsert = highlights.map(h => ({
-                        halunder_term: h.halunder_phrase.trim(), german_equivalent: h.german_meaning, explanation: h.explanation_german,
-                        feature_type: h.type, source_table: 'new_examples', relevance_score: h.relevance_score,
-                        tags: [h.type], source_ids: [example.id]
-                    }));
-                    const { error } = await sourceDbClient.from('cleaned_linguistic_examples').upsert(highlightsToUpsert, { onConflict: 'halunder_term' });
-                    if (error) throw new Error(`Highlight upsert failed: ${error.message}`);
+                    const highlightsToUpsert = highlights
+                        .filter(h => typeof h.relevance_score === 'number')
+                        .map(h => ({
+                            halunder_term: h.halunder_phrase.trim(),
+                            german_equivalent: h.german_meaning,
+                            explanation: h.explanation_german,
+                            feature_type: h.type,
+                            source_table: 'new_examples',
+                            relevance_score: h.relevance_score,
+                            tags: [h.type],
+                            // *** FIX: Pass the correct original example ID ***
+                            source_ids: [originalExample.id] 
+                        }));
+                    
+                    if (highlightsToUpsert.length > 0) {
+                        const { error } = await sourceDbClient.from('cleaned_linguistic_examples').upsert(highlightsToUpsert, { onConflict: 'halunder_term' });
+                        if (error) throw new Error(`Highlight upsert failed: ${error.message}`);
+                    }
                 }
 
                 await sourceDbClient.from('new_examples').update({ cleaning_status: 'completed' }).eq('id', originalExample.id);
@@ -215,7 +258,8 @@ async function processBatch(batch, shouldPrintPrompt) {
     }
 }
 
-function buildBatchCleaningPrompt(batch) {
+// Builds a prompt for a batch of items with full context
+function buildBatchCleaningPrompt(batch, wordContexts, knownIdioms) {
     const inputData = batch.map(example => ({
         original_id: example.id,
         halunder_sentence: example.halunder_sentence,
@@ -240,11 +284,23 @@ function buildBatchCleaningPrompt(batch) {
     - If a Halunder sentence contains slashes (e.g., "man kiid di kiis/bitten/friis wuune"), you MUST expand this into multiple, separate sentence objects in the "expansions" array for that example. Each expansion should be a complete, valid sentence.
 
 3.  **TRANSLATION HIERARCHY:**
-    - \`best_translation\`: This MUST be the most natural, common, and idiomatic German translation. Improve the original German hint if it's awkward or too literal. For "man kiid di kiis bitten wuune", "Man konnte draußen leben" is better than the literal "man konnte die Käse draußen wohnen".
+    - \`best_translation\`: This MUST be the most natural, common, and idiomatic German translation. Improve the original German hint if it's awkward or too literal.
     - \`alternative_translations\`: Include other natural variations. If a literal translation exists and is different, you MUST include it here for linguistic analysis.
 
 **MAIN TASK:**
 For each item in the "input_examples" array, generate a corresponding object in the "results" array of your response.
+
+**CONTEXT DATA FOR THE ENTIRE BATCH:**
+
+**1. Dictionary Context for Individual Words:**
+\`\`\`json
+${JSON.stringify(wordContexts, null, 2)}
+\`\`\`
+
+**2. Known Idioms & Cultural References (for reference):**
+\`\`\`json
+${JSON.stringify(knownIdioms.slice(0, 100), null, 2)}
+\`\`\`
 
 **EXAMPLES TO PROCESS:**
 \`\`\`json
@@ -258,33 +314,18 @@ Your entire response must be a single JSON object. The "results" array order mus
 {
   "results": [
     {
-      "original_id": "a43b62f4-4708-4eca-bd42-d639102285db",
+      "original_id": "The UUID of the first input example",
       "expansions": [
         {
-          "cleaned_halunder": "Man kiid di kiis wuune.",
-          "best_translation": "Man konnte im Freien leben.",
-          "confidence_score": 1.0,
-          "notes": "Idiomatic translation. 'di kiis wuune' means 'im Freien leben'.",
+          "cleaned_halunder": "Hi froaget mi miin Grummen it.",
+          "best_translation": "Er fragt mir ein Loch in den Bauch.",
+          "confidence_score": 0.97,
+          "notes": "Idiomatic translation is best for training. The literal meaning is included as an alternative.",
           "alternative_translations": [
-            {"translation": "Man konnte draußen leben.", "confidence_score": 0.95, "notes": "Slightly less common but still natural phrasing."}
+            {"translation": "Er löchert mich mit seinen Fragen.", "confidence_score": 0.9, "notes": "Another natural variation."},
+            {"translation": "Er fragt mich meine Eingeweide aus.", "confidence_score": 0.6, "notes": "Literal translation for linguistic analysis."}
           ],
-          "discovered_highlights": [{"halunder_phrase": "di kiis wuune", "german_meaning": "im Freien leben", "explanation_german": "Eine Redewendung für 'draußen' oder 'im Freien sein/leben'.", "type": "idiom", "relevance_score": 9}]
-        },
-        {
-          "cleaned_halunder": "Man kiid bitten wuune.",
-          "best_translation": "Man konnte draußen wohnen.",
-          "confidence_score": 0.9,
-          "notes": "'bitten' is a direct word for 'draußen'.",
-          "alternative_translations": [],
-          "discovered_highlights": []
-        },
-        {
-          "cleaned_halunder": "Man kiid friis wuune.",
-          "best_translation": "Man konnte an der frischen Luft wohnen.",
-          "confidence_score": 0.85,
-          "notes": "'friis' refers to 'frische Luft'.",
-          "alternative_translations": [],
-          "discovered_highlights": []
+          "discovered_highlights": [{"halunder_phrase": "miin Grummen it froage", "german_meaning": "jemandem Löcher in den Bauch fragen", "explanation_german": "Eine Redewendung für intensives Ausfragen.", "type": "idiom", "relevance_score": 9}]
         }
       ]
     }
