@@ -17,7 +17,7 @@ const dictionaryRoutes = require('./dictionary-routes.js');
 const linguisticRoutes = require('./linguistic-routes.js');
 const translatorRoutes = require('./translator-routes.js');
 const corpusBuilderRoutes = require('./corpus-builder.js');
-const dictionaryCleanerRoutes = require('./dictionary-cleaner-routes.js');
+const dictionaryExampleCleanerRoutes = require('./dictionary-example-cleaner-routes.js');
 
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
@@ -48,7 +48,7 @@ app.use('/dictionary', dictionaryRoutes); // For the public viewer tool
 app.use('/linguistic', linguisticRoutes);
 app.use('/translator', translatorRoutes);
 app.use('/corpus', corpusBuilderRoutes);
-app.use('/dictionary-cleaner', dictionaryCleanerRoutes);
+app.use('/dictionary-example-cleaner', dictionaryExampleCleanerRoutes);
 
 // === PAGE SERVING ROUTES ===
 app.get('/', (req, res) => {
@@ -69,8 +69,8 @@ app.get('/linguistic-cleaner', (req, res) => {
 app.get('/corpus-builder', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'corpus-builder.html'));
 });
-app.get('/dictionary-cleaner', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'dictionary-cleaner.html'));
+app.get('/dictionary-example-cleaner', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dictionary-example-cleaner.html'));
 });
 
 // Health check route
