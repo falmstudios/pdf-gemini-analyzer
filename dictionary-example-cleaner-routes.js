@@ -1,7 +1,7 @@
 // ===============================================
 // FINAL FIXED DICTIONARY EXAMPLE CLEANER ROUTES
 // File: dictionary-example-cleaner-routes.js
-// Version: 2.0 (Fixes SyntaxError in prompt)
+// Version: 2.1 (Fixes idiom filtering and foreign key validation)
 // ===============================================
 
 const express = require('express');
@@ -209,13 +209,12 @@ async function runDictionaryExampleCleaner() {
         processingState.status = 'Cleaning example groups with enhanced AI context...';
         let processedGroupCount = 0;
 
-        // Process in concurrent chunks
         const CONCURRENT_CHUNKS = 5;
         for (let i = 0; i < totalGroups; i += CONCURRENT_CHUNKS) {
             const chunk = groupsToProcess.slice(i, i + CONCURRENT_CHUNKS);
             
             const processingPromises = chunk.map((group, index) => {
-                return new Promise(resolve => setTimeout(resolve, index * 200)) // Stagger calls slightly
+                return new Promise(resolve => setTimeout(resolve, index * 200)) 
                     .then(() => processExampleGroup(group, !firstPromptPrinted && index === 0))
                     .catch(e => {
                         addLog(`Failed to process group for concept ID ${group[0].concept.id}: ${e.message}`, 'error');
@@ -233,7 +232,7 @@ async function runDictionaryExampleCleaner() {
             processingState.progress = totalGroups > 0 ? (processedGroupCount / totalGroups) : 1;
 
             if (i + CONCURRENT_CHUNKS < totalGroups) {
-                await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause between chunks
+                await new Promise(resolve => setTimeout(resolve, 500)); 
             }
         }
         
@@ -254,16 +253,25 @@ async function runDictionaryExampleCleaner() {
 async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
     const concept = exampleGroup[0].concept;
     const groupIds = exampleGroup.map(ex => ex.id);
+    const validOriginalIds = new Set(groupIds); // For validating AI response
+
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', groupIds);
 
-    const allSentences = exampleGroup.map(ex => ex.halunder_sentence).join(' ');
-    const words = [...new Set(allSentences.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
+    const allSentencesText = exampleGroup.map(ex => ex.halunder_sentence).join(' ');
+    const words = [...new Set(allSentencesText.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
     
-    const [wordContexts, knownIdioms] = await Promise.all([
+    const [wordContexts, knownIdiomsResult] = await Promise.all([
         getWordContext(words),
         sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation, tags').gte('relevance_score', 6)
     ]);
     
+    // **FIX 1: Filter known idioms to only include those relevant to the current sentence group.**
+    const allKnownIdioms = knownIdiomsResult.data || [];
+    const groupHalunderText = exampleGroup.map(ex => ex.halunder_sentence.toLowerCase()).join(' ');
+    const relevantIdioms = allKnownIdioms.filter(idiom =>
+        groupHalunderText.includes(idiom.halunder_term.toLowerCase())
+    );
+
     const headwordContext = {
         headword: concept.primary_german_label,
         part_of_speech: concept.part_of_speech,
@@ -273,7 +281,7 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
         krogmann_idioms: concept.krogmann_idioms
     };
 
-    const prompt = buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, knownIdioms.data || []);
+    const prompt = buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, relevantIdioms);
     
     processingState.lastPromptUsed = prompt;
     if (shouldPrintPrompt) {
@@ -290,6 +298,13 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
     
     let totalCleanedSentences = 0;
     for (const cleanedExample of aiResult.processed_examples) {
+        
+        // **FIX 2: Validate the original_example_id provided by the AI before inserting.**
+        if (!validOriginalIds.has(cleanedExample.original_example_id)) {
+            addLog(`AI returned an invalid original_example_id: ${cleanedExample.original_example_id}. Skipping this record.`, 'warning');
+            continue; // Skip this invalid record
+        }
+
         // --- 1. Save Translations ---
         const translationsToInsert = [];
         translationsToInsert.push({
@@ -374,7 +389,7 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
                         addLog(`Saved new linguistic feature: ${linguisticEntry.halunder_term} (AI score: ${linguisticEntry.relevance_score})`, 'success');
                     }
                 } catch (linguisticError) {
-                    if (linguisticError.code !== 'PGRST116') { // Ignore 'exact one row' error for .single()
+                     if (linguisticError.code !== 'PGRST116') { // Ignore 'exact one row' error for .single() when no entry is found
                         addLog(`Error processing linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
                     }
                 }
@@ -386,7 +401,7 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
     addLog(`[GROUP PROCESSED] Concept ${concept.id} (${concept.primary_german_label}): Processed ${exampleGroup.length} raw examples into ${totalCleanedSentences} clean sentences.`, 'success');
 }
 
-// **FIXED**: Escaped all literal backticks (`) inside the template string.
+// Enhanced AI prompt that processes groups and expects AI-judged relevance
 function buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, knownIdioms) {
     const rawExamples = exampleGroup.map(ex => ({
         id: ex.id,
@@ -399,7 +414,7 @@ function buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, k
 You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to process a batch of related example sentence pairs from a dictionary.
 
 **PRIMARY GOALS:**
-1.  **EXPAND & CLEAN:** For each raw example, clean it up. If it contains variations (e.g., using "/"), you MUST expand it into multiple, separate, complete sentence objects.
+1.  **EXPAND & CLEAN:** For each raw example, clean it up (without changing spelling, etc.). If it contains variations (e.g., using "/"), you MUST expand it into multiple, separate, complete sentence objects. You shall also fix punctuation (?.!) and also make sure sentences are capitalized.
 2.  **NATURAL TRANSLATION:** Your \`best_translation\` MUST be the most natural, idiomatic German a native speaker would use. Literal translations are valuable but should be put in \`alternative_translations\` or explained in the notes.
 3.  **DISCOVER HIGHLIGHTS:** Identify idioms, cultural notes, place names, or other linguistically interesting elements.
 4.  **JUDGE RELEVANCE:** For each discovered highlight, you MUST assign a \`relevance_score\` from 1 (very basic) to 10 (extremely rare and insightful).
@@ -422,7 +437,7 @@ ${JSON.stringify(headwordContext, null, 2)}
 ${JSON.stringify(wordContexts, null, 2)}
 \`\`\`
 
-**3. Already Known Idioms/Features:**
+**3. Already Known Idioms/Features (Only relevant items are shown):**
 \`\`\`json
 ${JSON.stringify(knownIdioms, null, 2)}
 \`\`\`
