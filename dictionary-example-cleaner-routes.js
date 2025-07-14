@@ -308,40 +308,69 @@ async function processSingleExample(example, shouldPrintPrompt) {
     
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
-    // Save discovered highlights to cleaned_linguistic_examples table
-    // AI now determines the relevance score itself
+    // FIXED: Save discovered highlights to cleaned_linguistic_examples table
     if (aiResult.discovered_highlights && aiResult.discovered_highlights.length > 0) {
         for (const highlight of aiResult.discovered_highlights) {
+            const relevanceScore = calculateRelevanceScore(highlight);
+            
             const linguisticEntry = {
-                halunder_term: highlight.halunder_phrase,
+                halunder_term: highlight.halunder_phrase.trim(), // Ensure trimmed
                 german_equivalent: highlight.german_meaning,
                 explanation: highlight.explanation_german,
                 feature_type: highlight.type,
                 source_table: 'new_examples',
-                relevance_score: highlight.relevance_score || 5, // AI determines this
+                relevance_score: relevanceScore,
                 tags: [highlight.type],
                 source_ids: [example.id],
                 processed_at: new Date().toISOString()
             };
 
             try {
-                const { error: linguisticError } = await sourceDbClient
+                // FIXED: Check if it already exists first, then insert or update
+                const { data: existingEntry } = await sourceDbClient
                     .from('cleaned_linguistic_examples')
-                    .upsert([linguisticEntry], { 
-                        onConflict: 'halunder_term',
-                        ignoreDuplicates: false 
-                    });
-                
-                if (linguisticError) {
-                    addLog(`Failed to save linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
+                    .select('id, relevance_score')
+                    .ilike('halunder_term', linguisticEntry.halunder_term.trim())
+                    .single();
+
+                if (existingEntry) {
+                    // Update if our relevance score is higher
+                    if (relevanceScore > existingEntry.relevance_score) {
+                        const { error: updateError } = await sourceDbClient
+                            .from('cleaned_linguistic_examples')
+                            .update({
+                                german_equivalent: linguisticEntry.german_equivalent,
+                                explanation: linguisticEntry.explanation,
+                                relevance_score: relevanceScore,
+                                processed_at: new Date().toISOString()
+                            })
+                            .eq('id', existingEntry.id);
+                        
+                        if (updateError) {
+                            addLog(`Failed to update linguistic feature "${highlight.halunder_phrase}": ${updateError.message}`, 'warning');
+                        } else {
+                            addLog(`Updated linguistic feature: ${highlight.halunder_phrase} (score: ${existingEntry.relevance_score} → ${relevanceScore})`, 'success');
+                        }
+                    } else {
+                        addLog(`Linguistic feature "${highlight.halunder_phrase}" already exists with higher/equal score`, 'info');
+                    }
                 } else {
-                    addLog(`Saved linguistic feature: ${highlight.halunder_phrase} (AI score: ${highlight.relevance_score})`, 'success');
+                    // Insert new entry
+                    const { error: insertError } = await sourceDbClient
+                        .from('cleaned_linguistic_examples')
+                        .insert([linguisticEntry]);
+                    
+                    if (insertError) {
+                        addLog(`Failed to save linguistic feature "${highlight.halunder_phrase}": ${insertError.message}`, 'warning');
+                    } else {
+                        addLog(`Saved new linguistic feature: ${highlight.halunder_phrase} (score: ${relevanceScore})`, 'success');
+                    }
                 }
             } catch (linguisticError) {
-                addLog(`Error saving linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
+                addLog(`Error processing linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
             }
         }
-        addLog(`Discovered ${aiResult.discovered_highlights.length} new linguistic features`, 'success');
+        addLog(`Processed ${aiResult.discovered_highlights.length} linguistic features`, 'success');
     }
 
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
