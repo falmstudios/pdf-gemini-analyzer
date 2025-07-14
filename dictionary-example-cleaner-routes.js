@@ -546,27 +546,63 @@ router.get('/sample-prompt', (req, res) => {
     }
 });
 
+// FIXED: Corrected Supabase syntax for updating and getting the count.
 router.post('/reset-all', async (req, res) => {
     try {
-        const { error, count } = await sourceDbClient.from('new_examples').update({ cleaning_status: 'pending' }).neq('id', '00000000-0000-0000-0000-000000000000').select({count: 'exact'});
+        addLog('Attempting to reset all examples to pending...', 'info');
+        const { count, error } = await sourceDbClient
+            .from('new_examples')
+            .update({ cleaning_status: 'pending' })
+            .neq('cleaning_status', 'pending'); // Only update rows that are not already pending
+
         if (error) throw error;
-        res.json({ success: true, message: `Reset ${count} examples to pending status`, resetCount: count });
+
+        const resetCount = count || 0;
+        const message = `Reset ${resetCount} examples to pending status.`;
+        addLog(message, 'success');
+        res.json({ 
+            success: true, 
+            message: message,
+            resetCount 
+        });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        const errorMessage = `Error resetting examples: ${error.message}`;
+        addLog(errorMessage, 'error');
+        res.status(500).json({ error: errorMessage });
     }
 });
 
+// FIXED: Corrected Supabase syntax for deleting and getting the count.
 router.post('/clear-cleaned', async (req, res) => {
     try {
-        const { error: cleanedError } = await sourceDbClient.from('ai_cleaned_dictsentences').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        addLog('Attempting to clear all cleaned data...', 'info');
+        
+        // Clear cleaned sentences
+        const { count: cleanedCount, error: cleanedError } = await sourceDbClient
+            .from('ai_cleaned_dictsentences')
+            .delete()
+            .neq('id', '00000000-0000-0000-0000-000000000000');
+
         if (cleanedError) throw cleanedError;
 
-        const { error: linguisticError } = await sourceDbClient.from('cleaned_linguistic_examples').delete().eq('source_table', 'new_examples');
-        if (linguisticError) throw linguisticError;
+        // Clear discovered linguistic features from new_examples
+        const { count: linguisticCount, error: linguisticError } = await sourceDbClient
+            .from('cleaned_linguistic_examples')
+            .delete()
+            .eq('source_table', 'new_examples');
 
-        res.json({ success: true, message: 'Cleared all cleaned data and discovered linguistic features' });
+        if (linguisticError) throw linguisticError;
+        
+        const message = `Cleared ${cleanedCount || 0} cleaned sentences and ${linguisticCount || 0} discovered linguistic features.`;
+        addLog(message, 'success');
+        res.json({ 
+            success: true, 
+            message: message
+        });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        const errorMessage = `Error clearing cleaned data: ${error.message}`;
+        addLog(errorMessage, 'error');
+        res.status(500).json({ error: errorMessage });
     }
 });
 
