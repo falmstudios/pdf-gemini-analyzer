@@ -1,5 +1,5 @@
 // ===============================================
-// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE RESILIENT VERSION
+// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE, NO-RPC VERSION
 // File: dictionary-example-cleaner-routes.js
 // ===============================================
 
@@ -15,7 +15,7 @@ const axiosInstance = axios.create({ timeout: 0 });
 // === TUNING PARAMETERS (TIER 2) ===
 const CONCURRENT_REQUESTS = 15;
 const STAGGER_DELAY_MS = 100;
-const PREFETCH_CHUNK_SIZE = 200; // How many sentences to pre-fetch context for at a time
+const PREFETCH_CHUNK_SIZE = 200;
 
 // === STATE MANAGEMENT ===
 let processingState = { isProcessing: false, progress: 0, status: 'Idle', details: '', logs: [], startTime: null, lastPromptUsed: null };
@@ -62,34 +62,26 @@ async function callOpenAI_Api(prompt) {
 }
 
 // === DATABASE HELPERS ===
-// *** FIXED: Rock-solid pagination logic ***
 async function fetchAllWithPagination(queryBuilder, limit) {
     const PAGE_SIZE = 1000;
     let allData = [];
     let page = 0;
     let fetchedData;
-
     do {
         const { data, error } = await queryBuilder.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
         if (error) throw error;
-        
         fetchedData = data;
-        if (fetchedData && fetchedData.length > 0) {
-            allData.push(...fetchedData);
-        }
+        if (fetchedData?.length > 0) allData.push(...fetchedData);
         page++;
     } while (fetchedData && fetchedData.length === PAGE_SIZE && (!limit || allData.length < limit));
-    
     return limit ? allData.slice(0, limit) : allData;
 }
 
 async function getWordContextForChunk(sentences) {
     const allWords = sentences.flatMap(ex => ex.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
     if (allWords.length === 0) return {};
-    
     const uniqueWords = [...new Set(allWords)];
     const orFilter = uniqueWords.map(word => `term_text.ilike.${word}`).join(',');
-
     const query = sourceDbClient.from('new_terms').select(`
             term_text,
             new_concept_to_term!inner(
@@ -97,13 +89,10 @@ async function getWordContextForChunk(sentences) {
                 concept:new_concepts!inner(primary_german_label, part_of_speech, german_definition)
             )
         `).or(orFilter).eq('language', 'hal');
-    
     const termData = await fetchAllWithPagination(query);
     const wordContextMap = {};
     termData.forEach(term => {
-        if (!wordContextMap[term.term_text.toLowerCase()]) {
-            wordContextMap[term.term_text.toLowerCase()] = [];
-        }
+        if (!wordContextMap[term.term_text.toLowerCase()]) wordContextMap[term.term_text.toLowerCase()] = [];
         term.new_concept_to_term.forEach(connection => {
             wordContextMap[term.term_text.toLowerCase()].push({
                 german_equivalent: connection.concept.primary_german_label,
@@ -183,7 +172,7 @@ async function runDictionaryExampleCleaner(limit) {
     }
 }
 
-// Processes a single example, called concurrently
+// *** REVISED: Handles DB operations directly, NO RPC ***
 async function processSingleExample(example, shouldPrintPrompt, wordContextForChunk) {
     try {
         await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
@@ -194,7 +183,6 @@ async function processSingleExample(example, shouldPrintPrompt, wordContextForCh
             return acc;
         }, {});
         
-        // Fetch only relevant idioms for this specific sentence
         const orFilter = wordsInSentence.map(w => `halunder_term.ilike.%${w}%`).join(',');
         const { data: relevantIdioms } = orFilter ? await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation').or(orFilter).gte('relevance_score', 6) : { data: [] };
 
@@ -209,43 +197,65 @@ async function processSingleExample(example, shouldPrintPrompt, wordContextForCh
         }
 
         const aiResult = await callOpenAI_Api(prompt);
-        if (!aiResult.expansions || aiResult.expansions.length === 0) {
-            throw new Error("AI response did not contain 'expansions' array.");
+        const expansions = aiResult.expansions || [];
+        if (expansions.length === 0) {
+            throw new Error("AI response did not contain valid 'expansions' array.");
         }
         
-        const cleaned_sentences = [];
-        let linguistic_highlights = [];
-        aiResult.expansions.forEach(exp => {
-            cleaned_sentences.push({
-                cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
-                confidence_score: exp.confidence_score, ai_notes: exp.notes,
-                alternative_translations: 'gpt4_best'
+        // --- Direct Database Operations Start ---
+
+        // 1. Prepare all translation rows to insert
+        const translationsToInsert = [];
+        expansions.forEach(exp => {
+            translationsToInsert.push({
+                original_example_id: example.id, cleaned_halunder: exp.cleaned_halunder,
+                cleaned_german: exp.best_translation, confidence_score: exp.confidence_score,
+                ai_notes: exp.notes, alternative_translations: 'gpt4_best'
             });
             (exp.alternative_translations || []).forEach((alt, i) => {
-                cleaned_sentences.push({
-                    cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
-                    confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
-                    alternative_translations: `gpt4_alternative_${i + 1}`
+                translationsToInsert.push({
+                    original_example_id: example.id, cleaned_halunder: exp.cleaned_halunder,
+                    cleaned_german: alt.translation, confidence_score: alt.confidence_score || 0.8,
+                    ai_notes: alt.notes, alternative_translations: `gpt4_alternative_${i + 1}`
                 });
             });
-            if (exp.discovered_highlights) linguistic_highlights.push(...exp.discovered_highlights);
         });
+        
+        // 2. Insert cleaned sentences
+        if (translationsToInsert.length > 0) {
+            const { error: insertErr } = await sourceDbClient.from('ai_cleaned_dictsentences').insert(translationsToInsert);
+            if (insertErr) throw new Error(`Cleaned sentence insert failed: ${insertErr.message}`);
+        }
 
-        const { error: rpcError } = await sourceDbClient.rpc('save_cleaned_example_data', {
-            p_original_example_id: example.id,
-            p_cleaned_sentences: JSON.stringify(cleaned_sentences),
-            p_linguistic_highlights: JSON.stringify(linguistic_highlights)
-        });
-        if (rpcError) throw new Error(`RPC Error: ${rpcError.message}`);
+        // 3. Upsert linguistic highlights
+        const highlights = expansions.flatMap(exp => exp.discovered_highlights || []);
+        if (highlights.length > 0) {
+            const highlightsToUpsert = highlights
+                .filter(h => typeof h.relevance_score === 'number')
+                .map(h => ({
+                    halunder_term: h.halunder_phrase.trim(), german_equivalent: h.german_meaning,
+                    explanation: h.explanation_german, feature_type: h.type,
+                    source_table: 'new_examples', relevance_score: h.relevance_score,
+                    tags: [h.type], source_ids: [example.id]
+                }));
+            
+            const { error: upsertErr } = await sourceDbClient.from('cleaned_linguistic_examples').upsert(highlightsToUpsert, { onConflict: 'halunder_term' });
+            if (upsertErr) addLog(`Warning: Highlight upsert failed - ${upsertErr.message}`, 'warning'); // Non-critical
+        }
 
-        addLog(`[OK] ID ${example.id} -> Generated ${aiResult.expansions.length} clean examples.`, 'success');
+        // 4. Mark original as completed
+        await sourceDbClient.from('new_examples').update({ cleaning_status: 'completed' }).eq('id', example.id);
+
+        // --- Direct Database Operations End ---
+
+        addLog(`[OK] ID ${example.id} -> Generated ${expansions.length} clean examples.`, 'success');
         return { promptWasPrinted: shouldPrintPrompt };
+
     } catch(e) {
         addLog(`[FAIL] ID ${example.id}: ${e.message}`, 'error');
         await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).eq('id', example.id);
     }
 }
-
 
 // Builds a prompt for a single item with full context
 function buildSingleItemPrompt(example, relevantIdioms, wordContext) {
