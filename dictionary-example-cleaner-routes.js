@@ -1,5 +1,5 @@
 // ===============================================
-// ENHANCED DICTIONARY EXAMPLE CLEANER ROUTES
+// COMPLETE DICTIONARY EXAMPLE CLEANER ROUTES WITH PROMPT DISPLAY
 // File: dictionary-example-cleaner-routes.js
 // Location: /dictionary-example-cleaner-routes.js (root of your project)
 // ===============================================
@@ -9,7 +9,7 @@ const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
-// Database connections
+// Database connection - using SOURCE database only
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 
 const axiosInstance = axios.create({ timeout: 0 });
@@ -21,7 +21,8 @@ let processingState = {
     status: 'Idle',
     details: '',
     logs: [],
-    startTime: null
+    startTime: null,
+    lastPromptUsed: null // Store the last prompt for display
 };
 
 function addLog(message, type = 'info') {
@@ -31,7 +32,7 @@ function addLog(message, type = 'info') {
     console.log(`[DICT-EXAMPLE-CLEANER] [${type.toUpperCase()}] ${message}`);
 }
 
-// OpenAI API caller
+// OpenAI API caller (no temperature)
 async function callOpenAI_Api(prompt) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY environment variable not set.");
@@ -51,8 +52,8 @@ async function callOpenAI_Api(prompt) {
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    response_format: { "type": "json_object" },
-                    temperature: 0.7
+                    response_format: { "type": "json_object" }
+                    // Removed temperature as requested
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
             );
@@ -151,7 +152,15 @@ async function getWordContext(words) {
 
 // Main processing function
 async function runDictionaryExampleCleaner(limit) {
-    processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
+    processingState = { 
+        isProcessing: true, 
+        progress: 0, 
+        status: 'Starting...', 
+        details: '', 
+        logs: [], 
+        startTime: Date.now(),
+        lastPromptUsed: null
+    };
     let firstPromptPrinted = false;
     addLog(`Starting enhanced dictionary example cleaning process...`, 'info');
 
@@ -253,6 +262,9 @@ async function processSingleExample(example, shouldPrintPrompt) {
 
     const prompt = buildEnhancedCleaningPrompt(example, headwordContext, wordContexts, foundIdioms);
     
+    // Store the prompt for display
+    processingState.lastPromptUsed = prompt;
+    
     if (shouldPrintPrompt) {
         console.log('----------- ENHANCED DICTIONARY EXAMPLE CLEANER PROMPT -----------');
         console.log(prompt);
@@ -262,14 +274,15 @@ async function processSingleExample(example, shouldPrintPrompt) {
 
     const aiResult = await callOpenAI_Api(prompt);
 
-    // Save cleaned result
+    // Save cleaned result with the prompt
     const cleanedEntry = {
         original_example_id: example.id,
         cleaned_halunder: aiResult.cleaned_halunder,
         cleaned_german: aiResult.best_translation,
         confidence_score: aiResult.confidence_score,
         ai_notes: aiResult.notes,
-        alternative_translations: aiResult.alternative_translations
+        alternative_translations: aiResult.alternative_translations,
+        openai_prompt: prompt // Store the exact prompt
     };
 
     const { error: insertError } = await sourceDbClient
@@ -413,7 +426,10 @@ router.post('/start-cleaning', (req, res) => {
 });
 
 router.get('/progress', (req, res) => {
-    res.json(processingState);
+    res.json({
+        ...processingState,
+        lastPromptUsed: processingState.lastPromptUsed // Include the last prompt
+    });
 });
 
 router.get('/stats', async (req, res) => {
@@ -443,6 +459,15 @@ router.get('/stats', async (req, res) => {
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+// Get a sample prompt for display
+router.get('/sample-prompt', (req, res) => {
+    if (processingState.lastPromptUsed) {
+        res.json({ prompt: processingState.lastPromptUsed });
+    } else {
+        res.json({ prompt: 'No prompt available yet. Start processing to see the latest prompt.' });
     }
 });
 
