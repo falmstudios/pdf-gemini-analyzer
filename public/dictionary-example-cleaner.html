@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enhanced Dictionary Example Cleaner</title>
+    <link rel="stylesheet" href="dictionary-styles.css">
+    <style>
+        .progress-bar-container { 
+            background-color: #e0e0e0; 
+            border-radius: 4px; 
+            overflow: hidden; 
+            margin: 10px 0;
+        }
+        .progress-bar { 
+            height: 20px; 
+            background-color: #27ae60; 
+            width: 0%; 
+            transition: width 0.4s ease-in-out; 
+            text-align: center; 
+            color: white; 
+            font-weight: bold;
+            line-height: 20px;
+        }
+        .log-container { 
+            height: 400px; 
+            overflow-y: auto; 
+            background-color: #2b2b2b; 
+            color: #f1f1f1; 
+            padding: 15px; 
+            border-radius: 5px; 
+            font-family: monospace; 
+            margin-top: 20px; 
+        }
+        .log-entry { 
+            padding: 2px 0; 
+            border-bottom: 1px solid #444; 
+        }
+        .log-entry.error { color: #ff6b6b; }
+        .log-entry.success { color: #69f0ae; }
+        .log-entry.warning { color: #ffd54f; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            border: 1px solid #e9ecef;
+        }
+        .stat-number {
+            font-size: 2em;
+            font-weight: bold;
+            color: #27ae60;
+        }
+        .stat-label {
+            color: #666;
+            margin-top: 5px;
+        }
+        .admin-controls {
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .admin-controls h3 {
+            color: #856404;
+            margin-bottom: 15px;
+        }
+        .danger-btn {
+            background-color: #dc3545;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        .danger-btn:hover {
+            background-color: #c82333;
+        }
+        .warning-btn {
+            background-color: #ffc107;
+            color: #212529;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        .warning-btn:hover {
+            background-color: #e0a800;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Enhanced Dictionary Example Cleaner</h1>
+            <a href="/" class="back-link">← Back to Home</a>
+        </div>
+        
+        <div class="main-content">
+            <div class="info-panel">
+                <h2>About This Enhanced Tool</h2>
+                <p>This tool processes raw dictionary examples using AI with comprehensive word context. It cleans sentence pairs and automatically discovers idioms, place names, and cultural references.</p>
+                
+                <div class="stats-grid" id="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-number" id="total-examples">-</div>
+                        <div class="stat-label">Total Examples</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="pending-examples">-</div>
+                        <div class="stat-label">Pending Examples</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="cleaned-examples">-</div>
+                        <div class="stat-label">Cleaned Examples</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="discovered-idioms">-</div>
+                        <div class="stat-label">Discovered Highlights</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="admin-controls">
+                <h3>⚠️ Administrative Controls</h3>
+                <p>Use these controls to manage the processing queue and clean up data.</p>
+                <button onclick="resetAllExamples()" class="warning-btn">Reset All to Pending</button>
+                <button onclick="clearAllCleaned()" class="danger-btn">Clear All Cleaned Data</button>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #856404;">
+                    <strong>Reset All:</strong> Marks all examples as pending for reprocessing.<br>
+                    <strong>Clear All:</strong> Deletes all cleaned sentences and discovered idioms (irreversible).
+                </p>
+            </div>
+
+            <div class="control-panel">
+                <h2>Processing Controls</h2>
+                <div class="form-group">
+                    <label for="example-limit">Number of examples to process:</label>
+                    <input type="number" id="example-limit" value="25" min="1" max="500" style="width: 100px; padding: 8px; margin-right: 15px;">
+                    <button id="start-btn" class="primary-btn">Start Enhanced Cleaning</button>
+                    <button onclick="refreshStats()" class="secondary-btn" style="margin-left: 10px;">Refresh Stats</button>
+                </div>
+                
+                <div class="info-box" style="background-color: #e3f2fd; padding: 15px; margin-top: 15px; border-radius: 5px;">
+                    <h4>Enhanced Features:</h4>
+                    <ul>
+                        <li><strong>Word-by-word context:</strong> AI gets dictionary definitions for every word in the sentence</li>
+                        <li><strong>Cultural discovery:</strong> Automatically finds place names, idioms, and cultural references</li>
+                        <li><strong>Comprehensive cleanup:</strong> Better OCR error correction with full linguistic context</li>
+                        <li><strong>Idiom cataloging:</strong> Saves discovered highlights to dedicated new_idioms_from_dict table</li>
+                        <li><strong>Smart categorization:</strong> Classifies findings as idioms, places, cultural references, etc.</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="progress-panel" id="progress-panel" style="display: none;">
+                <h2>Processing Progress</h2>
+                <div class="progress-bar-container">
+                    <div id="progress-bar" class="progress-bar">0%</div>
+                </div>
+                <p><strong>Status:</strong> <span id="status-text">Idle</span></p>
+                <p><strong>Details:</strong> <span id="details-text"></span></p>
+            </div>
+
+            <div class="console-panel">
+                <h2>Processing Log</h2>
+                <div id="log-container" class="log-container">
+                    <div class="log-entry">Enhanced system ready. Word context and cultural discovery enabled.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let progressInterval;
+
+        // Load stats on page load
+        window.onload = async function() {
+            await refreshStats();
+            updateProgress(); // Check current status
+        };
+
+        // Refresh statistics
+        async function refreshStats() {
+            try {
+                const response = await fetch('/dictionary-example-cleaner/stats');
+                const stats = await response.json();
+                
+                document.getElementById('total-examples').textContent = stats.totalExamples.toLocaleString();
+                document.getElementById('pending-examples').textContent = stats.pendingExamples.toLocaleString();
+                document.getElementById('cleaned-examples').textContent = stats.cleanedExamples.toLocaleString();
+                document.getElementById('discovered-idioms').textContent = stats.discoveredIdioms.toLocaleString();
+                
+            } catch (error) {
+                console.error('Error loading statistics:', error);
+            }
+        }
+
+        // Reset all examples to pending
+        async function resetAllExamples() {
+            if (!confirm('This will reset ALL examples to pending status for reprocessing. Continue?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/dictionary-example-cleaner/reset-all', {
+                    method: 'POST'
+                });
+                
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error);
+                
+                addLogEntry(`Reset completed: ${data.resetCount} examples marked as pending`, 'success');
+                await refreshStats();
+            } catch (error) {
+                addLogEntry(`Error resetting examples: ${error.message}`, 'error');
+            }
+        }
+
+        // Clear all cleaned data
+        async function clearAllCleaned() {
+            if (!confirm('This will DELETE ALL cleaned sentences and discovered idioms. This cannot be undone! Continue?')) {
+                return;
+            }
+            
+            if (!confirm('Are you absolutely sure? This will permanently delete all processed data.')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/dictionary-example-cleaner/clear-cleaned', {
+                    method: 'POST'
+                });
+                
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error);
+                
+                addLogEntry('All cleaned data has been deleted', 'warning');
+                await refreshStats();
+            } catch (error) {
+                addLogEntry(`Error clearing data: ${error.message}`, 'error');
+            }
+        }
+
+        // Start processing
+        document.getElementById('start-btn').addEventListener('click', async function() {
+            const startBtn = document.getElementById('start-btn');
+            if (startBtn.disabled) return;
+
+            const limit = document.getElementById('example-limit').value;
+            
+            if (!confirm(`This will process up to ${limit} dictionary examples using OpenAI GPT-4.1 with enhanced word context. This will consume API credits. Continue?`)) {
+                return;
+            }
+
+            startBtn.disabled = true;
+            startBtn.textContent = 'Processing...';
+            document.getElementById('progress-panel').style.display = 'block';
+
+            try {
+                const response = await fetch('/dictionary-example-cleaner/start-cleaning', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ limit: parseInt(limit) })
+                });
+                
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error);
+                
+                // Start monitoring progress
+                progressInterval = setInterval(updateProgress, 2000);
+                addLogEntry('Enhanced processing started successfully', 'success');
+            } catch (error) {
+                addLogEntry(`Error starting process: ${error.message}`, 'error');
+                resetUI();
+            }
+        });
+
+        // Update progress
+        async function updateProgress() {
+            try {
+                const response = await fetch('/dictionary-example-cleaner/progress');
+                const data = await response.json();
+                
+                document.getElementById('status-text').textContent = data.status || 'Idle';
+                document.getElementById('details-text').textContent = data.details || '';
+                
+                const percentage = Math.round((data.progress || 0) * 100);
+                const progressBar = document.getElementById('progress-bar');
+                progressBar.style.width = `${percentage}%`;
+                progressBar.textContent = `${percentage}%`;
+
+                // Update logs
+                if (data.logs && data.logs.length > 0) {
+                    renderLogs(data.logs);
+                }
+
+                // Check if completed
+                if (!data.isProcessing && data.status !== 'Idle') {
+                    clearInterval(progressInterval);
+                    resetUI();
+                    await refreshStats();
+                    
+                    if (data.status === 'Completed') {
+                        addLogEntry('Enhanced processing completed successfully!', 'success');
+                    } else if (data.status.includes('Error')) {
+                        addLogEntry(`Process ended with error: ${data.status}`, 'error');
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to fetch progress:', error);
+            }
+        }
+
+        // Render logs
+        function renderLogs(logs) {
+            const logContainer = document.getElementById('log-container');
+            const newLogs = logs.slice(-50); // Show last 50 logs
+            
+            logContainer.innerHTML = newLogs.map(log => 
+                `<div class="log-entry ${log.type}">${new Date(log.timestamp).toLocaleTimeString()} - ${log.message}</div>`
+            ).join('');
+            
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        // Add single log entry
+        function addLogEntry(message, type = 'info') {
+            const logContainer = document.getElementById('log-container');
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = `<div class="log-entry ${type}">${timestamp} - ${message}</div>`;
+            logContainer.innerHTML += logEntry;
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        // Reset UI
+        function resetUI() {
+            const startBtn = document.getElementById('start-btn');
+            startBtn.disabled = false;
+            startBtn.textContent = 'Start Enhanced Cleaning';
+        }
+    </script>
+</body>
+</html>
