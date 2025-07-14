@@ -1,5 +1,5 @@
 // ===============================================
-// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - OPTIMAL SEMANTIC GROUPING VERSION
+// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE GOLD-STANDARD VERSION
 // File: dictionary-example-cleaner-routes.js
 // ===============================================
 
@@ -13,7 +13,6 @@ const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env
 const axiosInstance = axios.create({ timeout: 0 });
 
 // === TUNING PARAMETERS (TIER 2) ===
-// How many concept GROUPS to process in parallel.
 const CONCURRENT_GROUPS = 8;
 
 // === STATE MANAGEMENT ===
@@ -77,6 +76,49 @@ async function fetchAllWithPagination(queryBuilder, limit) {
     return limit ? allData.slice(0, limit) : allData;
 }
 
+// *** REVISED: Fetches FULL dictionary context for all words in a group ***
+async function getWordContextForGroup(group) {
+    const allWords = group.flatMap(ex => ex.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
+    if (allWords.length === 0) return {};
+    const uniqueWords = [...new Set(allWords)];
+    const orFilter = uniqueWords.map(word => `term_text.ilike.${word}`).join(',');
+
+    const query = sourceDbClient
+        .from('new_terms')
+        .select(`
+            term_text,
+            new_concept_to_term!inner(
+                pronunciation, gender, plural_form, etymology, note,
+                concept:new_concepts!inner(
+                    primary_german_label, part_of_speech, german_definition
+                )
+            )
+        `)
+        .or(orFilter).eq('language', 'hal');
+    
+    const termData = await fetchAllWithPagination(query);
+    const wordContextMap = {};
+    termData.forEach(term => {
+        if (!wordContextMap[term.term_text.toLowerCase()]) {
+            wordContextMap[term.term_text.toLowerCase()] = [];
+        }
+        term.new_concept_to_term.forEach(connection => {
+            wordContextMap[term.term_text.toLowerCase()].push({
+                german_equivalent: connection.concept.primary_german_label,
+                part_of_speech: connection.concept.part_of_speech,
+                german_definition: connection.concept.german_definition,
+                pronunciation: connection.pronunciation,
+                gender: connection.gender,
+                plural_form: connection.plural_form,
+                etymology: connection.etymology,
+                note: connection.note,
+            });
+        });
+    });
+    return wordContextMap;
+}
+
+
 // === MAIN PROCESSING LOGIC ===
 async function runDictionaryExampleCleaner(limit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now(), lastPromptUsed: null };
@@ -94,11 +136,12 @@ async function runDictionaryExampleCleaner(limit) {
             return;
         }
 
-        // *** SEMANTIC GROUPING LOGIC ***
         const groups = pendingExamples.reduce((acc, ex) => {
-            const key = ex.concept_id;
-            if (!acc[key]) acc[key] = [];
-            acc[key].push(ex);
+            if (ex.concept_id) {
+                const key = ex.concept_id;
+                if (!acc[key]) acc[key] = [];
+                acc[key].push(ex);
+            }
             return acc;
         }, {});
         const exampleGroups = Object.values(groups);
@@ -123,7 +166,6 @@ async function runDictionaryExampleCleaner(limit) {
             });
             
             const results = await Promise.allSettled(promises);
-
             results.forEach(result => {
                 if(result.status === 'fulfilled' && result.value) {
                      processedCount += result.value.processedCount;
@@ -154,7 +196,8 @@ async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', groupIds);
 
     try {
-        const prompt = buildGroupedPrompt(group, knownIdioms);
+        const wordContext = await getWordContextForGroup(group);
+        const prompt = buildGroupedPrompt(group, knownIdioms, wordContext);
         if (shouldPrintPrompt) {
             processingState.lastPromptUsed = prompt;
             console.log('----------- FIRST PROMPT (GROUPED) -----------');
@@ -178,28 +221,26 @@ async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
             try {
                 const cleaned_sentences = [];
                 let linguistic_highlights = [];
-
-                processedItem.expansions.forEach(exp => {
-                    cleaned_sentences.push({
-                        cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
-                        confidence_score: exp.confidence_score, ai_notes: exp.notes,
-                        alternative_translations: 'gpt4_best'
-                    });
-                    if (exp.alternative_translations) {
-                        exp.alternative_translations.forEach((alt, i) => {
-                            cleaned_sentences.push({
-                                cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
-                                confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
-                                alternative_translations: `gpt4_alternative_${i + 1}`
-                            });
+                if (processedItem.expansions) {
+                    processedItem.expansions.forEach(exp => {
+                        cleaned_sentences.push({
+                            cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
+                            confidence_score: exp.confidence_score, ai_notes: exp.notes,
+                            alternative_translations: 'gpt4_best'
                         });
-                    }
-                    if (exp.discovered_highlights) {
-                        linguistic_highlights.push(...exp.discovered_highlights);
-                    }
-                });
+                        if (exp.alternative_translations) {
+                            exp.alternative_translations.forEach((alt, i) => {
+                                cleaned_sentences.push({
+                                    cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
+                                    confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
+                                    alternative_translations: `gpt4_alternative_${i + 1}`
+                                });
+                            });
+                        }
+                        if (exp.discovered_highlights) linguistic_highlights.push(...exp.discovered_highlights);
+                    });
+                }
                 
-                // Use the transactional RPC to save all data atomically
                 const { error: rpcError } = await sourceDbClient.rpc('save_cleaned_example_data', {
                     p_original_example_id: originalExample.id,
                     p_cleaned_sentences: JSON.stringify(cleaned_sentences),
@@ -223,20 +264,30 @@ async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
 }
 
 
-// Builds a prompt for a group of items sharing a concept
-function buildGroupedPrompt(group, knownIdioms) {
+// *** REVISED: Builds a prompt with FULL context for the group ***
+function buildGroupedPrompt(group, knownIdioms, wordContext) {
     const headwordConcept = group[0].concept;
     const inputExamples = group.map(ex => ({
         original_id: ex.id,
         halunder_sentence: ex.halunder_sentence
     }));
 
+    // Create a detailed headword context object for the prompt
+    const detailedHeadwordContext = {
+        headword: headwordConcept.primary_german_label,
+        part_of_speech: headwordConcept.part_of_speech,
+        german_definition: headwordConcept.german_definition,
+        notes: headwordConcept.notes,
+        krogmann_info: headwordConcept.krogmann_info,
+        krogmann_idioms: headwordConcept.krogmann_idioms
+    };
+
     return `You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to analyze a group of example sentences for a single dictionary headword to understand its semantic range, and then process each example.
 
 **HEADWORD CONTEXT (applies to all examples below):**
-- Headword: "${headwordConcept.primary_german_label}"
-- Part of Speech: "${headwordConcept.part_of_speech}"
-- German Definition: "${headwordConcept.german_definition}"
+\`\`\`json
+${JSON.stringify(detailedHeadwordContext, null, 2)}
+\`\`\`
 
 **CRITICAL INSTRUCTION 1: SENTENCE EXPANSION**
 Within each example, if a Halunder sentence contains slashes (e.g., "A/B/C"), you MUST expand it into multiple, separate sentence objects in the "expansions" array for that example.
@@ -247,16 +298,21 @@ For EACH expanded sentence, you MUST follow this priority:
 2.  \`alternative_translations\`: Include other natural variations AND the literal, word-for-word translation if it's different.
 
 **MAIN TASK:**
-Analyze all the provided examples together for context. Then, for each item in the "input_examples" array, generate a corresponding object in the "processed_examples" array of your response.
+Analyze all the provided examples and context. Then, for each item in the "input_examples" array, generate a corresponding object in the "processed_examples" array of your response.
 
 **INPUT DATA:**
 
-**1. Known Idioms (for reference):**
+**1. Dictionary Context for Individual Words (for reference):**
 \`\`\`json
-${JSON.stringify(knownIdioms.slice(0, 50), null, 2))}
+${JSON.stringify(wordContext, null, 2)}
 \`\`\`
 
-**2. Example Sentences for the headword "${headwordConcept.primary_german_label}":**
+**2. Known Idioms (for reference, truncated):**
+\`\`\`json
+${JSON.stringify(knownIdioms.slice(0, 50), null, 2)}
+\`\`\`
+
+**3. Example Sentences for the headword "${headwordConcept.primary_german_label}":**
 \`\`\`json
 ${JSON.stringify(inputExamples, null, 2)}
 \`\`\`
@@ -307,7 +363,7 @@ Your entire response must be a single JSON object. The "processed_examples" arra
 // --- API ROUTES ---
 router.post('/start-cleaning', (req, res) => {
     if (processingState.isProcessing) return res.status(400).json({ error: 'Processing is already in progress.' });
-    const limit = parseInt(req.body.limit, 10) || 25;
+    const limit = parseInt(req.body.limit, 10) || 10000;
     runDictionaryExampleCleaner(limit).catch(err => {
         console.error("Caught unhandled error in dictionary example cleaner:", err);
     });
