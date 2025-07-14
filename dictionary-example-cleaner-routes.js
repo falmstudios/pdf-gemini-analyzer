@@ -428,7 +428,7 @@ ${JSON.stringify(wordContexts, null, 2)}
 ${JSON.stringify(knownIdioms, null, 2)}
 \`\`\`
 
-**4. Raw Example Pair (may contain errors):**
+**4. Raw Example Pair (likely already pretty correct meaningwise):**
 - Halunder: "${example.halunder_sentence}"
 - German: "${example.german_sentence}"
 
