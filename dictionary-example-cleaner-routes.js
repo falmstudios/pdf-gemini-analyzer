@@ -1,5 +1,5 @@
 // ===============================================
-// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE GOLD-STANDARD VERSION
+// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE ROBUST VERSION
 // File: dictionary-example-cleaner-routes.js
 // ===============================================
 
@@ -76,9 +76,9 @@ async function fetchAllWithPagination(queryBuilder, limit) {
     return limit ? allData.slice(0, limit) : allData;
 }
 
-// *** REVISED: Fetches FULL dictionary context for all words in a group ***
+// *** FIXED: Now robust against null halunder_sentence values ***
 async function getWordContextForGroup(group) {
-    const allWords = group.flatMap(ex => ex.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
+    const allWords = group.flatMap(ex => ex.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
     if (allWords.length === 0) return {};
     const uniqueWords = [...new Set(allWords)];
     const orFilter = uniqueWords.map(word => `term_text.ilike.${word}`).join(',');
@@ -107,10 +107,8 @@ async function getWordContextForGroup(group) {
                 german_equivalent: connection.concept.primary_german_label,
                 part_of_speech: connection.concept.part_of_speech,
                 german_definition: connection.concept.german_definition,
-                pronunciation: connection.pronunciation,
-                gender: connection.gender,
-                plural_form: connection.plural_form,
-                etymology: connection.etymology,
+                pronunciation: connection.pronunciation, gender: connection.gender,
+                plural_form: connection.plural_form, etymology: connection.etymology,
                 note: connection.note,
             });
         });
@@ -152,7 +150,8 @@ async function runDictionaryExampleCleaner(limit) {
 
         const idiomQuery = sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation').gte('relevance_score', 6);
         const knownIdioms = await fetchAllWithPagination(idiomQuery);
-        addLog(`Loaded ${knownIdioms.length} known idioms.`, 'info');
+        // *** FIXED: Log total count to confirm pagination works ***
+        addLog(`Loaded ${knownIdioms.length} known idioms from all pages.`, 'info');
         
         let processedCount = 0;
         let firstPromptPrinted = false;
@@ -193,6 +192,7 @@ async function runDictionaryExampleCleaner(limit) {
 // Processes a group of examples sharing the same concept_id
 async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
     const groupIds = group.map(ex => ex.id);
+    const groupName = group[0]?.concept?.primary_german_label || 'Unknown Group';
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', groupIds);
 
     try {
@@ -219,27 +219,30 @@ async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
             }
 
             try {
-                const cleaned_sentences = [];
+                // *** FIXED: Ensure arrays are always passed to the RPC function ***
+                const expansions = processedItem.expansions || [];
                 let linguistic_highlights = [];
-                if (processedItem.expansions) {
-                    processedItem.expansions.forEach(exp => {
-                        cleaned_sentences.push({
-                            cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
-                            confidence_score: exp.confidence_score, ai_notes: exp.notes,
-                            alternative_translations: 'gpt4_best'
-                        });
-                        if (exp.alternative_translations) {
-                            exp.alternative_translations.forEach((alt, i) => {
-                                cleaned_sentences.push({
-                                    cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
-                                    confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
-                                    alternative_translations: `gpt4_alternative_${i + 1}`
-                                });
-                            });
-                        }
-                        if (exp.discovered_highlights) linguistic_highlights.push(...exp.discovered_highlights);
+                const cleaned_sentences = [];
+
+                expansions.forEach(exp => {
+                    cleaned_sentences.push({
+                        cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
+                        confidence_score: exp.confidence_score, ai_notes: exp.notes,
+                        alternative_translations: 'gpt4_best'
                     });
-                }
+                    if (exp.alternative_translations) {
+                        exp.alternative_translations.forEach((alt, i) => {
+                            cleaned_sentences.push({
+                                cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
+                                confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
+                                alternative_translations: `gpt4_alternative_${i + 1}`
+                            });
+                        });
+                    }
+                    if (exp.discovered_highlights) {
+                        linguistic_highlights.push(...exp.discovered_highlights);
+                    }
+                });
                 
                 const { error: rpcError } = await sourceDbClient.rpc('save_cleaned_example_data', {
                     p_original_example_id: originalExample.id,
@@ -254,17 +257,17 @@ async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
             }
         }
         
-        addLog(`[OK] Processed concept group for "${group[0].concept.primary_german_label}" (${group.length} examples).`, 'success');
+        addLog(`[OK] Processed concept group for "${groupName}" (${group.length} examples).`, 'success');
         return { processedCount: group.length, promptWasPrinted: shouldPrintPrompt };
     } catch(e) {
-        addLog(`[FAIL] Group for "${group[0].concept.primary_german_label}" failed: ${e.message}`, 'error');
+        addLog(`[FAIL] Group for "${groupName}" failed: ${e.message}`, 'error');
         await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).in('id', groupIds);
         return { processedCount: 0, promptWasPrinted: false };
     }
 }
 
 
-// *** REVISED: Builds a prompt with FULL context for the group ***
+// Builds a prompt with FULL context for the group
 function buildGroupedPrompt(group, knownIdioms, wordContext) {
     const headwordConcept = group[0].concept;
     const inputExamples = group.map(ex => ({
@@ -272,7 +275,6 @@ function buildGroupedPrompt(group, knownIdioms, wordContext) {
         halunder_sentence: ex.halunder_sentence
     }));
 
-    // Create a detailed headword context object for the prompt
     const detailedHeadwordContext = {
         headword: headwordConcept.primary_german_label,
         part_of_speech: headwordConcept.part_of_speech,
@@ -333,21 +335,6 @@ Your entire response must be a single JSON object. The "processed_examples" arra
           "notes": "Standard translation for 'bad weather'.",
           "alternative_translations": [
             {"translation": "Es ist heute ein schlechtes Wetter.", "confidence_score": 0.9}
-          ],
-          "discovered_highlights": []
-        }
-      ]
-    },
-    {
-      "original_id": "The UUID of the second input example",
-      "expansions": [
-        {
-          "cleaned_halunder": "Hi es en bisterk Kearl.",
-          "best_translation": "Er ist ein böser Kerl.",
-          "confidence_score": 1.0,
-          "notes": "Direct translation for 'a bad/mean guy'.",
-          "alternative_translations": [
-             {"translation": "Er ist ein fieser Kerl.", "confidence_score": 0.9}
           ],
           "discovered_highlights": []
         }
