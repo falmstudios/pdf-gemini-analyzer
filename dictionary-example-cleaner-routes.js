@@ -1,5 +1,5 @@
 // ===============================================
-// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE ROBUST VERSION
+// FINAL DICTIONARY EXAMPLE CLEANER ROUTES - DEFINITIVE RESILIENT VERSION
 // File: dictionary-example-cleaner-routes.js
 // ===============================================
 
@@ -13,7 +13,9 @@ const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env
 const axiosInstance = axios.create({ timeout: 0 });
 
 // === TUNING PARAMETERS (TIER 2) ===
-const CONCURRENT_GROUPS = 8;
+const CONCURRENT_REQUESTS = 15;
+const STAGGER_DELAY_MS = 100;
+const PREFETCH_CHUNK_SIZE = 200; // How many sentences to pre-fetch context for at a time
 
 // === STATE MANAGEMENT ===
 let processingState = { isProcessing: false, progress: 0, status: 'Idle', details: '', logs: [], startTime: null, lastPromptUsed: null };
@@ -60,41 +62,41 @@ async function callOpenAI_Api(prompt) {
 }
 
 // === DATABASE HELPERS ===
+// *** FIXED: Rock-solid pagination logic ***
 async function fetchAllWithPagination(queryBuilder, limit) {
     const PAGE_SIZE = 1000;
     let allData = [];
     let page = 0;
-    while (true) {
+    let fetchedData;
+
+    do {
         const { data, error } = await queryBuilder.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
         if (error) throw error;
-        if (data?.length > 0) {
-            allData.push(...data);
-            if (data.length < PAGE_SIZE || (limit && allData.length >= limit)) break;
-            page++;
-        } else { break; }
-    }
+        
+        fetchedData = data;
+        if (fetchedData && fetchedData.length > 0) {
+            allData.push(...fetchedData);
+        }
+        page++;
+    } while (fetchedData && fetchedData.length === PAGE_SIZE && (!limit || allData.length < limit));
+    
     return limit ? allData.slice(0, limit) : allData;
 }
 
-// *** FIXED: Now robust against null halunder_sentence values ***
-async function getWordContextForGroup(group) {
-    const allWords = group.flatMap(ex => ex.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
+async function getWordContextForChunk(sentences) {
+    const allWords = sentences.flatMap(ex => ex.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || []);
     if (allWords.length === 0) return {};
+    
     const uniqueWords = [...new Set(allWords)];
     const orFilter = uniqueWords.map(word => `term_text.ilike.${word}`).join(',');
 
-    const query = sourceDbClient
-        .from('new_terms')
-        .select(`
+    const query = sourceDbClient.from('new_terms').select(`
             term_text,
             new_concept_to_term!inner(
                 pronunciation, gender, plural_form, etymology, note,
-                concept:new_concepts!inner(
-                    primary_german_label, part_of_speech, german_definition
-                )
+                concept:new_concepts!inner(primary_german_label, part_of_speech, german_definition)
             )
-        `)
-        .or(orFilter).eq('language', 'hal');
+        `).or(orFilter).eq('language', 'hal');
     
     const termData = await fetchAllWithPagination(query);
     const wordContextMap = {};
@@ -116,11 +118,10 @@ async function getWordContextForGroup(group) {
     return wordContextMap;
 }
 
-
 // === MAIN PROCESSING LOGIC ===
 async function runDictionaryExampleCleaner(limit) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now(), lastPromptUsed: null };
-    addLog(`Starting... Concurrent Groups: ${CONCURRENT_GROUPS}`, 'info');
+    addLog(`Starting... Concurrent Requests: ${CONCURRENT_REQUESTS}`, 'info');
 
     try {
         await sourceDbClient.from('new_examples').update({ cleaning_status: 'pending' }).in('cleaning_status', ['processing', 'error']);
@@ -134,46 +135,39 @@ async function runDictionaryExampleCleaner(limit) {
             return;
         }
 
-        const groups = pendingExamples.reduce((acc, ex) => {
-            if (ex.concept_id) {
-                const key = ex.concept_id;
-                if (!acc[key]) acc[key] = [];
-                acc[key].push(ex);
-            }
-            return acc;
-        }, {});
-        const exampleGroups = Object.values(groups);
-
         const totalToProcess = pendingExamples.length;
-        addLog(`Found ${totalToProcess} examples, forming ${exampleGroups.length} semantic concept groups.`, 'success');
-        processingState.status = 'Processing concept groups...';
-
-        const idiomQuery = sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation').gte('relevance_score', 6);
-        const knownIdioms = await fetchAllWithPagination(idiomQuery);
-        // *** FIXED: Log total count to confirm pagination works ***
-        addLog(`Loaded ${knownIdioms.length} known idioms from all pages.`, 'info');
+        addLog(`Found ${totalToProcess} examples to process.`, 'success');
+        processingState.status = 'Processing examples...';
         
         let processedCount = 0;
         let firstPromptPrinted = false;
 
-        for (let i = 0; i < exampleGroups.length; i += CONCURRENT_GROUPS) {
-            const chunk = exampleGroups.slice(i, i + CONCURRENT_GROUPS);
-            addLog(`Processing a block of ${chunk.length} concept groups (starting at group #${i + 1})...`, 'info');
+        for (let i = 0; i < totalToProcess; i += PREFETCH_CHUNK_SIZE) {
+            const prefetchChunk = pendingExamples.slice(i, i + PREFETCH_CHUNK_SIZE);
+            addLog(`Pre-fetching word context for next ${prefetchChunk.length} sentences...`, 'info');
+            const wordContextForChunk = await getWordContextForChunk(prefetchChunk);
+            addLog(`Context loaded for ${Object.keys(wordContextForChunk).length} unique words.`, 'success');
 
-            const promises = chunk.map((group, index) => {
-                return processConceptGroup(group, !firstPromptPrinted && index === 0, knownIdioms);
-            });
-            
-            const results = await Promise.allSettled(promises);
-            results.forEach(result => {
-                if(result.status === 'fulfilled' && result.value) {
-                     processedCount += result.value.processedCount;
-                     if(result.value.promptWasPrinted) firstPromptPrinted = true;
-                }
-            });
+            for (let j = 0; j < prefetchChunk.length; j += CONCURRENT_REQUESTS) {
+                const concurrentChunk = prefetchChunk.slice(j, j + CONCURRENT_REQUESTS);
+                addLog(`Processing a concurrent block of ${concurrentChunk.length} examples...`, 'info');
 
-            processingState.details = `Processed ${processedCount} of ${totalToProcess} total examples.`;
-            processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
+                const promises = concurrentChunk.map((example, index) => {
+                    return new Promise(resolve => setTimeout(resolve, index * STAGGER_DELAY_MS))
+                        .then(() => processSingleExample(example, !firstPromptPrinted && index === 0, wordContextForChunk));
+                });
+                
+                const results = await Promise.allSettled(promises);
+                results.forEach(result => {
+                    if (result.status === 'fulfilled' && result.value) {
+                         if(result.value.promptWasPrinted) firstPromptPrinted = true;
+                    }
+                });
+
+                processedCount += concurrentChunk.length;
+                processingState.details = `Processed ${processedCount} of ${totalToProcess} total examples.`;
+                processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
+            }
         }
 
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
@@ -189,156 +183,130 @@ async function runDictionaryExampleCleaner(limit) {
     }
 }
 
-// Processes a group of examples sharing the same concept_id
-async function processConceptGroup(group, shouldPrintPrompt, knownIdioms) {
-    const groupIds = group.map(ex => ex.id);
-    const groupName = group[0]?.concept?.primary_german_label || 'Unknown Group';
-    await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).in('id', groupIds);
-
+// Processes a single example, called concurrently
+async function processSingleExample(example, shouldPrintPrompt, wordContextForChunk) {
     try {
-        const wordContext = await getWordContextForGroup(group);
-        const prompt = buildGroupedPrompt(group, knownIdioms, wordContext);
+        await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
+        
+        const wordsInSentence = example.halunder_sentence?.toLowerCase().match(/[\p{L}0-9']+/gu) || [];
+        const relevantWordContext = wordsInSentence.reduce((acc, word) => {
+            if (wordContextForChunk[word]) acc[word] = wordContextForChunk[word];
+            return acc;
+        }, {});
+        
+        // Fetch only relevant idioms for this specific sentence
+        const orFilter = wordsInSentence.map(w => `halunder_term.ilike.%${w}%`).join(',');
+        const { data: relevantIdioms } = orFilter ? await sourceDbClient.from('cleaned_linguistic_examples').select('halunder_term, german_equivalent, explanation').or(orFilter).gte('relevance_score', 6) : { data: [] };
+
+        const prompt = buildSingleItemPrompt(example, relevantIdioms || [], relevantWordContext);
+        
         if (shouldPrintPrompt) {
             processingState.lastPromptUsed = prompt;
-            console.log('----------- FIRST PROMPT (GROUPED) -----------');
+            console.log('----------- FIRST PROMPT -----------');
             console.log(prompt);
-            console.log('-------------------------------------------');
-            addLog('Printed first grouped prompt to console.', 'info');
+            console.log('------------------------------------');
+            addLog('Printed first prompt to console.', 'info');
         }
 
         const aiResult = await callOpenAI_Api(prompt);
-        if (!aiResult.processed_examples || !Array.isArray(aiResult.processed_examples)) {
-            throw new Error("AI response did not contain 'processed_examples' array.");
-        }
-
-        for (const processedItem of aiResult.processed_examples) {
-            const originalExample = group.find(ex => ex.id === processedItem.original_id);
-            if (!originalExample) {
-                addLog(`AI returned data for an unknown original_id ${processedItem.original_id}`, 'warning');
-                continue;
-            }
-
-            try {
-                // *** FIXED: Ensure arrays are always passed to the RPC function ***
-                const expansions = processedItem.expansions || [];
-                let linguistic_highlights = [];
-                const cleaned_sentences = [];
-
-                expansions.forEach(exp => {
-                    cleaned_sentences.push({
-                        cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
-                        confidence_score: exp.confidence_score, ai_notes: exp.notes,
-                        alternative_translations: 'gpt4_best'
-                    });
-                    if (exp.alternative_translations) {
-                        exp.alternative_translations.forEach((alt, i) => {
-                            cleaned_sentences.push({
-                                cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
-                                confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
-                                alternative_translations: `gpt4_alternative_${i + 1}`
-                            });
-                        });
-                    }
-                    if (exp.discovered_highlights) {
-                        linguistic_highlights.push(...exp.discovered_highlights);
-                    }
-                });
-                
-                const { error: rpcError } = await sourceDbClient.rpc('save_cleaned_example_data', {
-                    p_original_example_id: originalExample.id,
-                    p_cleaned_sentences: JSON.stringify(cleaned_sentences),
-                    p_linguistic_highlights: JSON.stringify(linguistic_highlights)
-                });
-                if (rpcError) throw new Error(`RPC Error for ID ${originalExample.id}: ${rpcError.message}`);
-
-            } catch (e) {
-                 addLog(`Failed to save data for example ID ${originalExample.id}: ${e.message}`, 'error');
-                 await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).eq('id', originalExample.id);
-            }
+        if (!aiResult.expansions || aiResult.expansions.length === 0) {
+            throw new Error("AI response did not contain 'expansions' array.");
         }
         
-        addLog(`[OK] Processed concept group for "${groupName}" (${group.length} examples).`, 'success');
-        return { processedCount: group.length, promptWasPrinted: shouldPrintPrompt };
+        const cleaned_sentences = [];
+        let linguistic_highlights = [];
+        aiResult.expansions.forEach(exp => {
+            cleaned_sentences.push({
+                cleaned_halunder: exp.cleaned_halunder, cleaned_german: exp.best_translation,
+                confidence_score: exp.confidence_score, ai_notes: exp.notes,
+                alternative_translations: 'gpt4_best'
+            });
+            (exp.alternative_translations || []).forEach((alt, i) => {
+                cleaned_sentences.push({
+                    cleaned_halunder: exp.cleaned_halunder, cleaned_german: alt.translation,
+                    confidence_score: alt.confidence_score || 0.8, ai_notes: alt.notes,
+                    alternative_translations: `gpt4_alternative_${i + 1}`
+                });
+            });
+            if (exp.discovered_highlights) linguistic_highlights.push(...exp.discovered_highlights);
+        });
+
+        const { error: rpcError } = await sourceDbClient.rpc('save_cleaned_example_data', {
+            p_original_example_id: example.id,
+            p_cleaned_sentences: JSON.stringify(cleaned_sentences),
+            p_linguistic_highlights: JSON.stringify(linguistic_highlights)
+        });
+        if (rpcError) throw new Error(`RPC Error: ${rpcError.message}`);
+
+        addLog(`[OK] ID ${example.id} -> Generated ${aiResult.expansions.length} clean examples.`, 'success');
+        return { promptWasPrinted: shouldPrintPrompt };
     } catch(e) {
-        addLog(`[FAIL] Group for "${groupName}" failed: ${e.message}`, 'error');
-        await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).in('id', groupIds);
-        return { processedCount: 0, promptWasPrinted: false };
+        addLog(`[FAIL] ID ${example.id}: ${e.message}`, 'error');
+        await sourceDbClient.from('new_examples').update({ cleaning_status: 'error', note: e.message }).eq('id', example.id);
     }
 }
 
 
-// Builds a prompt with FULL context for the group
-function buildGroupedPrompt(group, knownIdioms, wordContext) {
-    const headwordConcept = group[0].concept;
-    const inputExamples = group.map(ex => ({
-        original_id: ex.id,
-        halunder_sentence: ex.halunder_sentence
-    }));
-
+// Builds a prompt for a single item with full context
+function buildSingleItemPrompt(example, relevantIdioms, wordContext) {
     const detailedHeadwordContext = {
-        headword: headwordConcept.primary_german_label,
-        part_of_speech: headwordConcept.part_of_speech,
-        german_definition: headwordConcept.german_definition,
-        notes: headwordConcept.notes,
-        krogmann_info: headwordConcept.krogmann_info,
-        krogmann_idioms: headwordConcept.krogmann_idioms
+        headword: example.concept.primary_german_label,
+        part_of_speech: example.concept.part_of_speech,
+        german_definition: example.concept.german_definition,
+        notes: example.concept.notes,
+        krogmann_info: example.concept.krogmann_info,
+        krogmann_idioms: example.concept.krogmann_idioms
     };
 
-    return `You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to analyze a group of example sentences for a single dictionary headword to understand its semantic range, and then process each example.
+    return `You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to process a raw example sentence, proofread it, and provide high-quality, multi-layered German translations.
 
-**HEADWORD CONTEXT (applies to all examples below):**
+**HEADWORD CONTEXT (the main dictionary entry this example belongs to):**
 \`\`\`json
 ${JSON.stringify(detailedHeadwordContext, null, 2)}
 \`\`\`
 
 **CRITICAL INSTRUCTION 1: SENTENCE EXPANSION**
-Within each example, if a Halunder sentence contains slashes (e.g., "A/B/C"), you MUST expand it into multiple, separate sentence objects in the "expansions" array for that example.
+The provided sentence might contain slashes indicating alternatives (e.g., "A/B/C"). You MUST expand this into multiple, separate sentence objects in the "expansions" array. If no slashes, generate just one object.
 
 **CRITICAL INSTRUCTION 2: TRANSLATION HIERARCHY**
 For EACH expanded sentence, you MUST follow this priority:
-1.  \`best_translation\`: The most natural, idiomatic German translation.
-2.  \`alternative_translations\`: Include other natural variations AND the literal, word-for-word translation if it's different.
+1. \`best_translation\`: The most natural, idiomatic German translation.
+2. \`alternative_translations\`: Include other natural variations AND the literal, word-for-word translation if it's different.
 
 **MAIN TASK:**
-Analyze all the provided examples and context. Then, for each item in the "input_examples" array, generate a corresponding object in the "processed_examples" array of your response.
+Based on the input data below, generate a JSON response.
 
 **INPUT DATA:**
 
-**1. Dictionary Context for Individual Words (for reference):**
+**1. Raw Halunder Sentence (may contain OCR errors and alternatives):**
+"${example.halunder_sentence}"
+
+**2. Dictionary Context for Individual Words in this Sentence:**
 \`\`\`json
 ${JSON.stringify(wordContext, null, 2)}
 \`\`\`
 
-**2. Known Idioms (for reference, truncated):**
+**3. Known Idioms Found in this Sentence:**
 \`\`\`json
-${JSON.stringify(knownIdioms.slice(0, 50), null, 2)}
-\`\`\`
-
-**3. Example Sentences for the headword "${headwordConcept.primary_german_label}":**
-\`\`\`json
-${JSON.stringify(inputExamples, null, 2)}
+${JSON.stringify(relevantIdioms, null, 2)}
 \`\`\`
 
 **YOUR JSON OUTPUT FORMAT:**
-Your entire response must be a single JSON object. The "processed_examples" array order must match the "input_examples" order.
+Your entire response must be a single JSON object with an "expansions" array.
 
 \`\`\`json
 {
-  "processed_examples": [
+  "expansions": [
     {
-      "original_id": "The UUID of the first input example",
-      "expansions": [
-        {
-          "cleaned_halunder": "Deät es dolung en bisterk Weder.",
-          "best_translation": "Es ist heute ein böses Wetter.",
-          "confidence_score": 0.98,
-          "notes": "Standard translation for 'bad weather'.",
-          "alternative_translations": [
-            {"translation": "Es ist heute ein schlechtes Wetter.", "confidence_score": 0.9}
-          ],
-          "discovered_highlights": []
-        }
-      ]
+      "cleaned_halunder": "Hi froaget mi miin Grummen it.",
+      "best_translation": "Er fragt mir ein Loch in den Bauch.",
+      "confidence_score": 0.97,
+      "notes": "Idiomatic translation is best for training. The literal meaning is included as an alternative.",
+      "alternative_translations": [
+        {"translation": "Er löchert mich mit seinen Fragen.", "confidence_score": 0.9, "notes": "Another natural variation."},
+        {"translation": "Er fragt mich meine Eingeweide aus.", "confidence_score": 0.6, "notes": "Literal translation for linguistic analysis."}
+      ],
+      "discovered_highlights": [{"halunder_phrase": "miin Grummen it froage", "german_meaning": "jemandem Löcher in den Bauch fragen", "explanation_german": "Eine Redewendung für intensives Ausfragen.", "type": "idiom", "relevance_score": 9}]
     }
   ]
 }
@@ -354,7 +322,7 @@ router.post('/start-cleaning', (req, res) => {
     runDictionaryExampleCleaner(limit).catch(err => {
         console.error("Caught unhandled error in dictionary example cleaner:", err);
     });
-    res.json({ success: true, message: `Optimal cleaning started for up to ${limit} examples.` });
+    res.json({ success: true, message: `Definitive cleaning started for up to ${limit} examples.` });
 });
 
 router.get('/progress', (req, res) => res.json(processingState));
