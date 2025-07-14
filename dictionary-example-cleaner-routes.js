@@ -1,16 +1,7 @@
 // ===============================================
 // FINAL FIXED DICTIONARY EXAMPLE CLEANER ROUTES
 // File: dictionary-example-cleaner-routes.js
-// Uses cleaned_linguistic_examples table for discovered idioms
-//
-// FEATURES:
-// - Fetches all pending examples using pagination.
-// - Groups examples by concept_id for contextual AI processing.
-// - Processes groups concurrently in staggered chunks for high throughput.
-// - AI expands sentence variations (e.g., A/B/C) into distinct entries.
-// - AI judges and provides a relevance_score (1-10) for discovered highlights.
-// - AI prioritizes natural, idiomatic German for the primary translation.
-// - Robust logic to save all expanded sentences and update/insert highlights.
+// Version: 2.0 (Fixes SyntaxError in prompt)
 // ===============================================
 
 const express = require('express');
@@ -355,13 +346,25 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
                 try {
                     const { data: existingEntry } = await sourceDbClient
                         .from('cleaned_linguistic_examples')
-                        .select('id, relevance_score')
-                        .ilike('halunder_term', linguisticEntry.halunder_term)
+                        .select('id, relevance_score, source_ids')
+                        .ilike('halunder_term', linguisticEntry.halunder_term.trim())
                         .single();
 
                     if (existingEntry) {
                         if (linguisticEntry.relevance_score > existingEntry.relevance_score) {
-                            const { error: updateError } = await sourceDbClient.from('cleaned_linguistic_examples').update({ ...linguisticEntry, source_ids: undefined, id: undefined }).eq('id', existingEntry.id);
+                            const existingSourceIds = existingEntry.source_ids || [];
+                            const newSourceId = linguisticEntry.source_ids[0];
+                            const updatedSourceIds = [...new Set([...existingSourceIds, newSourceId])];
+
+                            const updatePayload = {
+                                german_equivalent: linguisticEntry.german_equivalent,
+                                explanation: linguisticEntry.explanation,
+                                relevance_score: linguisticEntry.relevance_score,
+                                processed_at: new Date().toISOString(),
+                                source_ids: updatedSourceIds
+                            };
+
+                            const { error: updateError } = await sourceDbClient.from('cleaned_linguistic_examples').update(updatePayload).eq('id', existingEntry.id);
                             if (updateError) throw updateError;
                             addLog(`Updated linguistic feature: ${linguisticEntry.halunder_term} (score: ${existingEntry.relevance_score} → ${linguisticEntry.relevance_score})`, 'success');
                         }
@@ -371,7 +374,9 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
                         addLog(`Saved new linguistic feature: ${linguisticEntry.halunder_term} (AI score: ${linguisticEntry.relevance_score})`, 'success');
                     }
                 } catch (linguisticError) {
-                     addLog(`Error saving linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
+                    if (linguisticError.code !== 'PGRST116') { // Ignore 'exact one row' error for .single()
+                        addLog(`Error processing linguistic feature "${highlight.halunder_phrase}": ${linguisticError.message}`, 'warning');
+                    }
                 }
             }
         }
@@ -381,8 +386,7 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
     addLog(`[GROUP PROCESSED] Concept ${concept.id} (${concept.primary_german_label}): Processed ${exampleGroup.length} raw examples into ${totalCleanedSentences} clean sentences.`, 'success');
 }
 
-
-// Enhanced AI prompt that processes groups and expects AI-judged relevance
+// **FIXED**: Escaped all literal backticks (`) inside the template string.
 function buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, knownIdioms) {
     const rawExamples = exampleGroup.map(ex => ({
         id: ex.id,
@@ -396,13 +400,13 @@ You are an expert linguist and data cleaner specializing in Heligolandic Frisian
 
 **PRIMARY GOALS:**
 1.  **EXPAND & CLEAN:** For each raw example, clean it up. If it contains variations (e.g., using "/"), you MUST expand it into multiple, separate, complete sentence objects.
-2.  **NATURAL TRANSLATION:** Your `best_translation` MUST be the most natural, idiomatic German a native speaker would use. Literal translations are valuable but should be put in `alternative_translations` or explained in the notes.
+2.  **NATURAL TRANSLATION:** Your \`best_translation\` MUST be the most natural, idiomatic German a native speaker would use. Literal translations are valuable but should be put in \`alternative_translations\` or explained in the notes.
 3.  **DISCOVER HIGHLIGHTS:** Identify idioms, cultural notes, place names, or other linguistically interesting elements.
-4.  **JUDGE RELEVANCE:** For each discovered highlight, you MUST assign a `relevance_score` from 1 (very basic) to 10 (extremely rare and insightful).
+4.  **JUDGE RELEVANCE:** For each discovered highlight, you MUST assign a \`relevance_score\` from 1 (very basic) to 10 (extremely rare and insightful).
 
 **INSTRUCTIONS:**
-- Analyze the entire group of `Raw Example Pairs` below. They are all related to the same headword.
-- Use the provided `Dictionary Context` for individual words to understand their meaning.
+- Analyze the entire group of \`Raw Example Pairs\` below. They are all related to the same headword.
+- Use the provided \`Dictionary Context\` for individual words to understand their meaning.
 - For EACH raw example, produce one or more cleaned objects in the output array.
 - Your entire response MUST be a single JSON object with ONE key: \`processed_examples\`. This key holds an array of result objects.
 
@@ -486,7 +490,6 @@ router.post('/start-cleaning', (req, res) => {
     if (processingState.isProcessing) {
         return res.status(400).json({ error: 'Processing is already in progress.' });
     }
-    // Limit is no longer needed as we process all pending items, but we keep the route structure
     runDictionaryExampleCleaner().catch(err => {
         console.error("Caught unhandled error in dictionary example cleaner:", err);
         processingState.status = 'Error';
@@ -498,7 +501,7 @@ router.post('/start-cleaning', (req, res) => {
 router.get('/progress', (req, res) => {
     res.json({
         ...processingState,
-        lastPromptUsed: processingState.lastPromptUsed // Optionally send the large prompt
+        lastPromptUsed: processingState.lastPromptUsed 
     });
 });
 
