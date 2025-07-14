@@ -227,7 +227,11 @@ async function runDictionaryExampleCleaner(limit) {
     }
 }
 
-// Enhanced single example processing
+// =========================================================================================
+// REPLACED SECTION START
+// =========================================================================================
+
+// Enhanced single example processing - AI JUDGES RELEVANCE
 async function processSingleExample(example, shouldPrintPrompt) {
     await sourceDbClient.from('new_examples').update({ cleaning_status: 'processing' }).eq('id', example.id);
 
@@ -308,13 +312,20 @@ async function processSingleExample(example, shouldPrintPrompt) {
     
     if (insertError) throw new Error(`Failed to save cleaned example: ${insertError.message}`);
 
-    // FIXED: Save discovered highlights to cleaned_linguistic_examples table
+    // Save discovered highlights using AI-provided relevance scores
     if (aiResult.discovered_highlights && aiResult.discovered_highlights.length > 0) {
         for (const highlight of aiResult.discovered_highlights) {
-            const relevanceScore = calculateRelevanceScore(highlight);
+            // Use AI-provided relevance score.
+            const relevanceScore = highlight.relevance_score;
             
+            // Add a check to ensure the score is a valid number before proceeding.
+            if (typeof relevanceScore !== 'number') {
+                addLog(`Skipping highlight "${highlight.halunder_phrase}" due to missing or invalid relevance_score.`, 'warning');
+                continue; // Skip to the next highlight
+            }
+
             const linguisticEntry = {
-                halunder_term: highlight.halunder_phrase.trim(), // Ensure trimmed
+                halunder_term: highlight.halunder_phrase.trim(),
                 german_equivalent: highlight.german_meaning,
                 explanation: highlight.explanation_german,
                 feature_type: highlight.type,
@@ -326,12 +337,17 @@ async function processSingleExample(example, shouldPrintPrompt) {
             };
 
             try {
-                // FIXED: Check if it already exists first, then insert or update
-                const { data: existingEntry } = await sourceDbClient
+                // Check if it already exists first
+                const { data: existingEntry, error: selectError } = await sourceDbClient
                     .from('cleaned_linguistic_examples')
                     .select('id, relevance_score')
                     .ilike('halunder_term', linguisticEntry.halunder_term.trim())
                     .single();
+
+                // Handle potential error from .single() if more than one row is found
+                if (selectError && selectError.code !== 'PGRST116') { // PGRST116 = 0 or 1 rows found, which is ok
+                     throw selectError;
+                }
 
                 if (existingEntry) {
                     // Update if our relevance score is higher
@@ -352,7 +368,7 @@ async function processSingleExample(example, shouldPrintPrompt) {
                             addLog(`Updated linguistic feature: ${highlight.halunder_phrase} (score: ${existingEntry.relevance_score} → ${relevanceScore})`, 'success');
                         }
                     } else {
-                        addLog(`Linguistic feature "${highlight.halunder_phrase}" already exists with higher/equal score`, 'info');
+                        addLog(`Linguistic feature "${highlight.halunder_phrase}" already exists with higher/equal score (${existingEntry.relevance_score})`, 'info');
                     }
                 } else {
                     // Insert new entry
@@ -363,7 +379,7 @@ async function processSingleExample(example, shouldPrintPrompt) {
                     if (insertError) {
                         addLog(`Failed to save linguistic feature "${highlight.halunder_phrase}": ${insertError.message}`, 'warning');
                     } else {
-                        addLog(`Saved new linguistic feature: ${highlight.halunder_phrase} (score: ${relevanceScore})`, 'success');
+                        addLog(`Saved new linguistic feature: ${highlight.halunder_phrase} (AI score: ${relevanceScore})`, 'success');
                     }
                 }
             } catch (linguisticError) {
@@ -381,7 +397,7 @@ async function processSingleExample(example, shouldPrintPrompt) {
     return shouldPrintPrompt;
 }
 
-// Enhanced AI prompt with comprehensive word context and AI relevance scoring
+// UPDATED AI prompt - AI now provides relevance scores
 function buildEnhancedCleaningPrompt(example, headwordContext, wordContexts, knownIdioms) {
     return `
 You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to take a raw example sentence pair from a dictionary and normalize it into a high-quality, clean parallel sentence for machine learning. You also act as a cultural and linguistic highlight discovery engine.
@@ -396,18 +412,16 @@ Your main job is to "clean" both the Halunder and German sentences, and to ident
 4. **Correct & Improve the German:** Create the best possible German translation. It should be grammatically correct and sound natural to a native speaker.
 5. **IDENTIFY HIGHLIGHTS:** Look for any of these in the Halunder sentence:
    - **Idioms**: Non-literal expressions (e.g., "beerigermarri" = kleiner Penis)
-   - **Place names**: Local Helgoland locations (e.g., "Lange Anna", "Nathurnstak")
+   - **Place names**: Local Helgoland locations
    - **Cultural references**: Traditions, customs, local practices
    - **Historical references**: People, events, old practices
    - **Metaphorical expressions**: Colorful language unique to Helgoland
-   - **Terms of endearment**: Family words like "Memmeken" (mommy)
-6. **JUDGE RELEVANCE SCORE (0-10):** For each highlight you find, assign a relevance score:
-   - **10:** Unique idioms, major landmarks (Lange Anna), very colorful expressions
-   - **8-9:** Cultural traditions, place names, terms of endearment (Memmeken), maritime terms
-   - **6-7:** Local expressions, minor place names, family terms
-   - **4-5:** Common words with slight regional variation
-   - **1-3:** Basic words like "the", "and", "is" (DON'T include these)
-   - **0:** Completely mundane words (skip these entirely)
+6. **JUDGE RELEVANCE:** For each discovered highlight, assign a relevance score 1-10:
+   - **10**: Extremely unique idioms, deep cultural insights, rare expressions
+   - **8-9**: Important cultural references, characteristic local expressions
+   - **6-7**: Moderately interesting terms, place names, maritime terms
+   - **4-5**: Common expressions, basic vocabulary variations
+   - **1-3**: Very basic terms, obvious translations
 7. **Provide Multiple Valid Translations:** Give 2-3 different ways to translate the German that are all correct but use different words or styles.
 8. **Output JSON:** Structure your entire response in the following JSON format ONLY.
 
@@ -428,7 +442,7 @@ ${JSON.stringify(wordContexts, null, 2)}
 ${JSON.stringify(knownIdioms, null, 2)}
 \`\`\`
 
-**4. Raw Example Pair (likely already pretty correct meaningwise):**
+**4. Raw Example Pair (may contain errors):**
 - Halunder: "${example.halunder_sentence}"
 - German: "${example.german_sentence}"
 
@@ -456,20 +470,20 @@ ${JSON.stringify(knownIdioms, null, 2)}
   ],
   "discovered_highlights": [
     {
-      "halunder_phrase": "Memmeken",
-      "german_literal": "kleine Mutter",
-      "german_meaning": "Mama",
-      "explanation_german": "Auf Helgoländisch ist 'Memmeken' eine liebevolle Bezeichnung für die Mutter, ähnlich wie 'Mama' oder 'Mami' im Deutschen. Das Diminutiv '-ken' macht es besonders zärtlich.",
-      "type": "cultural_reference",
-      "relevance_score": 8
+      "halunder_phrase": "beerigermarri",
+      "german_literal": "Konfirmandenwurst",
+      "german_meaning": "kleiner Penis",
+      "explanation_german": "Auf Helgoländisch sagt man 'beerigermarri' (wörtlich: Konfirmandenwurst) umgangssprachlich für einen kleinen Penis. Dies ist eine metaphorische und humorvolle Umschreibung, die in der lokalen Kultur verwurzelt ist.",
+      "type": "idiom",
+      "relevance_score": 9
     },
     {
-      "halunder_phrase": "Lange Anna",
-      "german_literal": "Lange Anna",
+      "halunder_phrase": "Nathurnstak",
+      "german_literal": "Nordspitze",
       "german_meaning": "Lange Anna",
-      "explanation_german": "Das berühmte Wahrzeichen Helgolands, ein 47 Meter hoher freistehender Felsen. Der Name ist sowohl auf Deutsch als auch auf Halunder gleich.",
+      "explanation_german": "Das Wahrzeichen Helgolands ist die Lange Anna, welche auf Halunder 'Nathurnstak' heißt. Die Bezeichnung bezieht sich auf die Nordspitze der Insel.",
       "type": "place_name",
-      "relevance_score": 10
+      "relevance_score": 7
     }
   ]
 }
@@ -477,17 +491,26 @@ ${JSON.stringify(knownIdioms, null, 2)}
 
 **Types for discovered_highlights:**
 - "idiom" - Non-literal expressions, metaphors, slang
-- "place_name" - Locations on or around Helgoland  
-- "cultural_reference" - Traditions, customs, local practices, family terms
+- "place_name" - Locations on or around Helgoland
+- "cultural_reference" - Traditions, customs, local practices
 - "historical_reference" - Historical people, events, old practices
 - "maritime_term" - Sea-related terminology specific to Helgoland
 - "food_tradition" - Local food names or cooking practices
 - "religious_reference" - Church or religious terminology
 - "family_name" - Traditional Helgolandic family names
 
-**IMPORTANT:** Only include highlights with relevance_score 4 or higher. Skip mundane words like articles, basic verbs, etc.
+**Relevance Score Guidelines:**
+- **10**: Extremely rare idioms, deep cultural insights that would fascinate linguists
+- **8-9**: Important cultural markers, characteristic expressions, significant place names
+- **6-7**: Moderately interesting local terms, maritime vocabulary, regional variations
+- **4-5**: Common local expressions, basic dialectal differences
+- **1-3**: Very basic terms, obvious cognates, simple vocabulary variations
 `;
 }
+
+// =========================================================================================
+// REPLACED SECTION END
+// =========================================================================================
 
 // API Routes (unchanged)
 router.post('/start-cleaning', (req, res) => {
