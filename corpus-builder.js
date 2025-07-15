@@ -239,7 +239,7 @@ async function runCorpusBuilder(textLimit, preparationOnly = false) {
     }
 }
 
-// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR ===
+// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR (CORRECTED) ===
 async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
@@ -251,8 +251,28 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
 
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
     const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
-    const { data: dictData, error: dictError } = await dictionaryDbClient.from('terms').select(`term_text, concept_to_term!inner(concept:concepts!inner(primary_german_label, part_of_speech, german_definition))`).or(orFilter).eq('language', 'hal');
-    if (dictError) addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
+    
+    // ================== THE FIX IS APPLIED HERE ==================
+    const { data: dictData, error: dictError } = await dictionaryDbClient
+        .from('new_terms') // Use the correct table name 'new_terms'
+        .select(`
+            term_text, 
+            new_concept_to_term!inner(
+                concept:new_concepts!inner(
+                    primary_german_label, 
+                    part_of_speech, 
+                    german_definition
+                )
+            )
+        `) // Use correct relationship names
+        .or(orFilter)
+        .eq('language', 'hal');
+    // =============================================================
+
+    if (dictError) {
+        // Log the specific error to help with debugging
+        addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
+    }
     
     const foundLinguisticExamples = allLinguisticExamples?.filter(ex => sentence.halunder_sentence.toLowerCase().includes(ex.halunder_term.toLowerCase())) || [];
 
