@@ -321,7 +321,7 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 
 **TASK 1: PROOFREAD THE HALUNDER TEXT**
 Your first and most important task is to correct the **Target Halunder Sentence Pair**. The source text may contain obvious, non-linguistic errors from scanning.
-- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing, and obvious typos that make a word nonsensical (e.g., "Djanne" -> "Djenne"). Combine hyphenated words that were split across lines.
+- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing and Combine hyphenated words that were split across lines.
 - **DO NOT:** Change grammar, word choice, or dialectal spellings. If a word is a valid, albeit archaic, Halunder word, **leave it as is**. Do not "modernize" the text. For example, do not change 'her' to 'har' even if 'har' seems more grammatically correct in the context. Preserve the original's linguistic character.
 
 **TASK 2: TRANSLATE THE CORRECTED TEXT**
@@ -372,7 +372,7 @@ ${JSON.stringify(linguisticExamples, null, 2)}
   "translation_sentence_1": "The German translation for only the first corrected sentence.",
   "translation_sentence_2": "The German translation for only the second corrected sentence (or null).",
   "confidence_score": 0.95,
-  "notes": "Explain briefly why you chose this translation, e.g., 'Corrected '\\n' and translated idiom X.'",
+  "notes": "Explain briefly why you chose this translation, explain your reasoning also with support of the dictionary and context.'",
   "alternative_translations": [
     {
       "translation": "A valid alternative translation for the entire pair.",
