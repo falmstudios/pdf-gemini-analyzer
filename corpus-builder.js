@@ -41,12 +41,11 @@ async function callOpenAI_Api(prompt) {
             const response = await axiosInstance.post(
                 apiUrl,
                 {
-                    model: "o3-2025-04-16", // Using the best value, high-quality model
+                    model: "gpt-4.1-2025-04-14",
                     messages: [
                         { "role": "system", "content": "You are a helpful expert linguist. Your output must be a single, valid JSON object and nothing else." },
                         { "role": "user", "content": prompt }
                     ],
-                    temperature: 0.7,
                     response_format: { "type": "json_object" }
                 },
                 { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` } }
@@ -80,11 +79,11 @@ async function callOpenAI_Api(prompt) {
 }
 
 // === THE MAIN PROCESSING FUNCTION ===
-async function runCorpusBuilder(textLimit) {
+async function runCorpusBuilder(textLimit, preparationOnly = false) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
     let allLinguisticExamples = [];
-    addLog(`Starting corpus build process using OpenAI o3...`, 'info');
+    addLog(`Starting corpus build process using OpenAI GPT-4.1...`, 'info');
 
     try {
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
@@ -128,7 +127,6 @@ async function runCorpusBuilder(textLimit) {
                 recoveryPage++;
             }
             addLog(`Successfully loaded all ${pendingSentences.length} sentences for recovery.`, 'success');
-
         } else {
             addLog("No existing pending jobs found. Starting new text extraction.", 'info');
             addLog(`Fetching up to ${textLimit} new texts...`, 'info');
@@ -181,6 +179,16 @@ async function runCorpusBuilder(textLimit) {
             if (newPendingError) throw new Error(`Could not fetch newly inserted sentences: ${newPendingError.message}`);
             pendingSentences = newPending;
         }
+        
+        if (preparationOnly) {
+            addLog(`Preparation Only mode is active. Process will stop before AI calls.`, 'info');
+            addLog(`Found a total of ${pendingSentences.length} sentence pairs ready for processing.`, 'success');
+            processingState.status = 'Preparation Complete';
+            processingState.details = `${pendingSentences.length} sentence pairs are ready.`;
+            processingState.progress = 1;
+            processingState.isProcessing = false;
+            return;
+        }
 
         // --- AI PROCESSING STAGE ---
         processingState.status = 'Processing sentence pairs with AI...';
@@ -190,9 +198,7 @@ async function runCorpusBuilder(textLimit) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
 
-        // We can remove the daily limit check as o3 has a very high token-based limit
-        // which is harder to track precisely. The RPM limit is the main concern.
-        addLog(`Using model o3 with a 500 RPM limit.`, 'info');
+        addLog(`Using model gpt-4.1-2025-04-14 with a 500 RPM limit.`, 'info');
 
         for (let i = 0; i < totalToProcess; i += 5) {
             const chunk = pendingSentences.slice(i, i + 5);
@@ -215,7 +221,6 @@ async function runCorpusBuilder(textLimit) {
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
             
-            // A very short pause is sufficient due to the staggering and high RPM limit
             if (i + 5 < totalToProcess) {
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
@@ -265,16 +270,16 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const aiResult = await callOpenAI_Api(prompt);
 
     const corpusEntries = [];
-    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: aiResult.best_translation_pair, source: 'o3_best_pair', confidence_score: aiResult.confidence_score, notes: aiResult.notes });
+    corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: aiResult.best_translation_pair, source: 'gpt-4.1_best_pair', confidence_score: aiResult.confidence_score, notes: aiResult.notes });
     if (aiResult.corrected_sentence_1 && aiResult.translation_sentence_1) {
-        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_1, german_translation: aiResult.translation_sentence_1, source: 'o3_best_sentence1', confidence_score: aiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_1, german_translation: aiResult.translation_sentence_1, source: 'gpt-4.1_best_sentence1', confidence_score: aiResult.confidence_score, notes: "Individual translation of the first sentence in the pair." });
     }
     if (aiResult.corrected_sentence_2 && aiResult.translation_sentence_2) {
-        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_2, german_translation: aiResult.translation_sentence_2, source: 'o3_best_sentence2', confidence_score: aiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
+        corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_sentence_2, german_translation: aiResult.translation_sentence_2, source: 'gpt-4.1_best_sentence2', confidence_score: aiResult.confidence_score, notes: "Individual translation of the second sentence in the pair." });
     }
     if (aiResult.alternative_translations) {
         aiResult.alternative_translations.forEach(alt => {
-            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'o3_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
+            corpusEntries.push({ source_sentence_id: sentence.id, halunder_sentence: aiResult.corrected_halunder_pair, german_translation: alt.translation, source: 'gpt-4.1_alternative_pair', confidence_score: alt.confidence_score, notes: alt.notes });
         });
     }
 
@@ -289,7 +294,7 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     return shouldPrintPrompt;
 }
 
-// === HELPER TO BUILD THE PROMPT (UNCHANGED) ===
+// === HELPER TO BUILD THE PROMPT ===
 function buildOpenAIPrompt(targetSentence, context, proposals, dictionary, linguisticExamples) {
     return `
 You are an expert linguist specializing in Heligolandic Frisian (Halunder) and German. Your task is to proofread a raw Halunder text for OCR errors and then provide a high-quality, multi-layered German translation.
@@ -361,23 +366,47 @@ ${JSON.stringify(linguisticExamples, null, 2)}
 }
 
 // === API ROUTES ===
+
+router.post('/upload-texts', async (req, res) => {
+    const { fileContent } = req.body;
+    if (!fileContent) {
+        return res.status(400).json({ error: 'No file content was provided.' });
+    }
+    try {
+        const textsToUpload = JSON.parse(fileContent);
+        if (!Array.isArray(textsToUpload)) {
+            throw new Error('Parsed content is not a valid JSON array.');
+        }
+        console.log(`Received file content, attempting to upload ${textsToUpload.length} texts...`);
+        const { data, error } = await sourceDbClient.from('texts').insert(textsToUpload).select();
+        if (error) {
+            console.error('Supabase insert error:', error);
+            throw new Error(`Database insertion failed: ${error.message}`);
+        }
+        res.json({ success: true, message: `Successfully uploaded ${data.length} of ${textsToUpload.length} texts.` });
+    } catch (error) {
+        console.error('Upload processing error:', error);
+        res.status(500).json({ error: `Failed to process file content: ${error.message}` });
+    }
+});
+
 router.post('/start-processing', (req, res) => {
     if (processingState.isProcessing) {
         return res.status(400).json({ error: 'Processing is already in progress.' });
     }
     const limit = parseInt(req.body.limit, 10) || 10;
-    // Model is now hardcoded to o3, so we don't need to get it from the request
-    runCorpusBuilder(limit).catch(err => {
+    runCorpusBuilder(limit, false).catch(err => {
         console.error("Caught unhandled error in corpus builder:", err);
     });
-    res.json({ success: true, message: `Processing started for up to ${limit} texts using OpenAI o3.` });
+    res.json({ success: true, message: `Processing started for up to ${limit} texts using OpenAI GPT-4.1.` });
 });
 
 router.post('/prepare-all-texts', (req, res) => {
     if (processingState.isProcessing) {
         return res.status(400).json({ error: 'Processing is already in progress.' });
     }
-    runPreparationOnly().catch(err => {
+    // Set a very high limit to effectively process all texts, and set preparationOnly to true
+    runCorpusBuilder(10000, true).catch(err => {
         console.error("Caught unhandled error in preparation:", err);
     });
     res.json({ success: true, message: `Preparation of all remaining texts has started.` });
