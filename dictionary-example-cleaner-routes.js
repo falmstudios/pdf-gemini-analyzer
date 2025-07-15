@@ -328,7 +328,6 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
             confidence_score: cleanedExample.confidence_score,
             ai_notes: cleanedExample.notes,
             alternative_translations: 'gpt4_best',
-            openai_prompt: prompt
         });
 
         if (cleanedExample.alternative_translations && Array.isArray(cleanedExample.alternative_translations)) {
