@@ -6,14 +6,35 @@
     <title>Corpus Builder</title>
     <link rel="stylesheet" href="dictionary-styles.css">
     <style>
-        .progress-bar-container { background-color: #e0e0e0; border-radius: 4px; overflow: hidden; }
-        .progress-bar { height: 20px; background-color: #4caf50; width: 0%; transition: width 0.4s ease-in-out; text-align: center; color: white; font-weight: bold;}
-        .log-container { height: 400px; overflow-y: auto; background-color: #2b2b2b; color: #f1f1f1; padding: 15px; border-radius: 5px; font-family: monospace; margin-top: 20px; }
-        .log-entry { padding: 2px 0; border-bottom: 1px solid #444; }
-        .log-entry.error { color: #ff6b6b; }
-        .log-entry.success { color: #69f0ae; }
-        .log-entry.warning { color: #ffd54f; }
-        .button-group { display: flex; gap: 10px; align-items: center; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; background-color: #f4f7f6; color: #333; margin: 0; }
+        .container { max-width: 1200px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e0e0e0; padding-bottom: 15px; margin-bottom: 20px; }
+        .header h1 { font-size: 1.8em; color: #1a237e; margin: 0; }
+        .main-content { display: grid; grid-template-columns: 1fr 1.5fr; gap: 30px; }
+        .info-panel, .status-panel { padding: 20px; border: 1px solid #ddd; border-radius: 8px; background-color: #fafafa; }
+        h2 { font-size: 1.5em; color: #283593; border-bottom: 2px solid #3f51b5; padding-bottom: 5px; margin-top: 0; }
+        h3 { font-size: 1.3em; color: #3949ab; }
+        h4 { font-size: 1.1em; color: #1a237e; margin-top: 20px; margin-bottom: 5px; }
+        p { color: #555; }
+        hr { border: 0; height: 1px; background-color: #e0e0e0; margin: 25px 0; }
+        .button-group { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+        .primary-btn, .secondary-btn { padding: 10px 18px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background-color 0.3s, transform 0.1s; }
+        .primary-btn { background-color: #3f51b5; color: white; }
+        .primary-btn:hover { background-color: #303f9f; }
+        .secondary-btn { background-color: #6c757d; color: white; }
+        .secondary-btn:hover { background-color: #5a6268; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        input[type="number"], input[type="file"] { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
+        .progress-bar-container { background-color: #e0e0e0; border-radius: 4px; overflow: hidden; margin-top: 10px; }
+        .progress-bar { height: 24px; background-color: #43a047; width: 0%; transition: width 0.4s ease-in-out; text-align: center; color: white; font-weight: bold; line-height: 24px; }
+        .log-container { height: 400px; overflow-y: auto; background-color: #2b2b2b; color: #f1f1f1; padding: 15px; border-radius: 5px; font-family: "SF Mono", "Fira Code", "Consolas", monospace; margin-top: 20px; font-size: 0.9em; }
+        .log-entry { padding: 4px 2px; border-bottom: 1px solid #444; word-break: break-all; }
+        .log-entry:last-child { border-bottom: none; }
+        .log-entry.error { color: #ff8a80; font-weight: bold;}
+        .log-entry.success { color: #b9f6ca; }
+        .log-entry.warning { color: #ffe57f; }
+        .back-link { text-decoration: none; color: #3f51b5; font-weight: bold; }
+        .back-link:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -25,22 +46,31 @@
         <div class="main-content">
             <div class="info-panel">
                 <h2>Control Panel</h2>
-                <p>Use the buttons below to manage the corpus generation process.</p>
+                <p>Manage the corpus generation process from here.</p>
+                
+                <hr>
+
+                <h4>1. Upload New Texts</h4>
+                <p>Upload a structured <code>texts_data.json</code> file to add new source texts to the database.</p>
+                <div class="button-group">
+                    <input type="file" id="file-upload-input" accept=".json">
+                    <button id="upload-btn" class="primary-btn">Upload File</button>
+                </div>
                 
                 <hr>
                 
-                <h4>1. Process a Batch (with AI)</h4>
-                <p>Process a limited number of new texts from start to finish using the powerful gpt-4.1 model.</p>
+                <h4>2. Process a Batch (with AI)</h4>
+                <p>Process a limited number of texts from the queue using the gpt-4.1 model.</p>
                 <div class="button-group">
                     <label for="text-limit">Number of texts:</label>
-                    <input type="number" id="text-limit" value="10" min="1" max="500" style="width: 100px; padding: 8px;">
+                    <input type="number" id="text-limit" value="10" min="1" max="500">
                     <button id="start-btn" class="primary-btn">Start AI Batch</button>
                 </div>
 
-                <hr style="margin-top: 20px;">
+                <hr>
 
-                <h4>2. Prepare All Remaining Texts (No AI)</h4>
-                <p>This will scan ALL remaining texts and prepare the sentence pairs, but will NOT call the AI. Use this once to see the total number of sentence pairs.</p>
+                <h4>3. Prepare All Remaining Texts (No AI)</h4>
+                <p>Scan ALL remaining texts and prepare the sentence pairs, but do NOT call the AI. Use this to see the total job queue.</p>
                 <button id="prepare-btn" class="secondary-btn">Prepare All Texts</button>
             </div>
 
@@ -49,7 +79,7 @@
                 <p><strong>Status:</strong> <span id="status-text">Idle</span></p>
                 <p><strong>Details:</strong> <span id="details-text"></span></p>
                 <div class="progress-bar-container">
-                    <div id="progress-bar" class="progress-bar"></div>
+                    <div id="progress-bar" class="progress-bar">0%</div>
                 </div>
                 <div id="log-container" class="log-container"></div>
             </div>
