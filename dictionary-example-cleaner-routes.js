@@ -339,7 +339,6 @@ async function processExampleGroup(exampleGroup, shouldPrintPrompt) {
                     confidence_score: alt.confidence_score || 0.7,
                     ai_notes: alt.notes || '',
                     alternative_translations: `gpt4_alternative_${index + 1}`,
-                    openai_prompt: prompt
                 });
             });
         }
