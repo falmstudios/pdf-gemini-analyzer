@@ -1,5 +1,5 @@
 const express = require('express');
-const multer = 'multer';
+const multer = require('multer'); // <-- FIX: This was the line causing the error. It's now corrected.
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pdfParse = require('pdf-parse');
 const cors = require('cors');
@@ -18,7 +18,7 @@ const linguisticRoutes = require('./linguistic-routes.js');
 const translatorRoutes = require('./translator-routes.js');
 const corpusBuilderRoutes = require('./corpus-builder.js');
 const dictionaryExampleCleanerRoutes = require('./dictionary-example-cleaner-routes.js');
-const exportRoutes = require('./export-routes.js'); // <-- ADD THIS: Import the new export routes
+const exportRoutes = require('./export-routes.js');
 
 // Create axios instance with no timeout
 const axiosInstance = axios.create({
@@ -50,7 +50,7 @@ app.use('/linguistic', linguisticRoutes);
 app.use('/translator', translatorRoutes);
 app.use('/corpus', corpusBuilderRoutes);
 app.use('/dictionary-example-cleaner', dictionaryExampleCleanerRoutes);
-app.use('/api/export', exportRoutes); // <-- ADD THIS: Use the new export routes under the /api/export prefix
+app.use('/api/export', exportRoutes);
 
 // === PAGE SERVING ROUTES ===
 app.get('/', (req, res) => {
@@ -74,7 +74,7 @@ app.get('/corpus-builder', (req, res) => {
 app.get('/dictionary-example-cleaner', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'dictionary-example-cleaner.html'));
 });
-app.get('/export', (req, res) => { // <-- ADD THIS: Create a route to serve the new export.html page
+app.get('/export', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'export.html'));
 });
 
@@ -89,7 +89,6 @@ app.get('/health', (req, res) => {
 });
 
 // === PDF ANALYSIS LOGIC (UNCHANGED) ===
-// ... (The rest of your file from line 89 onwards remains exactly the same) ...
 
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
@@ -251,6 +250,8 @@ app.post('/upload', upload.array('pdfs', 100), async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ... (The rest of your file is unchanged) ...
 
 app.get('/status', (req, res) => {
   const queueArray = Array.from(processingQueue.values()).map(item => ({
