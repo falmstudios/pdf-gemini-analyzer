@@ -426,8 +426,8 @@ function buildGroupCleaningPrompt(exampleGroup, headwordContext, wordContexts, k
 You are an expert linguist and data cleaner specializing in Heligolandic Frisian (Halunder) and German. Your task is to process a batch of related example sentence pairs from a dictionary.
 
 **PRIMARY GOALS:**
-1.  **EXPAND & CLEAN:** For each raw example, clean it up. If it contains variations (e.g., using "/"), you MUST expand it into multiple, separate, complete sentence objects.
-2.  **NATURAL TRANSLATION:** Your \`best_translation\` MUST be the most natural, idiomatic German a native speaker would use. Literal translations are valuable but should be put in \`alternative_translations\` or explained in the notes.
+1.  **EXPAND & CLEAN:** For each raw example, clean it up. If it contains variations (e.g., using "/"), you MUST expand it into multiple, separate, complete sentence objects. Capitalization of sentences and punctuation (?!.) should match, please fix that.
+2.  **NATURAL TRANSLATION:** Your \`best_translation\` MUST be the most natural, idiomatic German a native speaker would use. You may also provide equally good german translations as alternatives. More literal translations are valuable but should be put in \`alternative_translations\` and explained in the notes.
 3.  **DISCOVER HIGHLIGHTS:** Identify idioms, cultural notes, place names, or other linguistically interesting elements.
 4.  **JUDGE RELEVANCE:** For each discovered highlight, you MUST assign a \`relevance_score\` from 1 (very basic) to 10 (extremely rare and insightful).
 
