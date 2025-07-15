@@ -3,6 +3,17 @@ const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
+// ---!! TUNABLE SETTINGS !! ---
+const SETTINGS = {
+    // Number of sentence pairs to process in parallel.
+    // Your Tier 2 limit is 5,000 RPM. A value of 30 is a safe but aggressive start.
+    // If you hit token-per-minute (TPM) limits, you may need to lower this.
+    CONCURRENT_CHUNKS: 30,
+    // Small delay (in ms) to stagger requests within a chunk to prevent thundering herd issues.
+    STAGGER_DELAY_MS: 50
+};
+// -----------------------------
+
 // === DATABASE CONNECTIONS ===
 const sourceDbClient = createClient(process.env.SOURCE_SUPABASE_URL, process.env.SOURCE_SUPABASE_ANON_KEY);
 const dictionaryDbClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
@@ -78,12 +89,12 @@ async function callOpenAI_Api(prompt) {
     }
 }
 
-// === THE MAIN PROCESSING FUNCTION ===
+// === THE MAIN PROCESSING FUNCTION (OPTIMIZED FOR HIGH-THROUGHPUT) ===
 async function runCorpusBuilder(textLimit, preparationOnly = false) {
     processingState = { isProcessing: true, progress: 0, status: 'Starting...', details: '', logs: [], startTime: Date.now() };
     let firstPromptPrinted = false;
     let allLinguisticExamples = [];
-    addLog(`Starting corpus build process using OpenAI GPT-4.1...`, 'info');
+    addLog(`Starting HIGH-THROUGHPUT corpus build process... (Concurrency: ${SETTINGS.CONCURRENT_CHUNKS})`, 'info');
 
     try {
         addLog("Checking for any existing pending, stale, or errored jobs...", 'info');
@@ -190,7 +201,7 @@ async function runCorpusBuilder(textLimit, preparationOnly = false) {
             return;
         }
 
-        // --- AI PROCESSING STAGE ---
+        // --- AI PROCESSING STAGE (OPTIMIZED LOOP) ---
         processingState.status = 'Processing sentence pairs with AI...';
         let processedCount = 0;
         const totalToProcess = pendingSentences.length;
@@ -198,32 +209,34 @@ async function runCorpusBuilder(textLimit, preparationOnly = false) {
              addLog('No sentence pairs to process with AI.', 'info');
         }
 
-        addLog(`Using model gpt-4.1-2025-04-14 with a 500 RPM limit.`, 'info');
+        addLog(`Using model gpt-4.1-2025-04-14 with a high-concurrency strategy.`, 'info');
+        
+        const { CONCURRENT_CHUNKS, STAGGER_DELAY_MS } = SETTINGS;
 
-        for (let i = 0; i < totalToProcess; i += 5) {
-            const chunk = pendingSentences.slice(i, i + 5);
-            addLog(`Processing batch of ${chunk.length} sentence pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
+        for (let i = 0; i < totalToProcess; i += CONCURRENT_CHUNKS) {
+            const chunk = pendingSentences.slice(i, i + CONCURRENT_CHUNKS);
+            addLog(`Processing a high-concurrency batch of ${chunk.length} pairs (starting with pair ${i + 1} of ${totalToProcess})...`, 'info');
 
             const processingPromises = chunk.map((sentence, index) => {
-                return new Promise(resolve => setTimeout(resolve, index * 200)) // Stagger calls slightly
-                    .then(() => processSingleSentence(sentence, !firstPromptPrinted, allLinguisticExamples))
-                    .then(promptWasPrinted => {
-                        if (promptWasPrinted) firstPromptPrinted = true;
-                    }).catch(e => {
+                // Stagger requests slightly to avoid a sudden burst, then fire the API call
+                return new Promise(resolve => setTimeout(resolve, index * STAGGER_DELAY_MS)) 
+                    .then(() => processSingleSentence(sentence, !firstPromptPrinted && index === 0, allLinguisticExamples))
+                    .catch(e => {
                         addLog(`Failed to process sentence pair ID ${sentence.id}: ${e.message}`, 'error');
                         return sourceDbClient.from('source_sentences').update({ processing_status: 'error', error_message: e.message }).eq('id', sentence.id);
                     });
             });
 
+            // Wait for ALL promises in the current chunk to complete before starting the next one.
             await Promise.all(processingPromises);
+            
+            if (!firstPromptPrinted && chunk.length > 0) firstPromptPrinted = true;
 
             processedCount += chunk.length;
             processingState.details = `Processed ${processedCount} of ${totalToProcess} sentence pairs.`;
             processingState.progress = totalToProcess > 0 ? (processedCount / totalToProcess) : 1;
             
-            if (i + 5 < totalToProcess) {
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
+            // NO PAUSE HERE. The loop immediately starts the next chunk for continuous throughput.
         }
         
         const processingTime = Math.round((Date.now() - processingState.startTime) / 1000);
@@ -239,7 +252,7 @@ async function runCorpusBuilder(textLimit, preparationOnly = false) {
     }
 }
 
-// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR (CORRECTED) ===
+// === THE AI PIPELINE FOR A SINGLE SENTENCE PAIR ===
 async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticExamples) {
     await sourceDbClient.from('source_sentences').update({ processing_status: 'processing' }).eq('id', sentence.id);
 
@@ -252,7 +265,6 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
     const words = [...new Set(sentence.halunder_sentence.toLowerCase().match(/[\p{L}0-9']+/gu) || [])];
     const orFilter = words.map(word => `term_text.ilike.${word}`).join(',');
     
-    // ================== THE FIX IS APPLIED HERE ==================
     const { data: dictData, error: dictError } = await dictionaryDbClient
         .from('new_terms') // Use the correct table name 'new_terms'
         .select(`
@@ -267,10 +279,8 @@ async function processSingleSentence(sentence, shouldPrintPrompt, allLinguisticE
         `) // Use correct relationship names
         .or(orFilter)
         .eq('language', 'hal');
-    // =============================================================
 
     if (dictError) {
-        // Log the specific error to help with debugging
         addLog(`Dictionary lookup failed: ${dictError.message}`, 'warning');
     }
     
@@ -321,7 +331,7 @@ You are an expert linguist specializing in Heligolandic Frisian (Halunder) and G
 
 **TASK 1: PROOFREAD THE HALUNDER TEXT**
 Your first and most important task is to correct the **Target Halunder Sentence Pair**. The source text may contain obvious, non-linguistic errors from scanning.
-- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing and Combine hyphenated words that were split across lines.
+- **DO:** Fix misplaced line breaks (e.g., "letj\\ninaptain" -> "letj inaptain"), incorrect spacing, and obvious typos that make a word nonsensical (e.g., "Djanne" -> "Djenne"). Combine hyphenated words that were split across lines.
 - **DO NOT:** Change grammar, word choice, or dialectal spellings. If a word is a valid, albeit archaic, Halunder word, **leave it as is**. Do not "modernize" the text. For example, do not change 'her' to 'har' even if 'har' seems more grammatically correct in the context. Preserve the original's linguistic character.
 
 **TASK 2: TRANSLATE THE CORRECTED TEXT**
@@ -372,7 +382,7 @@ ${JSON.stringify(linguisticExamples, null, 2)}
   "translation_sentence_1": "The German translation for only the first corrected sentence.",
   "translation_sentence_2": "The German translation for only the second corrected sentence (or null).",
   "confidence_score": 0.95,
-  "notes": "Explain briefly why you chose this translation, explain your reasoning also with support of the dictionary and context.'",
+  "notes": "Explain briefly why you chose this translation, e.g., 'Corrected '\\n' and translated idiom X.'",
   "alternative_translations": [
     {
       "translation": "A valid alternative translation for the entire pair.",
